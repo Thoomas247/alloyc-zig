@@ -1,0 +1,121 @@
+import std::option;
+import std::iterable;
+import std::number;
+import std::vec as vectors;
+
+type Packet : Serializable, Iterable = struct {
+    id: u32,
+    payload: *[u8],
+};
+
+type Holder = enum {
+    Boxed: *Packet,
+    Empty,
+};
+
+interface Serializable {
+    fn serialize(format: u32) -> bool;
+}
+
+extern printf(format: &[u8], ...) -> i32;
+
+macro readTypeFromJson(path: &[u8]) {
+    return path;
+}
+
+pub fn serialize(self p: &Packet, format: u32) -> bool {
+    return format != 0;
+}
+
+pub fn length(self p: &Packet) -> u64 {
+    return p.payload.length();
+}
+
+type PacketCursor = struct {
+    remaining: u64,
+};
+
+fn iterator(self p: &Packet) -> PacketCursor {
+    return PacketCursor { .remaining = p.id };
+}
+
+fn next(self c: &var PacketCursor) -> Option<u64> {
+    if (c.remaining == 0) {
+        return Option::None;
+    };
+    c.remaining -= 1;
+    return Option::Some(c.remaining);
+}
+
+fn describe(handle: &Serializable) -> bool {
+    if (handle is Packet) |concrete| {
+        return concrete.serialize(2);
+    }
+    return match (handle) {
+        Packet |packet| { break packet.serialize(3); }
+        else { break handle.serialize(1); }
+    };
+}
+
+pub fn area(self s: &Packet, scale: f32) -> f32 {
+    var total = 0.0;
+    for (s.payload) |b: &| {
+        total += b to f32 * scale;
+    }
+    return total;
+}
+
+fn main() -> i32 {
+    var p: *var Packet = new Packet { .id = 1, .payload = new [0 : 120] };
+    const surface = p.area(1.5);
+    const tagged = describe(&p);
+    var counted: u64 = 0;
+    for (p) |n| {
+        counted += n;
+    }
+    const decade = [0..10];
+    for ([..10], decade) |round, digit| {
+        counted += round to u64 + digit to u64;
+    }
+    var h: Holder = ::Boxed(move p);
+
+    if (h is ::Boxed) |boxed: *| {
+        printf("id %d\n", boxed.id);
+    }
+
+    var phase: enum { Active, Stopped: u32 } = ::Active;
+    if (phase is ::Stopped) |code| {
+        counted += code to u64;
+    }
+
+    const lengths = make<u64>(3 + 4 * 2);
+    var compare = 3 < lengths;
+
+    var classified = match (lengths) {
+        0 { break "empty"; }
+        1 { break "one"; }
+        else { break "many"; }
+    } else {
+        break "fell through";
+    };
+
+    const doubler = |&var compare| (x: i64) -> i64 {
+        return x * 2;
+    };
+
+    const base: i64 = 1 +
+        2 + (3 *
+        4);
+    var wide = base;
+
+    const choice = #if (base > 4) break 50 else break 100;
+    while (wide < choice) {
+        wide += doubler(wide);
+    }
+
+    return 0;
+}
+
+fn make<T: Number>(count: u64) -> T {
+    return count as T;
+}

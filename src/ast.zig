@@ -1,0 +1,240 @@
+//! Abstract syntax tree for the Alloy language, mirroring section 2
+//! (Syntactic Grammar) of LANGUAGE_SPEC.md. All nodes are allocated in the
+//! owning Ast's arena and reference tokens for names and source locations.
+
+const std = @import("std");
+const Token = @import("tokenizer.zig").Token;
+
+pub const Ast = struct {
+    arena: std.heap.ArenaAllocator,
+    module: Module,
+
+    pub fn init(backing_allocator: std.mem.Allocator) Ast {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(backing_allocator),
+            .module = .{ .imports = &.{}, .definitions = &.{} },
+        };
+    }
+
+    pub fn deinit(ast: *Ast) void {
+        ast.arena.deinit();
+    }
+};
+
+pub const Module = struct {
+    imports: []const Import,
+    definitions: []const Definition,
+};
+
+pub const Import = struct {
+    path: []const Token,
+    alias: ?Token,
+};
+
+pub const Visibility = enum { private, public, exported };
+
+pub const Definition = struct {
+    visibility: Visibility,
+    kind: union(enum) {
+        type_def: TypeDef,
+        fn_def: FnDef,
+        extern_def: ExternDef,
+        interface_def: InterfaceDef,
+        macro_def: MacroDef,
+    },
+};
+
+pub const TypeDef = struct {
+    name: Token,
+    type_parameters: []const TypeParameter,
+    interfaces: []const Token,
+    base: *const TypeExpression,
+};
+
+pub const TypeParameter = struct {
+    name: Token,
+    constraint: ?Token,
+};
+
+pub const FnDef = struct {
+    name: Token,
+    type_parameters: []const TypeParameter,
+    function: Function,
+};
+
+pub const Function = struct {
+    parameters: []const Parameter,
+    return_type: ?*const TypeExpression,
+    body: *const Statement,
+};
+
+pub const Parameter = struct {
+    is_self: bool,
+    name: Token,
+    parameter_type: *const TypeExpression,
+};
+
+pub const ExternDef = struct {
+    name: Token,
+    parameters: []const Parameter,
+    variadic: bool,
+    return_type: ?*const TypeExpression,
+};
+
+pub const InterfaceDef = struct {
+    name: Token,
+    functions: []const InterfaceFn,
+};
+
+pub const InterfaceFn = struct {
+    name: Token,
+    parameters: []const Parameter,
+    return_type: ?*const TypeExpression,
+};
+
+pub const MacroDef = struct {
+    name: Token,
+    parameters: []const Parameter,
+    body: *const Statement,
+};
+
+pub const TypeModifier = enum { pointer, pointer_var, reference, reference_var };
+
+pub const TypeExpression = union(enum) {
+    modified: struct { modifier: TypeModifier, child: *const TypeExpression },
+    named: NamedType,
+    struct_type: []const StructMember,
+    enum_type: []const EnumMember,
+    array: struct { element: *const TypeExpression, length: ?Token },
+    function: struct {
+        parameter_types: []const *const TypeExpression,
+        return_type: ?*const TypeExpression,
+    },
+    comptime_type: *const Expression,
+};
+
+pub const NamedType = struct {
+    path: []const Token,
+    type_arguments: []const *const TypeExpression,
+    // '::Variant' in an 'is' target: the enum is implied by the subject
+    implied: bool = false,
+};
+
+pub const StructMember = struct {
+    name: Token,
+    member_type: *const TypeExpression,
+};
+
+pub const EnumMember = struct {
+    name: Token,
+    payload: ?*const TypeExpression,
+};
+
+pub const Statement = union(enum) {
+    var_def: VarDef,
+    block: []const *const Statement,
+    break_stmt: struct { keyword: Token, value: ?*const Expression },
+    return_stmt: struct { keyword: Token, value: ?*const Expression },
+    assign: struct {
+        target: *const Expression,
+        operator: Token,
+        value: *const Expression,
+    },
+    expression: *const Expression,
+};
+
+pub const VarDef = struct {
+    mutable: bool,
+    name: Token,
+    declared_type: ?*const TypeExpression,
+    value: *const Expression,
+};
+
+pub const Expression = union(enum) {
+    integer_literal: Token,
+    float_literal: Token,
+    string_literal: Token,
+    character_literal: Token,
+    bool_literal: struct { token: Token, value: bool },
+    path: []const Token,
+    // '::Variant': an enum variant whose enum type is implied from context
+    implied_variant: Token,
+    binary: struct {
+        operator: Token,
+        left: *const Expression,
+        right: *const Expression,
+    },
+    unary: struct { operator: Token, operand: *const Expression },
+    cast: struct {
+        operator: Token,
+        operand: *const Expression,
+        target: *const TypeExpression,
+    },
+    call: struct {
+        callee: *const Expression,
+        type_arguments: []const *const TypeExpression,
+        arguments: []const *const Expression,
+    },
+    member: struct { object: *const Expression, name: Token },
+    index: struct { object: *const Expression, subscript: *const Expression },
+    struct_init: struct { name: ?Token, members: []const MemberInit },
+    array_literal: []const *const Expression,
+    array_fill: struct { value: *const Expression, count: *const Expression },
+    // '[start..end]' integer range generator; a null start means 0
+    array_range: struct { operator: Token, start: ?*const Expression, end: *const Expression },
+    if_expr: IfExpression,
+    while_expr: WhileExpression,
+    for_expr: ForExpression,
+    match_expr: MatchExpression,
+    lambda: Lambda,
+    comptime_expr: *const Expression,
+    grouped: *const Expression,
+};
+
+pub const MemberInit = struct {
+    name: Token,
+    value: *const Expression,
+};
+
+pub const Capture = struct {
+    modifier: ?TypeModifier,
+    name: Token,
+    annotation: ?*const TypeExpression,
+};
+
+pub const IfExpression = struct {
+    condition: *const Expression,
+    capture: ?Capture,
+    then_branch: *const Statement,
+    else_branch: ?*const Statement,
+};
+
+pub const WhileExpression = struct {
+    condition: *const Expression,
+    body: *const Statement,
+    else_branch: ?*const Statement,
+};
+
+pub const ForExpression = struct {
+    subjects: []const *const Expression,
+    captures: []const Capture,
+    body: *const Statement,
+    else_branch: ?*const Statement,
+};
+
+pub const MatchExpression = struct {
+    subject: *const Expression,
+    arms: []const MatchArm,
+    else_branch: ?*const Statement,
+};
+
+pub const MatchArm = struct {
+    pattern: ?*const Expression,
+    capture: ?Capture,
+    body: *const Statement,
+};
+
+pub const Lambda = struct {
+    captures: []const Capture,
+    function: Function,
+};

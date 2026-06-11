@@ -1,0 +1,5 @@
+// lang item std::iterable::Iterable (LANGUAGE_SPEC.md section 5.1a); arrays
+// implement it implicitly with a compiler-provided length (section 5.1)
+pub interface Iterable {
+    fn length() -> u64;
+}

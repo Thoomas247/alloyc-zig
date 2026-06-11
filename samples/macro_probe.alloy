@@ -1,0 +1,57 @@
+extern printf(format: &[u8], ...) -> i32;
+
+interface Serializable {
+    fn serialize(format: u32) -> bool;
+}
+
+type Packet : Serializable = struct {
+    id: u32,
+    flag: bool,
+};
+
+fn serialize(self p: &Packet, format: u32) -> bool {
+    return format != 0;
+}
+
+macro label(name: &[u8]) {
+    return name;
+}
+
+macro vector2() {
+    var t = #struct_type();
+    t.add_member("x", #f32);
+    t.add_member("y", #f32);
+    return t;
+}
+
+macro widthOf(wide: bool) {
+    if (wide) {
+        return #u64;
+    }
+    return #u32;
+}
+
+type Vec2 = #vector2();
+type Header = #widthOf(false);
+
+fn main() -> i32 {
+    const tag = #label("packet v1");
+    printf("%s\n", tag);
+
+    const is_struct = #(#Packet.is_struct());
+    const member_count = #(#Packet.member_names().length());
+    const implements = #(#Packet.implements_interface(#Serializable));
+    const same = #(#type_of(7).equals(#i32));
+
+    var v = Vec2 { .x = 1.5, .y = 2.5 };
+    v.x += 1.0;
+    var h: Header = 40000;
+    h += 2;
+
+    var score = 0;
+    if (is_struct) { score += 1; }
+    if (implements) { score += 10; }
+    if (same) { score += 100; }
+    printf("members %d score %d\n", member_count, score);
+    return (v.x + v.y) to i32 + score to i32;
+}
