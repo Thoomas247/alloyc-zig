@@ -128,6 +128,7 @@ pub const Checker = struct {
     }
 
     pub fn run(self: *Checker) Error!void {
+        try self.checkRedeclarations();
         for (self.views, 0..) |view, view_index| {
             self.current_view = view_index;
             for (view.module.definitions) |*definition| {
@@ -137,13 +138,61 @@ pub const Checker = struct {
         try self.runPendingComptime();
     }
 
+    // section 3.6: functions overload only when their parameter type lists
+    // differ; two definitions that share a name with an identical parameter
+    // type list are a redeclaration. The resolver permits any fn/fn name
+    // sharing and defers identical-signature detection to here, where the
+    // parameter types are resolved. (Non-function clashes are caught earlier.)
+    fn checkRedeclarations(self: *Checker) Error!void {
+        var entries = self.globals.iterator();
+        while (entries.next()) |entry| {
+            const symbols = entry.value_ptr.items;
+            if (symbols.len < 2) continue;
+            for (symbols, 0..) |symbol, index| {
+                if (symbol.definition.kind != .fn_def) continue;
+                for (symbols[0..index]) |previous| {
+                    if (previous.definition.kind != .fn_def) continue;
+                    if (!try self.sameSignature(previous, symbol)) continue;
+                    const previous_path = self.views[previous.view_index].path;
+                    self.current_view = symbol.view_index;
+                    try self.report(symbol.definition.kind.fn_def.name.location, "redeclaration of '{s}'; an overload with an identical parameter type list already exists in {s} (section 3.6)", .{ entry.key_ptr.*, previous_path });
+                    break;
+                }
+            }
+        }
+    }
+
+    // whether two functions share a parameter type list (section 3.6). Any
+    // type-resolution diagnostics it triggers are rolled back, since the main
+    // check pass reports those in context.
+    fn sameSignature(self: *Checker, a: resolution.Symbol, b: resolution.Symbol) Error!bool {
+        const a_fn = a.definition.kind.fn_def;
+        const b_fn = b.definition.kind.fn_def;
+        if (a_fn.function.parameters.len != b_fn.function.parameters.len) return false;
+        const snapshot = self.diagnostics.items.len;
+        defer self.diagnostics.shrinkRetainingCapacity(snapshot);
+        const a_env = try self.typeParameterEnvironment(a_fn.type_parameters, a.view_index);
+        const b_env = try self.typeParameterEnvironment(b_fn.type_parameters, b.view_index);
+        for (a_fn.function.parameters, b_fn.function.parameters) |a_param, b_param| {
+            const a_type = try self.typeFromExpressionIn(a_param.parameter_type, a_env, a.view_index);
+            const b_type = try self.typeFromExpressionIn(b_param.parameter_type, b_env, b.view_index);
+            if (!a_type.eql(b_type)) return false;
+        }
+        return true;
+    }
+
     fn checkDefinition(self: *Checker, definition: *const ast.Definition) Error!void {
         switch (definition.kind) {
             .fn_def => |fn_def| {
                 try self.pushFrame(false);
                 defer self.popFrame();
                 const environment = try self.typeParameterEnvironment(fn_def.type_parameters, self.current_view);
-                for (fn_def.function.parameters) |parameter| {
+                for (fn_def.function.parameters, 0..) |parameter, index| {
+                    // 'self' marks an extension receiver and is only valid on
+                    // the first parameter (section 4.5)
+                    if (index != 0 and parameter.is_self) {
+                        try self.report(parameter.name.location, "'self' may only appear on the first parameter (section 4.5)", .{});
+                    }
                     const parameter_type = try self.typeFromExpression(parameter.parameter_type, environment);
                     try self.bind(parameter.name, parameter_type, false);
                 }
@@ -1345,6 +1394,12 @@ pub const Checker = struct {
                 if (unary.operand.* == .array_range) {
                     return self.checkArrayRange(unary.operand, expected, true, false);
                 }
+                // a string literal's bytes copy into an owned '*[u8]' heap
+                // array (section 1.6); the literal itself is a static '&[u8]'
+                if (unary.operand.* == .string_literal) {
+                    _ = try self.checkExpression(unary.operand, null);
+                    return self.makeType(.{ .heap_array = .{ .mutable = true, .child = try self.makeType(.{ .primitive = .u8 }) } });
+                }
                 const expected_child: ?*const Type = if (expected) |context| switch (context.*) {
                     .pointer => |indirection| indirection.child,
                     .heap_array => context,
@@ -1493,11 +1548,13 @@ pub const Checker = struct {
                         try target_measured.render(self.arena),
                         target_layout.?.size,
                     });
-                } else if (source_resolved.* != .reference and target_resolved.* != .reference and
-                    !(source_resolved.* == .primitive and target_resolved.* == .primitive))
+                } else if ((source_resolved.* == .reference and target_resolved.* == .reference) or
+                    (source_resolved.* != .reference and target_resolved.* != .reference and
+                        !(source_resolved.* == .primitive and target_resolved.* == .primitive)))
                 {
-                    // a value cast beyond primitives records its byte shapes
-                    // so the interpreter can reinterpret (section 3.5)
+                    // record the byte shapes so the interpreter can reinterpret
+                    // (section 3.5): the pointee shapes for '&S as &T', the
+                    // value shapes for a non-primitive value cast
                     const source_shape = try self.shapeOf(source_measured, 0);
                     const target_shape = try self.shapeOf(target_measured, 0);
                     if (source_shape != null and target_shape != null) {
@@ -1677,6 +1734,26 @@ pub const Checker = struct {
         }
     }
 
+    // a stack array fill's count must be compile-time evaluatable (section
+    // 2.1), verified here rather than by the grammar; folds consts and '#'
+    // expressions, yielding null for a genuine runtime value (the comptime
+    // snapshot poisons mutable vars, so those never fold)
+    fn comptimeArrayCount(self: *Checker, count: *const ast.Expression) Error!?u64 {
+        const environment = try self.snapshotComptimeEnvironment();
+        const machine = try self.comptimeMachine(self.current_view, environment);
+        const value = machine.evaluate(count) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        return switch (value) {
+            .integer => |integer| if (integer.value >= 0 and integer.value <= std.math.maxInt(u64))
+                @intCast(integer.value)
+            else
+                null,
+            else => null,
+        };
+    }
+
     fn checkArrayFill(self: *Checker, expression: *const ast.Expression, expected: ?*const Type, under_new: bool) Error!*const Type {
         const array_fill = expression.array_fill;
         const expected_element: ?*const Type = if (expected) |context| switch (context.*) {
@@ -1694,9 +1771,16 @@ pub const Checker = struct {
             try self.report(self.expressionSpan(array_fill.count), "the fill count must be an integer", .{});
         }
         // a compile-time count makes a fixed array; a runtime count is only
-        // valid under 'new', producing a heap array (sections 2.1 and 4.2)
-        if (array_fill.count.* == .integer_literal) {
-            const length = parseIntegerLiteral(array_fill.count.integer_literal.slice(self.source())) catch 0;
+        // valid under 'new', producing a heap array (sections 2.1 and 4.2).
+        // the count is any compile-time-evaluatable expression, not just an
+        // integer-literal token (section 2.1)
+        const fixed_length: ?u64 = if (array_fill.count.* == .integer_literal)
+            (parseIntegerLiteral(array_fill.count.integer_literal.slice(self.source())) catch 0)
+        else if (count_type.isInteger())
+            try self.comptimeArrayCount(array_fill.count)
+        else
+            null;
+        if (fixed_length) |length| {
             if (under_new) {
                 return self.makeType(.{ .heap_array = .{ .mutable = true, .child = try self.defaulted(value_type) } });
             }
@@ -3246,6 +3330,22 @@ pub const Checker = struct {
             try argument_types.append(self.arena, argument_type);
         }
 
+        // surplus explicit type arguments are an error (section 3.7): no
+        // candidate can bind more type arguments than it declares parameters
+        if (call.type_arguments.len != 0) {
+            var max_type_parameters: usize = 0;
+            var saw_function = false;
+            for (symbols.items) |symbol| {
+                if (symbol.definition.kind != .fn_def) continue;
+                saw_function = true;
+                max_type_parameters = @max(max_type_parameters, symbol.definition.kind.fn_def.type_parameters.len);
+            }
+            if (saw_function and call.type_arguments.len > max_type_parameters) {
+                try self.report(span, "too many type arguments for '{s}': {d} supplied but at most {d} type parameter(s) declared (section 3.7)", .{ name, call.type_arguments.len, max_type_parameters });
+                return &unknown_type;
+            }
+        }
+
         for (symbols.items) |symbol| {
             switch (symbol.definition.kind) {
                 .macro_def => |macro_def| {
@@ -3497,9 +3597,10 @@ pub const Checker = struct {
         const definition_source = self.views[symbol.view_index].source;
         const environment = try self.arena.create(TypeEnvironment);
         environment.* = .empty;
-        // explicit type arguments bind left-to-right (section 3.7)
+        // explicit type arguments bind left-to-right (section 3.7); more
+        // arguments than the function has type parameters makes it non-viable
+        if (call.type_arguments.len > type_parameters.len) return null;
         for (call.type_arguments, 0..) |explicit, index| {
-            if (index >= type_parameters.len) break;
             const bound = try self.typeFromExpression(explicit, self.scope_types);
             try environment.put(self.arena, type_parameters[index].name.slice(definition_source), bound);
         }

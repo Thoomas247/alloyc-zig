@@ -529,7 +529,7 @@ pub const Tokenizer = struct {
                 self.index += 1;
                 if (self.index >= self.buffer.len) break;
                 switch (self.buffer[self.index]) {
-                    'n', 'r', 't', '0', '\\', '\'', '"', 'x', 'X', 'u', 'U' => {},
+                    'n', 'r', 't', '0', '\\', '\'', '"', 'x', 'u' => {},
                     else => if (bad_escape == null) {
                         bad_escape = .{ .start = self.index - 1, .end = self.index + 1 };
                     },

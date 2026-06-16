@@ -92,7 +92,7 @@ octal_literal    ::= '0o' [0-7]+
 float_literal    ::= [0-9]+ '.' [0-9]*
 string_literal   ::= '"' ( escape_seq | <any char except '"' or '\n'> )* '"'
 char_literal     ::= '\'' ( escape_seq | <any char except '\'' or '\n'> )+ '\''
-escape_seq       ::= '\\' [nrt0\\'"xXuU] | '\\x' digit{2} | '\\u{' digit+ '}'
+escape_seq       ::= '\\' [nrt0\\'"] | '\\x' hex_digit{2} | '\\u{' hex_digit+ '}'
 
 ```
 

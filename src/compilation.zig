@@ -350,6 +350,30 @@ fn importFilePath(allocator: std.mem.Allocator, key: []const u8) ![]const u8 {
     return file_path.toOwnedSlice(allocator);
 }
 
+/// The section 5.4 import search order. A relative module path 'a/b/c.alloy'
+/// (from importFilePath) is looked up under, in order: the current directory,
+/// the compiler-executable's directory, then $ALLOY_STDLIB. Returns the
+/// ordered candidate paths to try; the current-directory candidate is the bare
+/// relative path, and an absent (null or empty) root is skipped. The loader
+/// reads each in turn and takes the first that exists.
+pub fn importSearchPaths(
+    allocator: std.mem.Allocator,
+    relative_path: []const u8,
+    exe_dir: ?[]const u8,
+    stdlib_dir: ?[]const u8,
+) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    // 1. the current directory: the relative path as-is
+    try paths.append(allocator, try allocator.dupe(u8, relative_path));
+    // 2. the compiler-executable's directory, then 3. $ALLOY_STDLIB
+    for ([_]?[]const u8{ exe_dir, stdlib_dir }) |root| {
+        const dir = root orelse continue;
+        if (dir.len == 0) continue;
+        try paths.append(allocator, try std.fs.path.join(allocator, &.{ dir, relative_path }));
+    }
+    return paths.toOwnedSlice(allocator);
+}
+
 fn expectRuns(source: []const u8, expected_exit: i64, expected_output: []const u8) !void {
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
@@ -2172,4 +2196,368 @@ test "native executables match strings and run cursors" {
         \\    return sum + checks;
         \\}
     , &cursor_sources, 20, "sum 10 checks 10\n");
+}
+
+// ===========================================================================
+// Spec-conformance corpus (from the LANGUAGE_SPEC.md audit)
+//
+// Each test pins one spec rule to a concrete program. Two kinds:
+//
+//   * "spec ok: ..."  — the compiler already matches the spec. These PASS now
+//     and guard against regression.
+//   * "spec gap: ..." — the compiler currently deviates from the spec. The
+//     assertion states the SPEC-CORRECT target and is gated by `pendingGap()`
+//     so it reports as *skipped*, not failed (the suite stays green and every
+//     gap is visible in the skip list). To start implementing one: delete its
+//     `try pendingGap();` line; the test then must pass. Fragment strings in
+//     gap tests are the intended messages — adjust to the final wording.
+// ===========================================================================
+
+// Marks a spec-conformance test as not-yet-implemented: reported skipped, not
+// failed. Delete the `try pendingGap();` line in a test to activate it.
+fn pendingGap() error{SkipZigTest}!void {
+    return error.SkipZigTest;
+}
+
+test "spec ok: §1.2 block comments nest" {
+    try expectChecks(
+        \\/* outer /* nested */ still open */
+        \\fn main() -> i32 { return 0; }
+    );
+}
+
+test "spec ok: §1.6 a character literal over 8 bytes is rejected" {
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    var big: u64 = 'abcdefghi';
+        \\    return 0;
+        \\}
+    , &.{"exceeds 8 bytes"});
+}
+
+test "spec ok: §4.2 'move' requires a pointer operand" {
+    try expectCheckErrors(
+        \\type Box = struct { v: i32 };
+        \\fn main() -> i32 {
+        \\    var b = Box { .v = 1 };
+        \\    var c = move b;
+        \\    return 0;
+        \\}
+    , &.{"'move' requires a pointer"});
+}
+
+test "spec ok: §3.6 extern declarations do not overload" {
+    try expectCheckErrors(
+        \\extern puts(s: &[u8]) -> i32;
+        \\extern puts(s: &[u8]) -> i32;
+        \\fn main() -> i32 { return 0; }
+    , &.{"redeclaration of 'puts'"});
+}
+
+test "spec ok: §5.4 a function name reused for a non-function is a redeclaration" {
+    try expectCheckErrors(
+        \\fn thing() -> i32 { return 0; }
+        \\type thing = u32;
+        \\fn main() -> i32 { return 0; }
+    , &.{"redeclaration of 'thing'"});
+}
+
+test "spec ok: §4.2 a bare owning pointer cannot fill a '*T' parameter" {
+    try expectCheckErrors(
+        \\type Box = struct { v: i32 };
+        \\fn take(p: *Box) -> i32 { return p.v; }
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .v = 1 };
+        \\    return take(p);
+        \\}
+    , &.{"no overload of 'take'"});
+}
+
+test "spec ok: §3.3 rule 6 a wider named struct coerces to an anonymous layout" {
+    try expectChecks(
+        \\type Big = struct { a: u32, b: u32, c: u32 };
+        \\fn take(s: struct { a: u32, b: u32 }) -> u32 { return s.a; }
+        \\fn main() -> i32 {
+        \\    var big = Big { .a = 1, .b = 2, .c = 3 };
+        \\    return take(big) to i32;
+        \\}
+    );
+}
+
+test "spec ok: §3.5 'as' on a value rejects a width mismatch" {
+    // 'p' pierces to Box (4 bytes), so 'p as u64' is a width error, not an
+    // address reinterpretation (pointee transparency, §4.2)
+    try expectCheckErrors(
+        \\type Box = struct { v: i32 };
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .v = 1 };
+        \\    var bits = p as u64;
+        \\    return 0;
+        \\}
+    , &.{"Box is 4 byte(s) but u64 is 8 byte(s)"});
+}
+
+test "spec ok: §3.5 codegen lowers a reference reinterpretation cast" {
+    // native code generation handles '&S as &T'; the interpreter does not yet
+    // (see the matching gap test below)
+    try expectBuildsAndRuns("spec_ref_as",
+        \\type Pair = struct { low: u32, high: u32 };
+        \\fn main() -> i32 {
+        \\    var pair = Pair { .low = 3, .high = 0 };
+        \\    var viewed: &u64 = &pair as &u64;
+        \\    return viewed to i32;
+        \\}
+    , 3, "");
+}
+
+test "spec ok: §1.6 'new \"text\"' yields an owned *[u8] heap copy" {
+    // section 1.6: a string literal is a static '&[u8]'; 'new' copies its
+    // bytes into a fresh owned '*[u8]' heap array (not a '*&[u8]' header)
+    try expectChecks(
+        \\fn main() -> i32 {
+        \\    var p: *[u8] = new "hello";
+        \\    return 0;
+        \\}
+    );
+    // the copy is real heap bytes: indexing reads them back ('i' == 105)
+    try expectRuns(
+        \\fn main() -> i32 {
+        \\    var p: *[u8] = new "hi";
+        \\    return p[1] to i32;
+        \\}
+    , 105, "");
+    try expectBuildsAndRuns("spec_new_string",
+        \\fn main() -> i32 {
+        \\    var p: *[u8] = new "hi";
+        \\    return p[1] to i32;
+        \\}
+    , 105, "");
+}
+
+test "spec ok: §4.5 'self' is only valid on the first parameter" {
+    // section 4.5: 'self' marks an extension receiver; on any later parameter
+    // it is a definition-time error
+    try expectCheckErrors(
+        \\fn f(a: u32, self b: u32) -> u32 { return a; }
+        \\fn main() -> i32 { return 0; }
+    , &.{"first parameter"});
+    // the first parameter may still be 'self'
+    try expectChecks(
+        \\type V = struct { n: u32 };
+        \\fn get(self v: &V, k: u32) -> u32 { return v.n + k; }
+        \\fn main() -> i32 { return 0; }
+    );
+}
+
+test "spec ok: §3.6 two functions with an identical parameter list are a redeclaration" {
+    // section 3.6: same name + identical parameter type list is a
+    // redeclaration, not an overload
+    try expectCheckErrors(
+        \\fn dup(a: u32) -> u32 { return a; }
+        \\fn dup(a: u32) -> u32 { return a + 1; }
+        \\fn main() -> i32 { return 0; }
+    , &.{"redeclaration"});
+    // differing parameter type lists still overload cleanly
+    try expectChecks(
+        \\fn dup(a: u32) -> u32 { return a; }
+        \\fn dup(a: u32, b: u32) -> u32 { return a + b; }
+        \\fn dup(a: bool) -> u32 { return 1; }
+        \\fn main() -> i32 { return 0; }
+    );
+}
+
+test "spec ok: §2.1 a const array-fill count makes a stack array" {
+    // section 2.1: a stack '[value : count]' count is any compile-time
+    // evaluatable expression, not only an integer-literal token
+    try expectChecks(
+        \\fn main() -> i32 {
+        \\    const n = 4;
+        \\    var a = [0 : n];
+        \\    return 0;
+        \\}
+    );
+    // the const folds to a real fixed array: index 2 of '[7 : 4]' is 7
+    try expectRuns(
+        \\fn main() -> i32 {
+        \\    const n = 4;
+        \\    var a = [7 : n];
+        \\    return a[2];
+        \\}
+    , 7, "");
+    try expectBuildsAndRuns("spec_const_fill",
+        \\fn main() -> i32 {
+        \\    const n = 4;
+        \\    var a = [7 : n];
+        \\    return a[2];
+        \\}
+    , 7, "");
+}
+
+test "spec ok: §2.1 a comptime array-fill count makes a stack array" {
+    // a '#' count folds the same way; '[7 : #side()]' is a 3-element array
+    try expectChecks(
+        \\fn side() -> i32 { return 3; }
+        \\fn main() -> i32 {
+        \\    var a = [0 : #side()];
+        \\    return 0;
+        \\}
+    );
+    try expectRuns(
+        \\fn side() -> i32 { return 3; }
+        \\fn main() -> i32 {
+        \\    var a = [7 : #side()];
+        \\    return a[1] + a[2];
+        \\}
+    , 14, "");
+    try expectBuildsAndRuns("spec_comptime_fill",
+        \\fn side() -> i32 { return 3; }
+        \\fn main() -> i32 {
+        \\    var a = [7 : #side()];
+        \\    return a[1] + a[2];
+        \\}
+    , 14, "");
+}
+
+test "spec ok: §3.2 a fixed-array TYPE length must be an integer literal" {
+    // decided 2026-06-16: §3.2's array-type length stays integer-literal only.
+    // (Only array-FILL counts fold compile-time consts, §2.1; the type
+    // annotation does not.)
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const n = 4;
+        \\    var a: [u8 : n] = [1 : n];
+        \\    return 0;
+        \\}
+    , &.{"integer length"});
+    // a literal length is accepted
+    try expectChecks(
+        \\fn main() -> i32 {
+        \\    var a: [u8 : 4] = [1 : 4];
+        \\    return 0;
+        \\}
+    );
+}
+
+test "spec ok: §3.5 the interpreter reinterprets '&S as &T'" {
+    // section 3.5: '&S as &T' views the same memory as the new pointee; the
+    // interpreter now reinterprets the pointee on read, matching codegen
+    try expectRuns(
+        \\type Pair = struct { low: u32, high: u32 };
+        \\fn main() -> i32 {
+        \\    var pair = Pair { .low = 3, .high = 0 };
+        \\    var viewed: &u64 = &pair as &u64;
+        \\    return viewed to i32;
+        \\}
+    , 3, "");
+    try expectBuildsAndRuns("spec_ref_reinterpret",
+        \\type Pair = struct { low: u32, high: u32 };
+        \\fn main() -> i32 {
+        \\    var pair = Pair { .low = 3, .high = 0 };
+        \\    var viewed: &u64 = &pair as &u64;
+        \\    return viewed to i32;
+        \\}
+    , 3, "");
+}
+
+test "spec gap: §4.4 native code generation lowers lambdas" {
+    // DEFERRED 2026-06-16: codegen rejects lambda expressions and function
+    // values; full closure lowering (capture lists, owning-capture moves, the
+    // closure calling convention) is a large change left for later. The
+    // interpreter runs lambdas; only native codegen is missing.
+    try pendingGap();
+    try expectBuildsAndRuns("spec_lambda",
+        \\fn main() -> i32 {
+        \\    const add = (a: i32, b: i32) -> i32 { return a + b; };
+        \\    return add(1, 2);
+        \\}
+    , 3, "");
+}
+
+test "spec ok: §1.6 uppercase backslash-X / backslash-U escapes are rejected" {
+    // decided 2026-06-16: only lowercase '\xHH' and '\u{...}' decode; the
+    // uppercase forms are unrecognized escape sequences (section 1.6)
+    try expectCheckErrors(
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn main() -> i32 {
+        \\    printf("\X41\n");
+        \\    return 0;
+        \\}
+    , &.{"unrecognized escape sequence"});
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    var s = "\U{1F600}";
+        \\    return 0;
+        \\}
+    , &.{"unrecognized escape sequence"});
+    // the lowercase forms still decode
+    try expectChecks(
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn main() -> i32 {
+        \\    printf("\x41\n");
+        \\    return 0;
+        \\}
+    );
+}
+
+test "spec ok: §3.3/§3.6 an untyped literal does not disambiguate overloads" {
+    // decided 2026-06-16: an untyped integer literal stays ambiguous between
+    // i32 and i64 overloads (it does NOT prefer its i32 default); an explicit
+    // type is required (sections 3.3, 3.6)
+    try expectCheckErrors(
+        \\fn f(x: i32) -> i32 { return x; }
+        \\fn f(x: i64) -> i64 { return x; }
+        \\fn main() -> i32 { return f(5); }
+    , &.{"ambiguous"});
+    // an explicitly typed argument selects one overload
+    try expectRuns(
+        \\fn f(x: i32) -> i32 { return x; }
+        \\fn f(x: i64) -> i64 { return x; }
+        \\fn main() -> i32 {
+        \\    var n: i32 = 5;
+        \\    return f(n);
+        \\}
+    , 5, "");
+}
+
+test "spec ok: §3.7 surplus explicit type arguments are rejected" {
+    // section 3.7: explicit type arguments bind left-to-right; supplying more
+    // than the function declares is an error (decided 2026-06-16)
+    try expectCheckErrors(
+        \\fn id<T>(x: T) -> T { return x; }
+        \\fn main() -> i32 { return id<i32, u64>(5); }
+    , &.{"type argument"});
+    // the exact count still binds and checks cleanly
+    try expectChecks(
+        \\fn id<T>(x: T) -> T { return x; }
+        \\fn main() -> i32 { return id<i32>(5); }
+    );
+}
+
+test "spec ok: §5.4 imports resolve via cwd, the exe dir, then $ALLOY_STDLIB" {
+    // section 5.4: 'a/b/c.alloy' is searched under the current directory, the
+    // compiler-executable's directory, then $ALLOY_STDLIB, in that order
+    const allocator = std.testing.allocator;
+    const paths = try importSearchPaths(allocator, "std/vec.alloy", "exe_root", "stdlib_root");
+    defer {
+        for (paths) |p| allocator.free(p);
+        allocator.free(paths);
+    }
+    try std.testing.expectEqual(@as(usize, 3), paths.len);
+    // 1. current directory: the bare relative path
+    try std.testing.expectEqualStrings("std/vec.alloy", paths[0]);
+    // 2. the compiler-executable's directory, 3. $ALLOY_STDLIB; each is the
+    // root joined to the relative path (separator is platform-specific)
+    try std.testing.expect(std.mem.startsWith(u8, paths[1], "exe_root"));
+    try std.testing.expect(std.mem.endsWith(u8, paths[1], "vec.alloy"));
+    try std.testing.expect(std.mem.startsWith(u8, paths[2], "stdlib_root"));
+    try std.testing.expect(std.mem.endsWith(u8, paths[2], "vec.alloy"));
+
+    // absent roots drop out, leaving only the current-directory candidate
+    const only_cwd = try importSearchPaths(allocator, "std/vec.alloy", null, null);
+    defer {
+        for (only_cwd) |p| allocator.free(p);
+        allocator.free(only_cwd);
+    }
+    try std.testing.expectEqual(@as(usize, 1), only_cwd.len);
+    try std.testing.expectEqualStrings("std/vec.alloy", only_cwd[0]);
 }

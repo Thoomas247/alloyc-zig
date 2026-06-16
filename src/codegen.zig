@@ -1048,6 +1048,18 @@ pub const Codegen = struct {
                 try self.startBlock(exit);
                 return .{ .scalar = .{ .text = data, .llvm = "ptr" } };
             },
+            .string_literal => |token| {
+                // 'new "text"': the literal's bytes copy into a fresh '*[u8]'
+                // allocation (section 1.6); the literal alone is a static slice
+                const text = token.slice(self.source());
+                const bytes = try tokenizer_module.unescape(self.arena, text[1 .. text.len - 1]);
+                const length = try std.fmt.allocPrint(self.arena, "{d}", .{bytes.len});
+                const data = try self.allocateHeapArray(length, element_layout.size);
+                const global = try self.byteGlobal(bytes);
+                const origin = try std.fmt.allocPrint(self.arena, "@\"{s}\"", .{global.name});
+                try self.copyBytes(data, origin, bytes.len * element_layout.size);
+                return .{ .scalar = .{ .text = data, .llvm = "ptr" } };
+            },
             else => {
                 // 'new [a, b, c]': the literal materializes on the stack
                 // and its bits transfer into the allocation
@@ -1322,16 +1334,18 @@ pub const Codegen = struct {
                 return .{ .scalar = try self.convertNumeric(operand.scalar, source_resolved.primitive, target_resolved.primitive) };
             },
             .keyword_as => {
+                const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
+                const target_resolved = try self.resolvedOf(try self.typeOf(expression));
+                // '&S as &T' views the same memory as another pointee; the
+                // pointer is unchanged, so this precedes the shaped path (the
+                // shapes recorded for the interpreter do not apply here)
+                if (source_resolved.* == .reference and target_resolved.* == .reference) {
+                    return try self.evalExpression(cast.operand);
+                }
                 if (self.cast_shapes.get(expression)) |shapes| {
                     return self.reinterpretShaped(expression, cast.operand, shapes, span);
                 }
                 const operand = try self.evalExpression(cast.operand);
-                const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
-                const target_resolved = try self.resolvedOf(try self.typeOf(expression));
-                if (source_resolved.* == .reference and target_resolved.* == .reference) {
-                    // same memory viewed as another pointee; nothing moves
-                    return operand;
-                }
                 if (source_resolved.* != .primitive or target_resolved.* != .primitive) {
                     return self.report(span, "'as' on this type is not yet supported by native code generation", .{});
                 }

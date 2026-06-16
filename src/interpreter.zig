@@ -711,6 +711,12 @@ pub const Interpreter = struct {
                 const value = try self.evalExpression(operand);
                 return .{ .heap_array = value.array };
             },
+            // 'new "text"' owns a fresh '*[u8]' copy of the bytes (section 1.6);
+            // the literal alone evaluates to a '&[u8]' slice view
+            .string_literal => {
+                const value = try self.evalExpression(operand);
+                return .{ .heap_array = value.slice };
+            },
             else => {
                 const value = try self.evalExpression(operand);
                 const cell = try self.arena.create(Value);
@@ -863,6 +869,14 @@ pub const Interpreter = struct {
                 // a shaped cast reinterprets through a byte image (section
                 // 3.5); the checker records shapes for non-primitive sides
                 if (self.cast_shapes.get(expression)) |shapes| {
+                    // '&S as &T' views the pointee in place: read it, reinterpret
+                    // its bytes, and bind a fresh reference (mutation through the
+                    // reinterpreted view is not modeled)
+                    if (operand == .reference) {
+                        const cell = try self.arena.create(Value);
+                        cell.* = try self.reinterpretShaped(operand.reference.*, shapes);
+                        return .{ .reference = cell };
+                    }
                     return self.reinterpretShaped(operand, shapes);
                 }
                 const target = self.primitiveOf(expression) orelse return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});

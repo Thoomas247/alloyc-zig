@@ -64,9 +64,18 @@ pub fn main(init: std.process.Init) !void {
 
     _ = try compilation.addModule(entrypoint_file_path, source);
 
-    var loader_io = init.io;
+    var import_search: ImportSearch = .{
+        .io = init.io,
+        // the directory holding the compiler executable, where 'std/' ships;
+        // the process arena frees it automatically on exit
+        .exe_dir = std.process.executableDirPathAlloc(init.io, init.arena.allocator()) catch null,
+        .stdlib_dir = stdlib: {
+            const value = init.environ_map.get("ALLOY_STDLIB") orelse break :stdlib null;
+            break :stdlib if (value.len != 0) value else null;
+        },
+    };
     const loader: alloyc.ModuleLoader = .{
-        .context = @ptrCast(&loader_io),
+        .context = @ptrCast(&import_search),
         .function = loadImportedModule,
     };
     const success = try compilation.run(loader);
@@ -205,14 +214,27 @@ fn readFile(io: Io, allocator: std.mem.Allocator, file_path: []const u8) ![]cons
     return try Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_size));
 }
 
-// import loader searching the current directory; the compiler-executable
-// directory and $ALLOY_STDLIB search paths (section 5.4) are still to come
+// the search roots for the §5.4 import order, carried as the loader context
+const ImportSearch = struct {
+    io: Io,
+    exe_dir: ?[]const u8,
+    stdlib_dir: ?[]const u8,
+};
+
+// import loader implementing the §5.4 search order: the relative module path
+// is tried under the current directory, the compiler-executable's directory,
+// then $ALLOY_STDLIB; the first file that exists wins
 fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
-    const io: *Io = @ptrCast(@alignCast(context.?));
-    return readFile(io.*, allocator, file_path) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => err,
-    };
+    const search: *const ImportSearch = @ptrCast(@alignCast(context.?));
+    const candidates = try alloyc.compilation.importSearchPaths(allocator, file_path, search.exe_dir, search.stdlib_dir);
+    for (candidates) |candidate| {
+        const source = readFile(search.io, allocator, candidate) catch |err| switch (err) {
+            error.FileNotFound, error.IsDir => continue,
+            else => return err,
+        };
+        return source;
+    }
+    return null;
 }
 
 fn errorDescription(err: anyerror) []const u8 {
