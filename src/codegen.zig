@@ -77,6 +77,10 @@ pub const Codegen = struct {
     function_infos: std.StringHashMapUnmanaged(*FunctionInfo),
     extern_infos: std.AutoHashMapUnmanaged(*const ast.Definition, *ExternInfo),
     queue: std.ArrayList(QueuedFunction),
+    // lifted lambda functions (section 4.4), memoized like function_infos so a
+    // lambda evaluated more than once emits its body only once
+    lambda_infos: std.StringHashMapUnmanaged(*LambdaInfo),
+    lambda_queue: std.ArrayList(*LambdaInfo),
     // deep-copy and drop helper functions, memoized by canonical type key
     helper_names: std.StringHashMapUnmanaged([]const u8),
     // runtime type identity globals, one per concrete declared type; the
@@ -123,6 +127,32 @@ pub const Codegen = struct {
         parameter_types: []const *const Type,
         variadic: bool,
         return_type: *const Type,
+    };
+
+    // a lifted lambda (section 4.4). The runtime value of a lambda is a 'ptr'
+    // to a heap environment laid out as [ fn_ptr | capture_0 | capture_1 ... ];
+    // the lifted function takes that env pointer as its first argument and
+    // reads its captures from it.
+    const LambdaInfo = struct {
+        name: []const u8,
+        lambda: *const ast.Lambda,
+        view_index: usize,
+        parameter_types: []const *const Type,
+        return_type: *const Type,
+        aggregate_return: bool,
+        captures: []const CaptureSlot,
+        env_size: u64,
+        env_alignment: u64,
+        bindings_environment: ?*const Checker.TypeEnvironment,
+    };
+
+    const CaptureSlot = struct {
+        name: []const u8,
+        // the type stored in the env slot: the captured value for a copy, a
+        // reference for '&'/'&var', the owning pointer for '*'/'*var'
+        slot_type: *const Type,
+        offset: u64,
+        mode: CaptureMode,
     };
 
     const Frame = struct {
@@ -215,6 +245,8 @@ pub const Codegen = struct {
             .function_infos = .empty,
             .extern_infos = .empty,
             .queue = .empty,
+            .lambda_infos = .empty,
+            .lambda_queue = .empty,
             .helper_names = .empty,
             .type_descriptors = .empty,
             .fault_helper_emitted = false,
@@ -268,8 +300,14 @@ pub const Codegen = struct {
             return self.report(main_definition.name.location, "'main' takes no parameters", .{});
         }
         const main_info = try self.functionInfo(main_symbol, main_definition.name.location, &.{});
-        while (self.queue.pop()) |queued| {
-            try self.emitFunction(queued.symbol, queued.info);
+        // both queues grow as bodies are emitted (calls queue functions,
+        // lambda expressions queue lifted functions); drain until settled
+        while (self.queue.items.len != 0 or self.lambda_queue.items.len != 0) {
+            if (self.queue.pop()) |queued| {
+                try self.emitFunction(queued.symbol, queued.info);
+            } else if (self.lambda_queue.pop()) |info| {
+                try self.emitLambda(info);
+            }
         }
         try self.emitMainWrapper(main_info);
 
@@ -850,7 +888,7 @@ pub const Codegen = struct {
             .while_expr => |while_expr| return self.evalWhile(expression, while_expr),
             .for_expr => |for_expr| return self.evalFor(expression, for_expr),
             .match_expr => |match_expr| return self.evalMatch(expression, match_expr),
-            .lambda => return self.report(self.spanOf(expression), "lambdas are not yet supported by native code generation", .{}),
+            .lambda => return self.evalLambda(expression),
         }
     }
 
@@ -1465,6 +1503,11 @@ pub const Codegen = struct {
                 else => self.report(span, "this callee is not callable", .{}),
             };
         }
+        // a callee with no static target but a function type is a closure
+        // value: call indirectly through its pointer (section 4.4)
+        if (try self.calleeFunctionType(callee)) |fn_type| {
+            return self.callClosure(expression, callee, fn_type, span);
+        }
         if (callee.* == .path and callee.path.len >= 2) {
             return self.enumConstruction(expression, callee.path[callee.path.len - 1].slice(self.source()), call.arguments);
         }
@@ -1639,6 +1682,320 @@ pub const Codegen = struct {
                 }
                 return std.fmt.allocPrint(self.arena, "ptr {s}", .{memory.pointer});
             },
+        }
+    }
+
+    fn alignForward(value: u64, alignment: u64) u64 {
+        return if (alignment <= 1) value else (value + alignment - 1) / alignment * alignment;
+    }
+
+    // the value beneath an indirection, for a copy capture's stored type
+    fn pierceValue(self: *Codegen, candidate: *const Type) Error!*const Type {
+        const resolved = try self.resolvedOf(candidate);
+        return switch (resolved.*) {
+            .reference, .pointer => |indirection| indirection.child,
+            else => candidate,
+        };
+    }
+
+    const ResolvedCapture = struct { name: []const u8, slot_type: *const Type, mode: CaptureMode };
+
+    // mirrors checker capture typing (section 2.1): copy by default, '&'/'&var'
+    // store a reference to the outer cell, '*'/'*var' move the owning pointer
+    fn captureSlot(self: *Codegen, capture: ast.Capture, span: Token.Location) Error!ResolvedCapture {
+        const name = capture.name.slice(self.source());
+        const outer = self.lookupLocal(name) orelse
+            return self.report(span, "the capture '{s}' is not a local here", .{name});
+        const mode = captureMode(capture);
+        const slot_type: *const Type = switch (mode) {
+            // an annotation spells the reference type directly ('|a: &T|');
+            // a bare '&'/'&var' modifier references the outer value in place
+            .reference => reference: {
+                if (capture.annotation) |annotation| {
+                    break :reference try self.substituted(try self.checker.typeFromExpressionIn(annotation, self.current_bindings orelse &empty_type_environment, self.current_view));
+                }
+                const value = try self.pierceValue(outer.declared_type);
+                const node = try self.arena.create(Type);
+                node.* = .{ .reference = .{ .mutable = capture.modifier != null and capture.modifier.? == .reference_var, .child = value } };
+                break :reference node;
+            },
+            // an owning capture stores the moved pointer itself
+            .owning => outer.declared_type,
+            // a copy stores the pierced value
+            .copy => try self.pierceValue(outer.declared_type),
+        };
+        return .{ .name = name, .slot_type = slot_type, .mode = mode };
+    }
+
+    // a lambda's runtime value is a pointer to a heap environment laid out as
+    // [ fn_ptr @ 0 | capture_0 | capture_1 ... ] (section 4.4)
+    fn lambdaInfo(self: *Codegen, expression: *const ast.Expression) Error!*LambdaInfo {
+        const lambda = &expression.lambda;
+        const span = self.spanOf(expression);
+        var key: std.Io.Writer.Allocating = .init(self.arena);
+        key.writer.print("{d}", .{@intFromPtr(lambda)}) catch return error.OutOfMemory;
+        if (self.current_bindings) |bindings| {
+            var it = bindings.iterator();
+            while (it.next()) |entry| {
+                key.writer.print("|{s}={s}", .{ entry.key_ptr.*, try self.typeKey(entry.value_ptr.*, 0) }) catch return error.OutOfMemory;
+            }
+        }
+        if (self.lambda_infos.get(key.writer.buffered())) |existing| return existing;
+
+        const resolved = try self.resolvedOf(try self.typeOf(expression));
+        if (resolved.* != .function) return self.report(span, "this lambda has no function type here", .{});
+        const fn_type = resolved.function;
+        var parameter_types: std.ArrayList(*const Type) = .empty;
+        for (fn_type.parameter_types) |parameter_type| {
+            const concrete = try self.substituted(parameter_type);
+            if (try self.unsupportedReason(concrete, 0)) |reason| {
+                return self.report(span, "{s} are not yet supported by native code generation", .{reason});
+            }
+            try parameter_types.append(self.arena, concrete);
+        }
+        const return_type = try self.substituted(fn_type.return_type);
+        if (try self.unsupportedReason(return_type, 0)) |reason| {
+            return self.report(span, "{s} are not yet supported by native code generation", .{reason});
+        }
+
+        var captures: std.ArrayList(CaptureSlot) = .empty;
+        var offset: u64 = 8;
+        var alignment: u64 = 8;
+        for (lambda.captures) |capture| {
+            const resolved_capture = try self.captureSlot(capture, span);
+            const layout = (try self.layoutQuery(resolved_capture.slot_type, 0)) orelse
+                return self.report(span, "this capture has no defined layout", .{});
+            offset = alignForward(offset, layout.alignment);
+            if (layout.alignment > alignment) alignment = layout.alignment;
+            try captures.append(self.arena, .{
+                .name = resolved_capture.name,
+                .slot_type = resolved_capture.slot_type,
+                .offset = offset,
+                .mode = resolved_capture.mode,
+            });
+            offset += layout.size;
+        }
+
+        const info = try self.arena.create(LambdaInfo);
+        const id = self.global_counter;
+        self.global_counter += 1;
+        info.* = .{
+            .name = try std.fmt.allocPrint(self.arena, "alloy.lambda.{d}", .{id}),
+            .lambda = lambda,
+            .view_index = self.current_view,
+            .parameter_types = try parameter_types.toOwnedSlice(self.arena),
+            .return_type = return_type,
+            .aggregate_return = switch (try self.classify(return_type, span)) {
+                .aggregate => true,
+                else => false,
+            },
+            .captures = try captures.toOwnedSlice(self.arena),
+            .env_size = alignForward(offset, alignment),
+            .env_alignment = alignment,
+            .bindings_environment = self.current_bindings,
+        };
+        try self.lambda_infos.put(self.arena, try self.arena.dupe(u8, key.writer.buffered()), info);
+        try self.lambda_queue.append(self.arena, info);
+        return info;
+    }
+
+    fn evalLambda(self: *Codegen, expression: *const ast.Expression) Error!Operand {
+        const info = try self.lambdaInfo(expression);
+        try self.declareMalloc();
+        // the environment is heap-allocated so the closure may outlive the
+        // scope that built it (section 4.4). It is not reclaimed on scope exit
+        // yet — closures live for the run, mirroring the interpreter's arena.
+        const env = try self.freshTemp();
+        try self.instruction("{s} = call ptr @\"malloc\"(i64 {d})", .{ env, info.env_size });
+        // the function pointer occupies the first word of the environment
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ info.name, env });
+        try self.storeCaptures(info, env);
+        return .{ .scalar = .{ .text = env, .llvm = "ptr" } };
+    }
+
+    // fills the environment at closure-creation time (section 4.4)
+    fn storeCaptures(self: *Codegen, info: *LambdaInfo, env: []const u8) Error!void {
+        const zero: Token.Location = .{ .start = 0, .end = 0 };
+        for (info.captures) |capture| {
+            const outer = self.lookupLocal(capture.name) orelse
+                return self.report(zero, "the capture '{s}' is not a local here", .{capture.name});
+            const dest = try self.byteOffset(env, capture.offset);
+            switch (capture.mode) {
+                .reference => try self.instruction("store ptr {s}, ptr {s}", .{ outer.pointer, dest }),
+                .owning => {
+                    // move the pointer in and leave the outer moved-from (null)
+                    const moved = try self.loadScalar(outer.pointer, "ptr");
+                    try self.instruction("store ptr {s}, ptr {s}", .{ moved, dest });
+                    try self.instruction("store ptr null, ptr {s}", .{outer.pointer});
+                },
+                .copy => {
+                    const value = try self.loadPlace(.{ .pointer = outer.pointer, .value_type = outer.declared_type }, zero);
+                    const coerced = try self.coerceOperand(value, outer.declared_type, capture.slot_type, zero);
+                    try self.storeOperand(dest, coerced, capture.slot_type, zero);
+                },
+            }
+        }
+    }
+
+    fn emitLambda(self: *Codegen, info: *LambdaInfo) Error!void {
+        const lambda = info.lambda;
+        self.current_view = info.view_index;
+        self.allocas = .init(self.arena);
+        self.body = .init(self.arena);
+        self.temp_counter = 0;
+        self.terminated = false;
+        self.scopes = .empty;
+        self.break_targets = .empty;
+        self.return_type = info.return_type;
+        self.return_slot = null;
+        self.current_bindings = info.bindings_environment;
+        try self.pushFrame();
+
+        const span: Token.Location = if (lambda.function.parameters.len != 0)
+            lambda.function.parameters[0].name.location
+        else
+            .{ .start = 0, .end = 0 };
+
+        var header: std.Io.Writer.Allocating = .init(self.arena);
+        const writer = &header.writer;
+        const return_text: []const u8 = if (info.aggregate_return)
+            "void"
+        else switch (try self.classify(info.return_type, span)) {
+            .void_class => "void",
+            .scalar => |llvm| llvm,
+            .aggregate => "void",
+        };
+        writer.print("define internal {s} @\"{s}\"(", .{ return_text, info.name }) catch return error.OutOfMemory;
+        if (info.aggregate_return) {
+            writer.print("ptr %return.slot, ", .{}) catch return error.OutOfMemory;
+            self.return_slot = "%return.slot";
+        }
+        // the environment pointer is the first ordinary parameter
+        writer.print("ptr %env", .{}) catch return error.OutOfMemory;
+        for (lambda.function.parameters, info.parameter_types, 0..) |parameter, parameter_type, index| {
+            writer.print(", ", .{}) catch return error.OutOfMemory;
+            const register = try std.fmt.allocPrint(self.arena, "%argument.{d}", .{index});
+            switch (try self.classify(parameter_type, parameter.name.location)) {
+                .void_class => return self.report(parameter.name.location, "a parameter cannot have no runtime value", .{}),
+                .scalar => |llvm| writer.print("{s} {s}", .{ llvm, register }) catch return error.OutOfMemory,
+                .aggregate => writer.print("ptr {s}", .{register}) catch return error.OutOfMemory,
+            }
+        }
+        writer.print(") {{\nentry:\n", .{}) catch return error.OutOfMemory;
+
+        try self.bindCaptures(info);
+
+        const view_source = self.views[info.view_index].source;
+        for (lambda.function.parameters, info.parameter_types, 0..) |parameter, parameter_type, index| {
+            const register = try std.fmt.allocPrint(self.arena, "%argument.{d}", .{index});
+            const name = parameter.name.slice(view_source);
+            switch (try self.classify(parameter_type, parameter.name.location)) {
+                .void_class => unreachable,
+                .scalar => |llvm| {
+                    const slot = try self.scalarSlot(llvm);
+                    try self.storeScalar(slot, .{ .text = register, .llvm = llvm });
+                    try self.bindLocal(name, slot, parameter_type);
+                },
+                .aggregate => try self.bindLocal(name, register, parameter_type),
+            }
+        }
+
+        try self.execStatement(lambda.function.body);
+        if (!self.terminated) try self.emitDefaultReturn();
+
+        const out = &self.functions.writer;
+        out.print("{s}", .{header.writer.buffered()}) catch return error.OutOfMemory;
+        out.print("{s}", .{self.allocas.writer.buffered()}) catch return error.OutOfMemory;
+        out.print("{s}", .{self.body.writer.buffered()}) catch return error.OutOfMemory;
+        out.print("}}\n", .{}) catch return error.OutOfMemory;
+    }
+
+    // binds each capture from the environment at the lifted function's entry
+    fn bindCaptures(self: *Codegen, info: *LambdaInfo) Error!void {
+        for (info.captures) |capture| {
+            const src = try self.byteOffset("%env", capture.offset);
+            switch (capture.mode) {
+                .reference, .owning => {
+                    // the slot holds a pointer; load it into an addressable slot
+                    const slot = try self.scalarSlot("ptr");
+                    const loaded = try self.loadScalar(src, "ptr");
+                    try self.storeScalar(slot, .{ .text = loaded, .llvm = "ptr" });
+                    try self.bindLocal(capture.name, slot, capture.slot_type);
+                },
+                // a copy lives inline in the env: its slot address is its place
+                .copy => try self.bindLocal(capture.name, src, capture.slot_type),
+            }
+        }
+    }
+
+    // the function type of a closure-valued callee. A bare local of function
+    // type is not recorded by the checker (it calls callFunctionValue without
+    // re-checking the callee), so it is looked up directly; every other callee
+    // form has its type recorded.
+    fn calleeFunctionType(self: *Codegen, callee: *const ast.Expression) Error!?Type.Function {
+        if (callee.* == .path and callee.path.len == 1) {
+            if (self.lookupLocal(callee.path[0].slice(self.source()))) |local| {
+                const resolved = try self.resolvedOf(local.declared_type);
+                if (resolved.* == .function) return resolved.function;
+            }
+        }
+        if (self.expression_types.get(callee)) |recorded| {
+            const resolved = try self.resolvedOf(try self.substituted(recorded));
+            if (resolved.* == .function) return resolved.function;
+        }
+        return null;
+    }
+
+    // calls a closure value indirectly through the function pointer stored at
+    // the head of its environment (section 4.4)
+    fn callClosure(self: *Codegen, expression: *const ast.Expression, callee: *const ast.Expression, fn_type: Type.Function, span: Token.Location) Error!Operand {
+        const call = expression.call;
+        const closure = (try self.evalExpression(callee)).scalar.text;
+        const fn_ptr = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr {s}", .{ fn_ptr, closure });
+
+        const return_type = try self.substituted(fn_type.return_type);
+        const aggregate_return = switch (try self.classify(return_type, span)) {
+            .aggregate => true,
+            else => false,
+        };
+
+        var lowered: std.ArrayList([]const u8) = .empty;
+        var result_slot: ?[]const u8 = null;
+        if (aggregate_return) {
+            const layout = (try self.layoutQuery(return_type, 0)) orelse
+                return self.report(span, "this return type has no defined layout", .{});
+            result_slot = try self.aggregateSlot(layout);
+            try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{result_slot.?}));
+        }
+        // the environment is the first ordinary argument
+        try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{closure}));
+        for (call.arguments, 0..) |argument, index| {
+            const parameter_type = if (index < fn_type.parameter_types.len)
+                try self.substituted(fn_type.parameter_types[index])
+            else
+                try self.typeOf(argument);
+            const value = try self.evalExpression(argument);
+            const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
+            try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
+        }
+        const joined = try self.joinArguments(lowered.items);
+        if (aggregate_return) {
+            try self.instruction("call void {s}({s})", .{ fn_ptr, joined });
+            const layout = (try self.layoutQuery(return_type, 0)).?;
+            return .{ .memory = .{ .pointer = result_slot.?, .layout = layout, .fresh = true } };
+        }
+        switch (try self.classify(return_type, span)) {
+            .void_class => {
+                try self.instruction("call void {s}({s})", .{ fn_ptr, joined });
+                return .none;
+            },
+            .scalar => |llvm| {
+                const result = try self.freshTemp();
+                try self.instruction("{s} = call {s} {s}({s})", .{ result, llvm, fn_ptr, joined });
+                return .{ .scalar = .{ .text = result, .llvm = llvm } };
+            },
+            .aggregate => unreachable,
         }
     }
 
@@ -2693,7 +3050,8 @@ pub const Codegen = struct {
         switch (resolved.*) {
             .pointer => |indirection| return self.unsupportedReason(indirection.child, depth + 1),
             .heap_array => |indirection| return self.unsupportedReason(indirection.child, depth + 1),
-            .function => return "function values",
+            // a function value is a closure pointer (section 4.4), supported
+            .function => return null,
             .type_parameter => return "generics",
             // reachable through '*I' (the pointer arm recurses): dropping
             // through an interface needs a virtual drop, deferred for now

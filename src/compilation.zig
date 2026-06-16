@@ -1978,12 +1978,6 @@ test "native codegen reports unsupported constructs" {
         \\    return 0;
         \\}
     , &.{"owning interface objects ('*I') are not yet supported by native code generation"});
-    try expectGenerateErrors(
-        \\fn main() -> i32 {
-        \\    const add = (a: i32, b: i32) -> i32 { return a + b; };
-        \\    return add(1, 2);
-        \\}
-    , &.{"function values are not yet supported by native code generation"});
 }
 
 test "native executables match the interpreter" {
@@ -2459,18 +2453,44 @@ test "spec ok: §3.5 the interpreter reinterprets '&S as &T'" {
     , 3, "");
 }
 
-test "spec gap: §4.4 native code generation lowers lambdas" {
-    // DEFERRED 2026-06-16: codegen rejects lambda expressions and function
-    // values; full closure lowering (capture lists, owning-capture moves, the
-    // closure calling convention) is a large change left for later. The
-    // interpreter runs lambdas; only native codegen is missing.
-    try pendingGap();
+test "spec ok: §4.4 native code generation lowers lambdas and closures" {
+    // section 4.4: a lambda lowers to a heap environment [fn_ptr | captures];
+    // a non-capturing lambda lifts to a plain function pointer
     try expectBuildsAndRuns("spec_lambda",
         \\fn main() -> i32 {
         \\    const add = (a: i32, b: i32) -> i32 { return a + b; };
         \\    return add(1, 2);
         \\}
     , 3, "");
+    // copy and '&var' captures: 'base' is copied at creation (a later write to
+    // it is not seen), 'counter' is captured by mutable reference (15 + 7)
+    try expectBuildsAndRuns("spec_closure_capture",
+        \\fn main() -> i32 {
+        \\    var base = 10;
+        \\    const add_base = |base| (x: i32) -> i32 { return base + x; };
+        \\    var counter = 0;
+        \\    const bump = |&var counter| (amount: i32) { counter += amount; };
+        \\    bump(3);
+        \\    bump(4);
+        \\    base = 100;
+        \\    return add_base(5) + counter;
+        \\}
+    , 22, "");
+    // a closure escapes its defining function (its environment is heap) and an
+    // owning '*' capture moves the pointer into it (7 + 15)
+    try expectBuildsAndRuns("spec_closure_escape",
+        \\type Box = struct { value: i32 };
+        \\fn make_adder(n: i32) -> (i32) -> i32 {
+        \\    return |n| (x: i32) -> i32 { return n + x; };
+        \\}
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 7 };
+        \\    const get = |p: *| () -> i32 { return p.value; };
+        \\    const owned = get();
+        \\    const add5 = make_adder(5);
+        \\    return owned + add5(10);
+        \\}
+    , 22, "");
 }
 
 test "spec ok: §1.6 uppercase backslash-X / backslash-U escapes are rejected" {
