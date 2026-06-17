@@ -129,12 +129,17 @@ pub const Codegen = struct {
         return_type: *const Type,
     };
 
-    // a lifted lambda (section 4.4). The runtime value of a lambda is a 'ptr'
-    // to a heap environment laid out as [ fn_ptr | capture_0 | capture_1 ... ];
-    // the lifted function takes that env pointer as its first argument and
-    // reads its captures from it.
+    // a lifted lambda (section 4.4). A lambda value is an 8-byte aggregate
+    // holding a pointer to a heap environment laid out as a 24-byte header
+    // [ fn_ptr@0 | refcount(i64)@8 | drop_ptr@16 ] followed by the captures.
+    // The value is an aggregate (not a bare ptr) so it flows through the
+    // owning-value machinery: a copy bumps the refcount, a scope-end drop
+    // releases it (freeing the environment and its owning captures at zero).
+    const ENV_HEADER: u64 = 24;
     const LambdaInfo = struct {
         name: []const u8,
+        // the per-lambda environment destructor (drops owning captures, frees)
+        drop_name: []const u8,
         lambda: *const ast.Lambda,
         view_index: usize,
         parameter_types: []const *const Type,
@@ -163,6 +168,9 @@ pub const Codegen = struct {
         name: []const u8,
         pointer: []const u8,
         declared_type: *const Type,
+        // a borrowed local is not dropped at scope end: a lambda's captures
+        // are owned by its environment, not by each invocation (section 4.4)
+        borrowed: bool = false,
     };
 
     const BreakTarget = struct {
@@ -1759,7 +1767,7 @@ pub const Codegen = struct {
         }
 
         var captures: std.ArrayList(CaptureSlot) = .empty;
-        var offset: u64 = 8;
+        var offset: u64 = ENV_HEADER;
         var alignment: u64 = 8;
         for (lambda.captures) |capture| {
             const resolved_capture = try self.captureSlot(capture, span);
@@ -1781,6 +1789,7 @@ pub const Codegen = struct {
         self.global_counter += 1;
         info.* = .{
             .name = try std.fmt.allocPrint(self.arena, "alloy.lambda.{d}", .{id}),
+            .drop_name = try std.fmt.allocPrint(self.arena, "alloy.lambda.{d}.drop", .{id}),
             .lambda = lambda,
             .view_index = self.current_view,
             .parameter_types = try parameter_types.toOwnedSlice(self.arena),
@@ -1803,14 +1812,21 @@ pub const Codegen = struct {
         const info = try self.lambdaInfo(expression);
         try self.declareMalloc();
         // the environment is heap-allocated so the closure may outlive the
-        // scope that built it (section 4.4). It is not reclaimed on scope exit
-        // yet — closures live for the run, mirroring the interpreter's arena.
+        // scope that built it (section 4.4); it is reference counted and freed
+        // when the last referencing closure value drops (section 4.2)
         const env = try self.freshTemp();
         try self.instruction("{s} = call ptr @\"malloc\"(i64 {d})", .{ env, info.env_size });
-        // the function pointer occupies the first word of the environment
+        // header: function pointer, refcount = 1, environment destructor
         try self.instruction("store ptr @\"{s}\", ptr {s}", .{ info.name, env });
+        const refcount = try self.byteOffset(env, 8);
+        try self.instruction("store i64 1, ptr {s}", .{refcount});
+        const drop_slot = try self.byteOffset(env, 16);
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ info.drop_name, drop_slot });
         try self.storeCaptures(info, env);
-        return .{ .scalar = .{ .text = env, .llvm = "ptr" } };
+        // the closure value is an 8-byte aggregate holding the env pointer
+        const slot = try self.aggregateSlot(.{ .size = 8, .alignment = 8 });
+        try self.instruction("store ptr {s}, ptr {s}", .{ env, slot });
+        return .{ .memory = .{ .pointer = slot, .layout = .{ .size = 8, .alignment = 8 }, .fresh = true } };
     }
 
     // fills the environment at closure-creation time (section 4.4)
@@ -1829,9 +1845,20 @@ pub const Codegen = struct {
                     try self.instruction("store ptr null, ptr {s}", .{outer.pointer});
                 },
                 .copy => {
-                    const value = try self.loadPlace(.{ .pointer = outer.pointer, .value_type = outer.declared_type }, zero);
-                    const coerced = try self.coerceOperand(value, outer.declared_type, capture.slot_type, zero);
-                    try self.storeOperand(dest, coerced, capture.slot_type, zero);
+                    const outer_resolved = try self.resolvedOf(outer.declared_type);
+                    // a copy through a pointer/reference captures the pointee
+                    // by value (pointee transparency, section 4.2): read the
+                    // address, then deep-copy the pointee into the env slot
+                    const value: Operand = switch (outer_resolved.*) {
+                        .pointer, .reference => |indirection| value: {
+                            const address = try self.loadScalar(outer.pointer, "ptr");
+                            const layout = (try self.layoutQuery(indirection.child, 0)) orelse Checker.Layout{ .size = 8, .alignment = 8 };
+                            break :value Operand{ .memory = .{ .pointer = address, .layout = layout, .fresh = false } };
+                        },
+                        else => try self.loadPlace(.{ .pointer = outer.pointer, .value_type = outer.declared_type }, zero),
+                    };
+                    // storeOperand deep-copies a non-fresh owning value (4.2)
+                    try self.storeOperand(dest, value, capture.slot_type, zero);
                 },
             }
         }
@@ -1908,9 +1935,33 @@ pub const Codegen = struct {
         out.print("{s}", .{self.allocas.writer.buffered()}) catch return error.OutOfMemory;
         out.print("{s}", .{self.body.writer.buffered()}) catch return error.OutOfMemory;
         out.print("}}\n", .{}) catch return error.OutOfMemory;
+
+        try self.emitLambdaDrop(info);
     }
 
-    // binds each capture from the environment at the lifted function's entry
+    // the per-lambda environment destructor: drops each owning capture, then
+    // frees the environment. Invoked by the generic closure drop when the
+    // refcount reaches zero (section 4.2).
+    fn emitLambdaDrop(self: *Codegen, info: *LambdaInfo) Error!void {
+        try self.declareFree();
+        const span: Token.Location = .{ .start = 0, .end = 0 };
+        const saved = self.beginHelperFunction();
+        for (info.captures) |capture| {
+            if (!try self.ownsHeap(capture.slot_type, 0)) continue;
+            const child_drop = try self.dropHelper(capture.slot_type, span);
+            const pointer = try self.byteOffset("%env", capture.offset);
+            try self.instruction("call void @\"{s}\"(ptr {s})", .{ child_drop, pointer });
+        }
+        try self.instruction("call void @\"free\"(ptr %env)", .{});
+        try self.instruction("ret void", .{});
+        self.terminated = true;
+        const header = try std.fmt.allocPrint(self.arena, "define internal void @\"{s}\"(ptr %env) {{\nentry:\n", .{info.drop_name});
+        try self.finishHelperFunction(saved, header);
+    }
+
+    // binds each capture from the environment at the lifted function's entry.
+    // Captures are borrowed: the environment owns them and drops them once, so
+    // the invocation's scope-end must not drop them (section 4.4).
     fn bindCaptures(self: *Codegen, info: *LambdaInfo) Error!void {
         for (info.captures) |capture| {
             const src = try self.byteOffset("%env", capture.offset);
@@ -1920,10 +1971,10 @@ pub const Codegen = struct {
                     const slot = try self.scalarSlot("ptr");
                     const loaded = try self.loadScalar(src, "ptr");
                     try self.storeScalar(slot, .{ .text = loaded, .llvm = "ptr" });
-                    try self.bindLocal(capture.name, slot, capture.slot_type);
+                    try self.bindBorrowedLocal(capture.name, slot, capture.slot_type);
                 },
                 // a copy lives inline in the env: its slot address is its place
-                .copy => try self.bindLocal(capture.name, src, capture.slot_type),
+                .copy => try self.bindBorrowedLocal(capture.name, src, capture.slot_type),
             }
         }
     }
@@ -1950,9 +2001,17 @@ pub const Codegen = struct {
     // the head of its environment (section 4.4)
     fn callClosure(self: *Codegen, expression: *const ast.Expression, callee: *const ast.Expression, fn_type: Type.Function, span: Token.Location) Error!Operand {
         const call = expression.call;
-        const closure = (try self.evalExpression(callee)).scalar.text;
+        // the closure value is an 8-byte aggregate holding the environment
+        // pointer; load the environment, then the function pointer at its head
+        const closure_value = try self.evalExpression(callee);
+        const closure_slot = switch (closure_value) {
+            .memory => |memory| memory.pointer,
+            else => return self.report(span, "internal: a closure callee is not an aggregate", .{}),
+        };
+        const env = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr {s}", .{ env, closure_slot });
         const fn_ptr = try self.freshTemp();
-        try self.instruction("{s} = load ptr, ptr {s}", .{ fn_ptr, closure });
+        try self.instruction("{s} = load ptr, ptr {s}", .{ fn_ptr, env });
 
         const return_type = try self.substituted(fn_type.return_type);
         const aggregate_return = switch (try self.classify(return_type, span)) {
@@ -1969,7 +2028,7 @@ pub const Codegen = struct {
             try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{result_slot.?}));
         }
         // the environment is the first ordinary argument
-        try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{closure}));
+        try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{env}));
         for (call.arguments, 0..) |argument, index| {
             const parameter_type = if (index < fn_type.parameter_types.len)
                 try self.substituted(fn_type.parameter_types[index])
@@ -3035,7 +3094,10 @@ pub const Codegen = struct {
                 }
                 return .{ .scalar = "ptr" };
             },
-            .heap_array, .function => .{ .scalar = "ptr" },
+            .heap_array => .{ .scalar = "ptr" },
+            // a closure value is an 8-byte aggregate (a pointer to its heap
+            // environment) so it flows through the owning-value machinery
+            .function => .{ .aggregate = .{ .size = 8, .alignment = 8 } },
             else => {
                 const layout = (try self.layoutQuery(resolved, 0)) orelse
                     return self.report(span, "this type has no defined runtime layout", .{});
@@ -3083,7 +3145,8 @@ pub const Codegen = struct {
         if (depth > 16) return false;
         const resolved = try self.resolvedOf(candidate);
         switch (resolved.*) {
-            .pointer, .heap_array => return true,
+            // a closure owns its reference-counted heap environment (4.4)
+            .pointer, .heap_array, .function => return true,
             .fixed_array => |array| return self.ownsHeap(array.element, depth + 1),
             .structural, .declared, .inline_enum, .structural_enum => {
                 if (try self.enumFrameQuery(resolved)) |frame| {
@@ -3251,6 +3314,36 @@ pub const Codegen = struct {
                 const length = try std.fmt.allocPrint(self.arena, "{d}", .{array.length});
                 try self.emitHelperElementLoop("%value", length, element_layout.size, child_drop, null);
             },
+            .function => {
+                // a closure holds its environment pointer; decrement the
+                // environment's refcount and run its destructor at zero (4.4)
+                const env = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr %value", .{env});
+                const live = try self.freshTemp();
+                try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, env });
+                const live_label = try self.freshLabel("live");
+                const done_label = try self.freshLabel("done");
+                try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+                self.terminated = true;
+                try self.startBlock(live_label);
+                const rc_slot = try self.byteOffset(env, 8);
+                const rc = try self.freshTemp();
+                try self.instruction("{s} = load i64, ptr {s}", .{ rc, rc_slot });
+                const dec = try self.freshTemp();
+                try self.instruction("{s} = sub i64 {s}, 1", .{ dec, rc });
+                try self.instruction("store i64 {s}, ptr {s}", .{ dec, rc_slot });
+                const dead = try self.freshTemp();
+                try self.instruction("{s} = icmp eq i64 {s}, 0", .{ dead, dec });
+                const free_label = try self.freshLabel("free");
+                try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ dead, free_label, done_label });
+                self.terminated = true;
+                try self.startBlock(free_label);
+                const drop_ptr = try self.freshTemp();
+                const drop_slot = try self.byteOffset(env, 16);
+                try self.instruction("{s} = load ptr, ptr {s}", .{ drop_ptr, drop_slot });
+                try self.instruction("call void {s}(ptr {s})", .{ drop_ptr, env });
+                try self.startBlock(done_label);
+            },
             else => {
                 if (try self.enumFrameQuery(resolved)) |frame| {
                     try self.emitEnumPayloadDispatch(frame, "drop", span);
@@ -3353,6 +3446,27 @@ pub const Codegen = struct {
                 const child_copy = try self.copyHelper(array.element, span);
                 const length = try std.fmt.allocPrint(self.arena, "{d}", .{array.length});
                 try self.emitHelperElementLoop("%destination", length, element_layout.size, child_copy, "%origin");
+            },
+            .function => {
+                // a closure copy shares the environment and bumps its refcount
+                // (section 4.2); the destructor frees it once, at the last drop
+                const env = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr %origin", .{env});
+                try self.instruction("store ptr {s}, ptr %destination", .{env});
+                const live = try self.freshTemp();
+                try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, env });
+                const live_label = try self.freshLabel("live");
+                const done_label = try self.freshLabel("done");
+                try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+                self.terminated = true;
+                try self.startBlock(live_label);
+                const rc_slot = try self.byteOffset(env, 8);
+                const rc = try self.freshTemp();
+                try self.instruction("{s} = load i64, ptr {s}", .{ rc, rc_slot });
+                const inc = try self.freshTemp();
+                try self.instruction("{s} = add i64 {s}, 1", .{ inc, rc });
+                try self.instruction("store i64 {s}, ptr {s}", .{ inc, rc_slot });
+                try self.startBlock(done_label);
             },
             else => {
                 try self.copyBytes("%destination", "%origin", layout.size);
@@ -3921,6 +4035,7 @@ pub const Codegen = struct {
         while (index > 0) {
             index -= 1;
             const local = frame.locals.items[index];
+            if (local.borrowed) continue;
             if (skip_pointer) |skip| {
                 if (std.mem.eql(u8, skip, local.pointer)) continue;
             }
@@ -3963,6 +4078,12 @@ pub const Codegen = struct {
     fn bindLocal(self: *Codegen, name: []const u8, pointer: []const u8, declared_type: *const Type) Error!void {
         const frame = &self.scopes.items[self.scopes.items.len - 1];
         try frame.locals.append(self.arena, .{ .name = name, .pointer = pointer, .declared_type = declared_type });
+    }
+
+    // binds a local the scope must not drop (a borrowed capture, section 4.4)
+    fn bindBorrowedLocal(self: *Codegen, name: []const u8, pointer: []const u8, declared_type: *const Type) Error!void {
+        const frame = &self.scopes.items[self.scopes.items.len - 1];
+        try frame.locals.append(self.arena, .{ .name = name, .pointer = pointer, .declared_type = declared_type, .borrowed = true });
     }
 
     fn lookupLocal(self: *Codegen, name: []const u8) ?Local {

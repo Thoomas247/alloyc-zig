@@ -2491,6 +2491,24 @@ test "spec ok: §4.4 native code generation lowers lambdas and closures" {
         \\    return owned + add5(10);
         \\}
     , 22, "");
+    // a closure value is copied: the shared environment is reference counted,
+    // so each copy is independently usable and the heap is freed exactly once
+    try expectBuildsAndRuns("spec_closure_copy",
+        \\fn main() -> i32 {
+        \\    const add = (x: i32) -> i32 { return x + 1; };
+        \\    const add2 = add;
+        \\    return add(1) + add2(2);
+        \\}
+    , 5, "");
+    // a copy capture through a pointer captures the pointee by value
+    try expectBuildsAndRuns("spec_closure_copy_through_pointer",
+        \\type Box = struct { value: i32 };
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 5 };
+        \\    const f = |p| () -> i32 { return p.value; };
+        \\    return f();
+        \\}
+    , 5, "");
 }
 
 test "spec ok: §1.6 uppercase backslash-X / backslash-U escapes are rejected" {
