@@ -1,7 +1,8 @@
 //! Name resolution, the first whole-program stage after the merge point.
 //! All module definitions merge into one global symbol table (section 5.4):
-//! unqualified names see the entire merged unit, while module-qualified paths
-//! (`std::vec::Vec`) additionally pass a pub/exp visibility check. The
+//! unqualified names see their own library plus every 'exp' symbol of other
+//! libraries in the unit, while module-qualified paths (`std::vec::Vec`)
+//! additionally pass a pub/exp visibility check. The
 //! resolver then walks every definition body and verifies that each name
 //! refers to a declaration, reporting every failure as a diagnostic.
 
@@ -16,6 +17,8 @@ pub const ModuleView = struct {
     key: ?[]const u8,
     path: []const u8,
     source: []const u8,
+    // the package the module arrived from, null in the executable's unit
+    library: ?[]const u8 = null,
     module: *const ast.Module,
 };
 
@@ -29,10 +32,48 @@ pub const Symbol = struct {
 /// functions, which may overload (section 3.6).
 pub const SymbolList = std.ArrayList(Symbol);
 
-/// The merged compilation unit: every definition of every module by name.
+/// Import alias to canonical module key, one map per module view.
+pub const AliasMap = std.StringHashMapUnmanaged([]const u8);
+
+/// Library names whose 'exp' symbols join a module's unqualified namespace,
+/// one map per module view; the value is the import token for diagnostics.
+pub const InjectedMap = std.StringHashMapUnmanaged(Token);
+
+/// One resolved use of a global definition, recorded for tooling: the
+/// language server answers find-references and rename from this table.
+pub const NameReference = struct {
+    view_index: usize,
+    span: Token.Location,
+    definition: *const ast.Definition,
+};
+
+/// One declaration or use of a local binding (parameter, variable,
+/// capture, or type parameter), identified by a per-run binding id.
+pub const LocalReference = struct {
+    view_index: usize,
+    span: Token.Location,
+    binding_id: usize,
+};
+
+/// The merged compilation unit: every definition of every module by name,
+/// plus the maps later stages need to re-derive what a qualified path pins.
 pub const MergedUnit = struct {
     globals: std.StringHashMapUnmanaged(SymbolList),
+    // canonical import key ('std::vec', 'pkg::mathx') to view index
+    module_keys: std.StringHashMapUnmanaged(usize),
+    aliases: []const AliasMap,
+    injected: []const InjectedMap,
+    references: []const NameReference,
+    locals: []const LocalReference,
 };
+
+/// Whether two modules belong to the same library; null marks the
+/// executable's own compilation unit (section 5.4).
+pub fn sameLibrary(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
 
 // 'void' is not a value type, but '#void' marks a payload-less enum
 // variant in 'add_member' (section 3.4)
@@ -44,7 +85,7 @@ const primitive_types = std.StaticStringMap(void).initComptime(.{
 
 // built-in macros (section 6.4), callable without any declaration
 const builtin_macros = std.StaticStringMap(void).initComptime(.{
-    .{"type_of"}, .{"struct_type"}, .{"enum_type"},
+    .{"type_of"}, .{"struct_type"}, .{"enum_type"}, .{"implementers_of"},
 });
 
 pub const Resolver = struct {
@@ -56,8 +97,17 @@ pub const Resolver = struct {
     globals: std.StringHashMapUnmanaged(SymbolList),
     // canonical import key to view index, for module-qualified paths
     module_keys: std.StringHashMapUnmanaged(usize),
-    // import aliases of the module currently being resolved
-    aliases: std.StringHashMapUnmanaged([]const u8),
+    // import aliases per module view, kept for the later stages
+    alias_maps: []AliasMap,
+    // libraries injected into each view's unqualified namespace: imports
+    // without an explicit 'as' inject their library's 'exp' names; an
+    // aliased import is reachable through the alias only (section 5.4)
+    injected_maps: []InjectedMap,
+    // every resolved use of a global definition, for tooling
+    references: std.ArrayList(NameReference),
+    // every declaration and use of a local binding, for tooling
+    local_references: std.ArrayList(LocalReference),
+    next_binding_id: usize,
     scopes: std.ArrayList(Frame),
     current_view: usize,
 
@@ -69,6 +119,7 @@ pub const Resolver = struct {
 
     const Binding = struct {
         name: []const u8,
+        id: usize,
     };
 
     pub const Error = error{OutOfMemory};
@@ -86,7 +137,11 @@ pub const Resolver = struct {
             .diagnostics_allocator = diagnostics_allocator,
             .globals = .empty,
             .module_keys = .empty,
-            .aliases = .empty,
+            .alias_maps = &.{},
+            .injected_maps = &.{},
+            .references = .empty,
+            .local_references = .empty,
+            .next_binding_id = 0,
             .scopes = .empty,
             .current_view = 0,
         };
@@ -96,11 +151,101 @@ pub const Resolver = struct {
     /// diagnostics list; the returned unit is valid either way.
     pub fn run(self: *Resolver) Error!MergedUnit {
         try self.collectGlobals();
+        self.alias_maps = try self.arena.alloc(AliasMap, self.views.len);
+        for (self.alias_maps) |*map| map.* = .empty;
+        self.injected_maps = try self.arena.alloc(InjectedMap, self.views.len);
+        for (self.injected_maps) |*map| map.* = .empty;
+        for (self.views, 0..) |view, view_index| {
+            self.current_view = view_index;
+            try self.registerImports(view);
+        }
+        try self.checkInjectedCollisions();
         for (self.views, 0..) |view, view_index| {
             self.current_view = view_index;
             try self.resolveModule(view);
         }
-        return .{ .globals = self.globals };
+        return .{
+            .globals = self.globals,
+            .module_keys = self.module_keys,
+            .aliases = self.alias_maps,
+            .injected = self.injected_maps,
+            .references = self.references.items,
+            .locals = self.local_references.items,
+        };
+    }
+
+    fn recordLocal(self: *Resolver, span: Token.Location, binding_id: usize) Error!void {
+        try self.local_references.append(self.arena, .{
+            .view_index = self.current_view,
+            .span = span,
+            .binding_id = binding_id,
+        });
+    }
+
+    fn recordReference(self: *Resolver, span: Token.Location, definition: *const ast.Definition) Error!void {
+        try self.references.append(self.arena, .{
+            .view_index = self.current_view,
+            .span = span,
+            .definition = definition,
+        });
+    }
+
+    // registers each import's alias and, when the import has no explicit
+    // 'as', injects its library's 'exp' names into this module's
+    // unqualified namespace (section 5.4)
+    fn registerImports(self: *Resolver, view: ModuleView) Error!void {
+        for (view.module.imports) |import| {
+            // every import gets an alias: the explicit 'as' name, or the
+            // last path segment ('import pkg::mathx' aliases 'mathx')
+            const key = try self.importKey(import, view);
+            const alias_token = import.alias orelse import.path[import.path.len - 1];
+            const alias_name = alias_token.slice(view.source);
+            const existing = try self.alias_maps[self.current_view].getOrPut(self.arena, alias_name);
+            if (existing.found_existing) {
+                try self.report(alias_token.location, "the import alias '{s}' is already used in this module; rename one with 'as'", .{alias_name});
+                continue;
+            }
+            existing.value_ptr.* = key;
+            if (import.alias != null) continue;
+            const target_view = self.module_keys.get(key) orelse continue;
+            const target_library = self.views[target_view].library orelse continue;
+            if (sameLibrary(view.library, target_library)) continue;
+            const injected = try self.injected_maps[self.current_view].getOrPut(self.arena, target_library);
+            if (!injected.found_existing) injected.value_ptr.* = alias_token;
+        }
+    }
+
+    // a name visible unqualified from two different libraries in one module
+    // is an error resolved by aliasing an import (section 5.4)
+    fn checkInjectedCollisions(self: *Resolver) Error!void {
+        var iterator = self.globals.iterator();
+        while (iterator.next()) |entry| {
+            for (self.views, 0..) |view, view_index| {
+                var first_library: ?[]const u8 = null;
+                var reported = false;
+                for (entry.value_ptr.items) |symbol| {
+                    if (reported) break;
+                    const symbol_library = self.views[symbol.view_index].library;
+                    const own = sameLibrary(view.library, symbol_library);
+                    if (!own) {
+                        if (symbol.visibility != .exported) continue;
+                        const library = symbol_library orelse continue;
+                        if (!self.injected_maps[view_index].contains(library)) continue;
+                    }
+                    const display = if (own) view.library orelse "this compilation unit" else symbol_library.?;
+                    if (first_library) |previous| {
+                        if (std.mem.eql(u8, previous, display)) continue;
+                        // point at an offending import of this module
+                        const token = self.injected_maps[view_index].get(if (own) previous else display).?;
+                        self.current_view = view_index;
+                        try self.report(token.location, "'{s}' is visible from both '{s}' and '{s}'; alias the import ('import ... as name') to disambiguate (section 5.4)", .{ entry.key_ptr.*, previous, display });
+                        reported = true;
+                    } else {
+                        first_library = display;
+                    }
+                }
+            }
+        }
     }
 
     // merge pass: every definition of every module lands in one table
@@ -123,12 +268,18 @@ pub const Resolver = struct {
                     try existing.value_ptr.append(self.arena, symbol);
                     continue;
                 }
-                // only fn definitions may share a name (overloading, section
-                // 3.6); identical-signature detection is the type checker's
-                const overloads = definition.kind == .fn_def and
-                    existing.value_ptr.items[0].definition.kind == .fn_def;
-                if (!overloads) {
-                    const previous_path = self.views[existing.value_ptr.items[0].view_index].path;
+                // only fn definitions may share a name within one library
+                // (overloading, section 3.6); different libraries reuse names
+                // freely, clashes surface at unqualified use sites instead
+                var conflict: ?Symbol = null;
+                for (existing.value_ptr.items) |other| {
+                    if (!sameLibrary(self.views[other.view_index].library, view.library)) continue;
+                    if (definition.kind == .fn_def and other.definition.kind == .fn_def) continue;
+                    conflict = other;
+                    break;
+                }
+                if (conflict) |other| {
+                    const previous_path = self.views[other.view_index].path;
                     self.current_view = view_index;
                     try self.report(name_token.location, "redeclaration of '{s}'; previously declared in {s}", .{ name, previous_path });
                     continue;
@@ -139,13 +290,6 @@ pub const Resolver = struct {
     }
 
     fn resolveModule(self: *Resolver, view: ModuleView) Error!void {
-        self.aliases.clearRetainingCapacity();
-        for (view.module.imports) |import| {
-            if (import.alias) |alias| {
-                const key = try self.joinPath(import.path, view.source);
-                try self.aliases.put(self.arena, alias.slice(view.source), key);
-            }
-        }
         for (view.module.definitions) |*definition| {
             try self.resolveDefinition(definition);
         }
@@ -221,12 +365,17 @@ pub const Resolver = struct {
 
     fn resolveInterfaceName(self: *Resolver, name_token: Token) Error!void {
         const name = name_token.slice(self.source());
-        const symbols = self.globals.get(name) orelse {
+        const lookup = self.lookupUnqualified(name);
+        const symbol = lookup.visible orelse {
+            if (lookup.hidden != null) {
+                return self.report(name_token.location, "interface '{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{name});
+            }
             return self.report(name_token.location, "use of undeclared interface '{s}'", .{name});
         };
-        if (symbols.items[0].definition.kind != .interface_def) {
-            return self.report(name_token.location, "'{s}' is not an interface ({s})", .{ name, definitionKindName(symbols.items[0].definition) });
+        if (symbol.definition.kind != .interface_def) {
+            return self.report(name_token.location, "'{s}' is not an interface ({s})", .{ name, definitionKindName(symbol.definition) });
         }
+        try self.recordReference(name_token.location, symbol.definition);
     }
 
     fn resolveStatement(self: *Resolver, statement: *const ast.Statement) Error!void {
@@ -254,6 +403,7 @@ pub const Resolver = struct {
             .break_stmt => |break_stmt| {
                 if (break_stmt.value) |value| try self.resolveExpression(value);
             },
+            .yield_stmt => |yield_stmt| try self.resolveExpression(yield_stmt.value),
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value| try self.resolveExpression(value);
             },
@@ -294,9 +444,14 @@ pub const Resolver = struct {
                 try self.resolveExpression(index.object);
                 try self.resolveExpression(index.subscript);
             },
+            .subslice => |subslice| {
+                try self.resolveExpression(subslice.object);
+                if (subslice.start) |start| try self.resolveExpression(start);
+                try self.resolveExpression(subslice.end);
+            },
             .struct_init => |struct_init| {
-                if (struct_init.name) |name| {
-                    try self.resolvePath(&.{name}, .type);
+                if (struct_init.path) |path| {
+                    try self.resolvePath(path, .type);
                 }
                 for (struct_init.members) |member| {
                     try self.resolveExpression(member.value);
@@ -385,7 +540,10 @@ pub const Resolver = struct {
     // a lambda capture must name something visible where the lambda is written
     fn resolveCapturedVariable(self: *Resolver, name_token: Token) Error!void {
         const name = name_token.slice(self.source());
-        if (self.lookupLocal(name, false) or self.globals.contains(name)) return;
+        if (self.lookupLocal(name, false)) |binding_id| {
+            return self.recordLocal(name_token.location, binding_id);
+        }
+        if (self.lookupUnqualified(name).visible != null) return;
         try self.report(name_token.location, "use of undeclared identifier '{s}'", .{name});
     }
 
@@ -439,16 +597,28 @@ pub const Resolver = struct {
         const first = path[0].slice(self.source());
 
         if (path.len == 1) {
-            if (self.lookupLocal(first, false)) return;
-            if (self.globals.contains(first)) return;
+            if (self.lookupLocal(first, false)) |binding_id| {
+                return self.recordLocal(span, binding_id);
+            }
+            const lookup = self.lookupUnqualified(first);
+            if (lookup.visible) |symbol| {
+                return self.recordReference(span, symbol.definition);
+            }
             // primitives appear in type positions and as '#u32' reflection
             if (primitive_types.has(first)) return;
             if (context == .value and builtin_macros.has(first)) return;
-            if (self.lookupLocal(first, true)) {
+            if (self.lookupLocal(first, true)) |binding_id| {
                 // capture lists are value-only: a type name (a scope type
                 // parameter) stays visible inside a lambda without capture
-                if (context == .type) return;
+                if (context == .type) return self.recordLocal(span, binding_id);
                 return self.report(span, "'{s}' is declared outside this lambda; add it to the capture list to use it", .{first});
+            }
+            if (lookup.hidden) |hidden| {
+                if (hidden.visibility == .exported) {
+                    const library = self.views[hidden.view_index].library orelse "the program";
+                    return self.report(span, "'{s}' is exported by '{s}' but not imported unqualified here; use qualified access or import it without 'as' (section 5.4)", .{ first, library });
+                }
+                return self.report(span, "'{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{first});
             }
             return self.report(span, "use of undeclared identifier '{s}'", .{first});
         }
@@ -461,11 +631,19 @@ pub const Resolver = struct {
             if (self.module_keys.get(key)) |view_index| {
                 return self.resolveQualified(span, key, view_index, path[prefix_length..]);
             }
+            // inside a library, relative module keys live under the
+            // package namespace (section 5.4)
+            if (self.views[self.current_view].library) |package_name| {
+                const prefixed = try std.fmt.allocPrint(self.arena, "pkg::{s}::{s}", .{ package_name, key });
+                if (self.module_keys.get(prefixed)) |view_index| {
+                    return self.resolveQualified(span, prefixed, view_index, path[prefix_length..]);
+                }
+            }
             if (prefix_length == 1) break;
         }
 
         // alias-qualified: 'vectors::Vec' after 'import std::vec as vectors'
-        if (self.aliases.get(first)) |key| {
+        if (self.alias_maps[self.current_view].get(first)) |key| {
             if (self.module_keys.get(key)) |view_index| {
                 return self.resolveQualified(span, key, view_index, path[1..]);
             }
@@ -473,9 +651,12 @@ pub const Resolver = struct {
 
         // 'Type::Variant' on a local or global enum type
         if (path.len == 2) {
-            if (self.lookupLocal(first, false)) return;
-            if (self.globals.get(first)) |symbols| {
-                return self.checkVariant(span, symbols.items[0], path[1]);
+            if (self.lookupLocal(first, false)) |binding_id| {
+                return self.recordLocal(path[0].location, binding_id);
+            }
+            if (self.lookupUnqualified(first).visible) |symbol| {
+                try self.recordReference(path[0].location, symbol.definition);
+                return self.checkVariant(span, symbol, path[1]);
             }
         }
 
@@ -484,16 +665,19 @@ pub const Resolver = struct {
     }
 
     // resolves the remainder of a module-qualified path (section 5.4):
-    // qualified access reaches only pub/exp definitions of that module
+    // qualified access reaches pub/exp definitions within one compilation
+    // unit, but only 'exp' definitions across a library boundary
     fn resolveQualified(self: *Resolver, span: Token.Location, key: []const u8, view_index: usize, remainder: []const Token) Error!void {
         const definition_name = remainder[0].slice(self.source());
+        const cross_library = !sameLibrary(self.views[self.current_view].library, self.views[view_index].library);
         const symbols = self.globals.get(definition_name) orelse SymbolList.empty;
         var found: ?Symbol = null;
         var found_visible = false;
         for (symbols.items) |symbol| {
             if (symbol.view_index != view_index) continue;
             found = symbol;
-            if (symbol.visibility != .private) {
+            const visible = if (cross_library) symbol.visibility == .exported else symbol.visibility != .private;
+            if (visible) {
                 found_visible = true;
                 break;
             }
@@ -502,8 +686,12 @@ pub const Resolver = struct {
             return self.report(span, "module '{s}' has no definition '{s}'", .{ key, definition_name });
         }
         if (!found_visible) {
+            if (cross_library) {
+                return self.report(span, "'{s}' in module '{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{ definition_name, key });
+            }
             return self.report(span, "'{s}' in module '{s}' is private; mark it 'pub' to allow qualified access", .{ definition_name, key });
         }
+        try self.recordReference(remainder[0].location, found.?.definition);
         if (remainder.len == 2) {
             return self.checkVariant(span, found.?, remainder[1]);
         }
@@ -511,6 +699,49 @@ pub const Resolver = struct {
             const full = try self.joinPath(remainder, self.source());
             return self.report(span, "'{s}' does not name a definition in module '{s}'", .{ full, key });
         }
+    }
+
+    // the canonical module key of an import, mirroring the loader's
+    // namespacing: a library's relative imports resolve under its own
+    // package prefix (section 5.4)
+    fn importKey(self: *Resolver, import: ast.Import, view: ModuleView) Error![]const u8 {
+        const joined = try self.joinPath(import.path, view.source);
+        if (view.library) |package_name| {
+            const first_segment = import.path[0].slice(view.source);
+            if (!std.mem.eql(u8, first_segment, "std") and !std.mem.eql(u8, first_segment, "pkg")) {
+                return std.fmt.allocPrint(self.arena, "pkg::{s}::{s}", .{ package_name, joined });
+            }
+        }
+        return joined;
+    }
+
+    // unqualified lookup (section 5.4): a name sees every symbol of its own
+    // library plus the 'exp' symbols of libraries this module imported
+    // without an alias
+    fn visibleUnqualified(self: *const Resolver, symbol: Symbol) bool {
+        if (sameLibrary(self.views[self.current_view].library, self.views[symbol.view_index].library)) return true;
+        if (symbol.visibility != .exported) return false;
+        const library = self.views[symbol.view_index].library orelse return false;
+        return self.injected_maps[self.current_view].contains(library);
+    }
+
+    const UnqualifiedLookup = struct {
+        visible: ?Symbol = null,
+        // an invisible match: not exported, or exported behind an alias
+        hidden: ?Symbol = null,
+    };
+
+    fn lookupUnqualified(self: *const Resolver, name: []const u8) UnqualifiedLookup {
+        var result: UnqualifiedLookup = .{};
+        const symbols = self.globals.get(name) orelse return result;
+        for (symbols.items) |symbol| {
+            if (self.visibleUnqualified(symbol)) {
+                if (result.visible == null) result.visible = symbol;
+            } else if (result.hidden == null) {
+                result.hidden = symbol;
+            }
+        }
+        return result;
     }
 
     // verifies 'Type::Variant' when the base is a directly declared enum;
@@ -551,22 +782,26 @@ pub const Resolver = struct {
                 return self.report(name_token.location, "'{s}' is already declared in this scope", .{name});
             }
         }
-        try frame.bindings.append(self.arena, .{ .name = name });
+        const id = self.next_binding_id;
+        self.next_binding_id += 1;
+        try frame.bindings.append(self.arena, .{ .name = name, .id = id });
+        try self.recordLocal(name_token.location, id);
     }
 
-    // searches scope frames innermost-first; without 'past_barriers' the
-    // search stops at a lambda boundary so uncaptured locals stay invisible
-    fn lookupLocal(self: *const Resolver, name: []const u8, past_barriers: bool) bool {
+    // searches scope frames innermost-first, yielding the binding's id;
+    // without 'past_barriers' the search stops at a lambda boundary so
+    // uncaptured locals stay invisible
+    fn lookupLocal(self: *const Resolver, name: []const u8, past_barriers: bool) ?usize {
         var frame_index = self.scopes.items.len;
         while (frame_index > 0) {
             frame_index -= 1;
             const frame = self.scopes.items[frame_index];
             for (frame.bindings.items) |binding| {
-                if (std.mem.eql(u8, binding.name, name)) return true;
+                if (std.mem.eql(u8, binding.name, name)) return binding.id;
             }
-            if (frame.barrier and !past_barriers) return false;
+            if (frame.barrier and !past_barriers) return null;
         }
-        return false;
+        return null;
     }
 
     fn joinPath(self: *Resolver, path: []const Token, path_source: []const u8) Error![]const u8 {

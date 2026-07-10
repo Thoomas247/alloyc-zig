@@ -1,0 +1,80 @@
+{
+    "name": "alloy-language",
+    "displayName": "Alloy Language",
+    "description": "Alloy language support: syntax highlighting, diagnostics, completion, hover, and go-to-definition via the alloyc language server.",
+    "version": "0.1.0",
+    "publisher": "alloy",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "main": "./extension.js",
+    "activationEvents": [],
+    "contributes": {
+        "languages": [
+            {
+                "id": "alloy",
+                "aliases": [
+                    "Alloy"
+                ],
+                "extensions": [
+                    ".alloy"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "alloy",
+                "scopeName": "source.alloy",
+                "path": "./syntaxes/alloy.tmLanguage.json"
+            }
+        ],
+        "debuggers": [
+            {
+                "type": "alloy",
+                "label": "Alloy Debug (interpreter)",
+                "languages": ["alloy"],
+                "configurationAttributes": {
+                    "launch": {
+                        "required": ["program"],
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Path to the .alloy entry file to debug."
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "type": "alloy",
+                        "request": "launch",
+                        "name": "Debug Alloy (interpreter)",
+                        "program": "${file}"
+                    }
+                ]
+            }
+        ],
+        "breakpoints": [
+            {
+                "language": "alloy"
+            }
+        ],
+        "configuration": {
+            "title": "Alloy",
+            "properties": {
+                "alloy.serverPath": {
+                    "type": "string",
+                    "default": "alloyc",
+                    "description": "Path to the alloyc executable providing the language server ('alloyc lsp')."
+                }
+            }
+        }
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    }
+}

@@ -7,6 +7,10 @@ const usage =
     \\usage: alloyc <file.alloy>
     \\       alloyc run <file.alloy>
     \\       alloyc build <file.alloy> [-o <output>] [--emit-llvm] [--release]
+    \\       alloyc lib <file.alloy> [-o <name.alloylib>]
+    \\       alloyc fmt <file.alloy> [--check]
+    \\       alloyc lsp
+    \\       alloyc dap
     \\
 ;
 
@@ -22,9 +26,19 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(usage, .{});
         std.process.exit(1);
     };
+    if (std.mem.eql(u8, first_argument, "lsp")) {
+        return serveLanguageServer(init);
+    }
+    if (std.mem.eql(u8, first_argument, "dap")) {
+        return serveDebugAdapter(init);
+    }
+    if (std.mem.eql(u8, first_argument, "fmt")) {
+        return formatFile(init, &args);
+    }
     const run_mode = std.mem.eql(u8, first_argument, "run");
     const build_mode = std.mem.eql(u8, first_argument, "build");
-    const entrypoint_file_path = if (run_mode or build_mode)
+    const lib_mode = std.mem.eql(u8, first_argument, "lib");
+    const entrypoint_file_path = if (run_mode or build_mode or lib_mode)
         args.next() orelse {
             std.debug.print(usage, .{});
             std.process.exit(1);
@@ -35,16 +49,16 @@ pub fn main(init: std.process.Init) !void {
     var output_path: ?[]const u8 = null;
     var emit_llvm = false;
     var release = false;
-    if (build_mode) {
+    if (build_mode or lib_mode) {
         while (args.next()) |argument| {
             if (std.mem.eql(u8, argument, "-o")) {
                 output_path = args.next() orelse {
                     std.debug.print("error: '-o' needs an output path\n", .{});
                     std.process.exit(1);
                 };
-            } else if (std.mem.eql(u8, argument, "--emit-llvm")) {
+            } else if (build_mode and std.mem.eql(u8, argument, "--emit-llvm")) {
                 emit_llvm = true;
-            } else if (std.mem.eql(u8, argument, "--release")) {
+            } else if (build_mode and std.mem.eql(u8, argument, "--release")) {
                 release = true;
             } else {
                 std.debug.print("error: unknown option '{s}'\n{s}", .{ argument, usage });
@@ -68,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
     const loader: alloyc.ModuleLoader = .{
         .context = @ptrCast(&loader_io),
         .function = loadImportedModule,
+        .library = loadPackageContainer,
     };
     const success = try compilation.run(loader);
     if (!success) {
@@ -78,7 +93,19 @@ pub fn main(init: std.process.Init) !void {
     if (run_mode) {
         var output: std.Io.Writer.Allocating = .init(allocator);
         defer output.deinit();
-        const exit_code = compilation.interpret(&output.writer) catch |err| switch (err) {
+        // the argv behind std::process::arguments: the program path, then
+        // everything after it on the 'alloyc run' command line
+        var run_arguments: std.ArrayList([]const u8) = .empty;
+        defer run_arguments.deinit(allocator);
+        try run_arguments.append(allocator, entrypoint_file_path);
+        while (args.next()) |argument| {
+            try run_arguments.append(allocator, argument);
+        }
+        const environment: alloyc.Compilation.RunEnvironment = .{
+            .host_io = init.io,
+            .arguments = run_arguments.items,
+        };
+        const exit_code = compilation.interpretWithEnvironment(&output.writer, environment) catch |err| switch (err) {
             error.RuntimeFault => {
                 std.debug.print("{s}", .{output.writer.buffered()});
                 std.debug.print("runtime fault: {s}\n", .{compilation.fault orelse "unknown"});
@@ -96,6 +123,19 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         try buildExecutable(init, entrypoint_file_path, output_path, ir_text, emit_llvm, release);
+        return;
+    }
+
+    if (lib_mode) {
+        // the standalone check above already gated on errors; publishing
+        // packs the checked unit's own sources (section 5.4)
+        const arena = init.arena.allocator();
+        const stem = std.fs.path.stem(entrypoint_file_path);
+        const library_path = output_path orelse try std.fmt.allocPrint(arena, "{s}.alloylib", .{stem});
+        const library_name = stripExtension(std.fs.path.basename(library_path));
+        const container = try compilation.packLibrary(arena, library_name);
+        try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = library_path, .data = container });
+        std.debug.print("packed {s}\n", .{library_path});
         return;
     }
 
@@ -121,6 +161,69 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  {t} {s}\n", .{ definition.kind, name.slice(module.source) });
         }
     }
+}
+
+// 'alloyc fmt <file> [--check]': canonical whitespace in place; '--check'
+// reports without writing and exits 1 when the file would change
+fn formatFile(init: std.process.Init, args: anytype) !void {
+    const allocator = init.arena.allocator();
+    const file_path = args.next() orelse {
+        std.debug.print(usage, .{});
+        std.process.exit(1);
+    };
+    var check_only = false;
+    while (args.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--check")) {
+            check_only = true;
+        } else {
+            std.debug.print("error: unknown option '{s}'\n{s}", .{ argument, usage });
+            std.process.exit(1);
+        }
+    }
+    const source = readFile(init.io, allocator, file_path) catch |err| {
+        std.debug.print("error: cannot read '{s}': {s}\n", .{ file_path, errorDescription(err) });
+        std.process.exit(1);
+    };
+    const formatted = alloyc.formatter.format(allocator, source) catch |err| switch (err) {
+        error.MalformedSource => {
+            std.debug.print("error: '{s}' has syntax errors; fix them before formatting\n", .{file_path});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    if (std.mem.eql(u8, source, formatted)) {
+        std.debug.print("{s} is already formatted\n", .{file_path});
+        return;
+    }
+    if (check_only) {
+        std.debug.print("{s} needs formatting\n", .{file_path});
+        std.process.exit(1);
+    }
+    try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_path, .data = formatted });
+    std.debug.print("formatted {s}\n", .{file_path});
+}
+
+// 'alloyc lsp': the language server speaks JSON-RPC over stdio until the
+// client sends 'exit'
+fn serveLanguageServer(init: std.process.Init) !void {
+    var input_buffer: [64 * 1024]u8 = undefined;
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
+    var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
+    var server = alloyc.LanguageServer.init(init.gpa, init.io, &input.interface, &output.interface);
+    defer server.deinit();
+    try server.run();
+}
+
+// 'alloyc dap': the interpreter-backed debug adapter over stdio
+fn serveDebugAdapter(init: std.process.Init) !void {
+    var input_buffer: [64 * 1024]u8 = undefined;
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
+    var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
+    var server = alloyc.DebugAdapter.init(init.gpa, init.io, &input.interface, &output.interface);
+    defer server.deinit();
+    try server.run();
 }
 
 fn reportDiagnostics(compilation: *const alloyc.Compilation) void {
@@ -158,16 +261,30 @@ fn buildExecutable(
     };
 
     const optimization: []const u8 = if (release) "-O2" else "-O0";
-    const result = std.process.run(init.arena.allocator(), init.io, .{
-        .argv = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module" },
-    }) catch |err| {
-        std.debug.print("error: cannot run '{s}': {s}\n", .{ clang_path, @errorName(err) });
-        std.process.exit(1);
-    };
-    const linked = result.term == .exited and result.term.exited == 0;
+    var linked = false;
+    if (!release) {
+        // checked builds carry DWARF end to end; the MSVC linker cannot
+        // keep DWARF sections, so the debug link goes through lld
+        const debug_result = std.process.run(init.arena.allocator(), init.io, .{
+            .argv = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g", "-fuse-ld=lld", "-Wl,/debug:dwarf" },
+        }) catch null;
+        linked = debug_result != null and debug_result.?.term == .exited and debug_result.?.term.exited == 0;
+        if (!linked) {
+            std.debug.print("note: debug-info link failed (lld unavailable?); linking without debug info\n", .{});
+        }
+    }
     if (!linked) {
-        std.debug.print("error: clang failed:\n{s}\n", .{result.stderr});
-        std.process.exit(1);
+        const result = std.process.run(init.arena.allocator(), init.io, .{
+            .argv = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module" },
+        }) catch |err| {
+            std.debug.print("error: cannot run '{s}': {s}\n", .{ clang_path, @errorName(err) });
+            std.process.exit(1);
+        };
+        linked = result.term == .exited and result.term.exited == 0;
+        if (!linked) {
+            std.debug.print("error: clang failed:\n{s}\n", .{result.stderr});
+            std.process.exit(1);
+        }
     }
     if (!emit_llvm) {
         Io.Dir.cwd().deleteFile(init.io, ir_path) catch {};
@@ -210,6 +327,18 @@ fn readFile(io: Io, allocator: std.mem.Allocator, file_path: []const u8) ![]cons
 fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
     const io: *Io = @ptrCast(@alignCast(context.?));
     return readFile(io.*, allocator, file_path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+// 'pkg::name' resolves to the local 'pkg' folder first; the trusted
+// registry download (section 5.4) is still to come
+fn loadPackageContainer(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
+    const io: *Io = @ptrCast(@alignCast(context.?));
+    var buffer: [512]u8 = undefined;
+    const container_path = std.fmt.bufPrint(&buffer, "pkg/{s}.alloylib", .{package_name}) catch return null;
+    return readFile(io.*, allocator, container_path) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };

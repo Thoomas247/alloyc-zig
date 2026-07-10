@@ -401,6 +401,14 @@ pub const Parser = struct {
                 }
                 return self.create(ast.Statement, .{ .break_stmt = .{ .keyword = keyword, .value = value } });
             },
+            .keyword_yield => {
+                const keyword = self.advance();
+                const value = try self.parseExpression();
+                if (!isBlockLike(value)) {
+                    try self.expectTerminator();
+                }
+                return self.create(ast.Statement, .{ .yield_stmt = .{ .keyword = keyword, .value = value } });
+            },
             .keyword_return => {
                 const keyword = self.advance();
                 var value: ?*const ast.Expression = null;
@@ -448,6 +456,16 @@ pub const Parser = struct {
             .declared_type = declared_type,
             .value = value,
         } });
+    }
+
+    /// Parses one freestanding expression, consuming the whole input; the
+    /// debugger uses this for watch expressions and breakpoint conditions.
+    pub fn parseFreestandingExpression(self: *Parser) Error!*const ast.Expression {
+        const expression = try self.parseExpression();
+        if (self.current().tag != .end_of_file) {
+            return self.fail(self.current(), "expected the end of the expression", .{});
+        }
+        return expression;
     }
 
     fn parseExpression(self: *Parser) Error!*const ast.Expression {
@@ -556,7 +574,26 @@ pub const Parser = struct {
                 },
                 .bracket_left => {
                     _ = self.advance();
-                    const subscript = try self.parseInnerExpression();
+                    // 'arr[start..end]' and 'arr[..end]' borrow a subslice;
+                    // a lone subscript is an element index (section 2.1)
+                    var start: ?*const ast.Expression = null;
+                    if (self.current().tag != .dot_dot) {
+                        start = try self.parseInnerExpression();
+                    }
+                    if (self.current().tag == .dot_dot) {
+                        const operator = self.advance();
+                        const end = try self.parseInnerExpression();
+                        _ = try self.expect(.bracket_right, "']'");
+                        expression = try self.create(ast.Expression, .{ .subslice = .{
+                            .object = expression,
+                            .operator = operator,
+                            .start = start,
+                            .end = end,
+                        } });
+                        continue;
+                    }
+                    const subscript = start orelse
+                        return self.fail(self.current(), "expected an index or a '..' subslice, found {s}", .{try self.describe(self.current())});
                     _ = try self.expect(.bracket_right, "']'");
                     expression = try self.create(ast.Expression, .{ .index = .{
                         .object = expression,
@@ -654,10 +691,10 @@ pub const Parser = struct {
                     _ = self.advance();
                     try path.append(self.arena, try self.expect(.identifier, "a name"));
                 }
-                if (path.items.len == 1 and self.current().tag == .brace_left and self.allow_struct_init) {
+                if (self.current().tag == .brace_left and self.allow_struct_init) {
                     const members = try self.parseMemberInits();
                     return self.create(ast.Expression, .{ .struct_init = .{
-                        .name = path.items[0],
+                        .path = try path.toOwnedSlice(self.arena),
                         .members = members,
                     } });
                 }
@@ -665,7 +702,7 @@ pub const Parser = struct {
             },
             .brace_left => {
                 const members = try self.parseMemberInits();
-                return self.create(ast.Expression, .{ .struct_init = .{ .name = null, .members = members } });
+                return self.create(ast.Expression, .{ .struct_init = .{ .path = null, .members = members } });
             },
             .parenthesis_left => {
                 if (self.looksLikeLambda()) {
@@ -1136,11 +1173,11 @@ test "match arms with patterns, captures, and external else" {
     const source =
         \\fn f() {
         \\    var label = match (value) {
-        \\        Option::Some |v: &| { break v; }
-        \\        Option::None { break fallback; }
-        \\        else { break other; }
+        \\        Option::Some |v: &| { yield v; }
+        \\        Option::None { yield fallback; }
+        \\        else { yield other; }
         \\    } else {
-        \\        break missing;
+        \\        yield missing;
         \\    };
         \\}
     ;
@@ -1206,7 +1243,7 @@ test "break with block-like operand is self-terminating" {
     const source =
         \\fn f() {
         \\    while (running) {
-        \\        break if (cond) break a else break b
+        \\        break if (cond) yield a else yield b
         \\    }
         \\}
     ;

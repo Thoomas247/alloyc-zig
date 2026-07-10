@@ -1,0 +1,121 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Alloy",
+    "scopeName": "source.alloy",
+    "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#characters" },
+        { "include": "#numbers" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#macros" },
+        { "include": "#functions" },
+        { "include": "#operators" }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.alloy",
+                    "match": "//.*$"
+                },
+                {
+                    "name": "comment.block.alloy",
+                    "begin": "/\\*",
+                    "end": "\\*/"
+                }
+            ]
+        },
+        "strings": {
+            "name": "string.quoted.double.alloy",
+            "begin": "\"",
+            "end": "\"",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.alloy",
+                    "match": "\\\\(x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|.)"
+                }
+            ]
+        },
+        "characters": {
+            "name": "string.quoted.single.alloy",
+            "begin": "'",
+            "end": "'",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.alloy",
+                    "match": "\\\\(x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]+\\}|.)"
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.hex.alloy",
+                    "match": "\\b0x[0-9a-fA-F_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.binary.alloy",
+                    "match": "\\b0b[01_]+\\b"
+                },
+                {
+                    "name": "constant.numeric.float.alloy",
+                    "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.alloy",
+                    "match": "\\b[0-9][0-9_]*\\b"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.control.alloy",
+                    "match": "\\b(if|else|while|for|match|break|yield|return)\\b"
+                },
+                {
+                    "name": "keyword.declaration.alloy",
+                    "match": "\\b(fn|type|enum|struct|const|var|interface|macro|extern|import|as|pub|exp)\\b"
+                },
+                {
+                    "name": "keyword.operator.word.alloy",
+                    "match": "\\b(is|to|move|new)\\b"
+                },
+                {
+                    "name": "variable.language.self.alloy",
+                    "match": "\\bself\\b"
+                },
+                {
+                    "name": "constant.language.boolean.alloy",
+                    "match": "\\b(true|false)\\b"
+                }
+            ]
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "storage.type.primitive.alloy",
+                    "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|f32|f64|bool|void)\\b"
+                },
+                {
+                    "name": "entity.name.type.alloy",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+                }
+            ]
+        },
+        "macros": {
+            "name": "entity.name.function.macro.alloy",
+            "match": "#[A-Za-z_][A-Za-z0-9_]*"
+        },
+        "functions": {
+            "name": "entity.name.function.alloy",
+            "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(\\(|<[^>]*>\\s*\\())"
+        },
+        "operators": {
+            "name": "keyword.operator.alloy",
+            "match": "(->|::|\\.\\.|&&|\\|\\||[+\\-*/%=!<>&|^~])"
+        }
+    }
+}

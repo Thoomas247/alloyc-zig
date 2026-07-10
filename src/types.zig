@@ -50,6 +50,14 @@ pub const Primitive = enum {
     }
 };
 
+/// Nominal runtime identity of a struct value (section 5.2): the declaring
+/// definition plus its view, so same-named types from different libraries
+/// never confuse dispatch, downcasts, or match arms.
+pub const TypeIdentity = struct {
+    definition: *const ast.Definition,
+    view_index: usize,
+};
+
 /// A serialization shape for 'as' reinterpretation (section 3.5): the
 /// checker flattens a type's C-compatible layout (section 3.9) into byte
 /// offsets so the interpreter can reinterpret values without re-deriving
@@ -65,6 +73,8 @@ pub const Shape = union(enum) {
         // the declared name carried into reconstructed values; empty for
         // structural layouts
         name: []const u8,
+        // the nominal identity reconstructed values receive, when declared
+        identity: ?TypeIdentity = null,
         fields: []const Field,
     };
 

@@ -31,12 +31,17 @@
 //! per-type identity global; calls without a static target dispatch through
 //! a closed-world chain over the interface's implementers, falling back to
 //! the default implementation, which receives the fat pair itself. 'is'
-//! tests, downcasts, and match arms compare type identities. Custom
-//! iterables drive the cursor protocol (section 4.3), and string subjects
-//! match through memcmp.
+//! tests, downcasts, and match arms compare type identities. An owning
+//! '*I' drops and clones virtually: the identity selects the concrete
+//! helper over the same closed world. Custom iterables drive the cursor
+//! protocol (section 4.3), and string subjects match through memcmp.
 //!
-//! Not yet lowered (clean diagnostics): lambdas and owning interface
-//! objects ('*I', which need a virtual drop).
+//! Closures (section 4.4) are heap blocks headed by call, drop, and copy
+//! function pointers with the captured environment behind them; a function
+//! value is one pointer everywhere. Named functions used as values share a
+//! constant block whose null drop and copy slots mark it static. Calls
+//! with no static target load the block's call slot and pass the block as
+//! the leading argument.
 
 const std = @import("std");
 const tokenizer_module = @import("tokenizer.zig");
@@ -56,6 +61,7 @@ pub const Codegen = struct {
     arena: std.mem.Allocator,
     views: []const resolution.ModuleView,
     globals: *const std.StringHashMapUnmanaged(resolution.SymbolList),
+    injected: []const resolution.InjectedMap,
     checker: *Checker,
     expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
     call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
@@ -82,6 +88,12 @@ pub const Codegen = struct {
     // runtime type identity globals, one per concrete declared type; the
     // address is the identity an interface object carries (section 5.2)
     type_descriptors: std.AutoHashMapUnmanaged(*const ast.Definition, []const u8),
+    // constant closure blocks for named functions used as values (section
+    // 4.4), memoized by the instance name
+    static_closures: std.StringHashMapUnmanaged([]const u8),
+    // the closed world of implementers per interface, memoized per
+    // interface definition
+    implementer_lists: std.AutoHashMapUnmanaged(*const ast.Definition, []const Implementer),
     fault_helper_emitted: bool,
     global_counter: usize,
 
@@ -91,12 +103,38 @@ pub const Codegen = struct {
     temp_counter: usize,
     terminated: bool,
     scopes: std.ArrayList(Frame),
+    // 'break' targets the innermost loop, 'yield' the innermost value
+    // if or match; separate stacks make each transparent to the other
+    // (section 4.3)
     break_targets: std.ArrayList(BreakTarget),
+    yield_targets: std.ArrayList(BreakTarget),
     return_type: *const Type,
     return_slot: ?[]const u8,
     // the active instance's resolved type parameters (section 3.7); every
     // recorded type substitutes through these before any layout question
     current_bindings: ?*const Checker.TypeEnvironment,
+    // debug info (checked builds only): DWARF metadata nodes accumulate
+    // here and print at the module tail; ids come from metadata_counter
+    debug_metadata: std.Io.Writer.Allocating,
+    metadata_counter: usize,
+    debug_compile_unit: ?usize,
+    debug_subroutine_type: ?usize,
+    // view index to DIFile id
+    debug_files: std.AutoHashMapUnmanaged(usize, usize),
+    // the DISubprogram of the function currently emitting, when it is a
+    // user function or lambda; helpers carry no debug scope
+    debug_subprogram: ?usize,
+    debug_location: ?usize,
+    // (subprogram, line, column) to DILocation id
+    debug_location_memo: std.AutoHashMapUnmanaged(u128, usize),
+    // type key to DWARF type id, reserved before members emit so
+    // self-referential types terminate
+    debug_types: std.StringHashMapUnmanaged(usize),
+    debug_file_id: ?usize,
+    debug_line: usize,
+    debug_column: usize,
+    // innermost-last lexical blocks under the active subprogram
+    debug_scopes: std.ArrayList(usize),
 
     pub const Error = error{ OutOfMemory, Unsupported };
 
@@ -127,12 +165,18 @@ pub const Codegen = struct {
 
     const Frame = struct {
         locals: std.ArrayList(Local),
+        // whether this frame opened a DILexicalBlock to pop with it
+        debug_scope_pushed: bool = false,
     };
 
     const Local = struct {
         name: []const u8,
         pointer: []const u8,
         declared_type: *const Type,
+        // a pinned local is storage the frame does not own: a closure
+        // capture lives in the environment block (dropped by the closure's
+        // drop function), a downcast pointer borrows the subject's data
+        pinned: bool = false,
     };
 
     const BreakTarget = struct {
@@ -182,7 +226,7 @@ pub const Codegen = struct {
     pub fn init(
         arena: std.mem.Allocator,
         views: []const resolution.ModuleView,
-        globals: *const std.StringHashMapUnmanaged(resolution.SymbolList),
+        unit: *const resolution.MergedUnit,
         checker: *Checker,
         expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
         call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
@@ -196,7 +240,8 @@ pub const Codegen = struct {
         return .{
             .arena = arena,
             .views = views,
-            .globals = globals,
+            .globals = &unit.globals,
+            .injected = unit.injected,
             .checker = checker,
             .expression_types = expression_types,
             .call_targets = call_targets,
@@ -217,6 +262,8 @@ pub const Codegen = struct {
             .queue = .empty,
             .helper_names = .empty,
             .type_descriptors = .empty,
+            .static_closures = .empty,
+            .implementer_lists = .empty,
             .fault_helper_emitted = false,
             .global_counter = 0,
             .current_view = 0,
@@ -226,9 +273,23 @@ pub const Codegen = struct {
             .terminated = false,
             .scopes = .empty,
             .break_targets = .empty,
+            .yield_targets = .empty,
             .return_type = &void_type,
             .return_slot = null,
             .current_bindings = null,
+            .debug_metadata = .init(arena),
+            .metadata_counter = 0,
+            .debug_compile_unit = null,
+            .debug_subroutine_type = null,
+            .debug_files = .empty,
+            .debug_subprogram = null,
+            .debug_location = null,
+            .debug_location_memo = .empty,
+            .debug_types = .empty,
+            .debug_file_id = null,
+            .debug_line = 1,
+            .debug_column = 1,
+            .debug_scopes = .empty,
         };
     }
 
@@ -284,9 +345,30 @@ pub const Codegen = struct {
         while (intrinsic_iterator.next()) |line| {
             writer.print("{s}\n", .{line.*}) catch return error.OutOfMemory;
         }
+        // argv captured by the main wrapper for std::process::arguments
+        writer.print("@\"alloy.process.argument_count\" = internal global i64 0\n", .{}) catch return error.OutOfMemory;
+        writer.print("@\"alloy.process.argument_data\" = internal global ptr null\n", .{}) catch return error.OutOfMemory;
         writer.print("{s}", .{self.constants.writer.buffered()}) catch return error.OutOfMemory;
         writer.print("{s}", .{self.functions.writer.buffered()}) catch return error.OutOfMemory;
+        if (self.debug_compile_unit) |unit_id| {
+            const version_flag = self.nextMetadata();
+            const dwarf_flag = self.nextMetadata();
+            writer.print("!llvm.dbg.cu = !{{!{d}}}\n", .{unit_id}) catch return error.OutOfMemory;
+            writer.print("!llvm.module.flags = !{{!{d}, !{d}}}\n", .{ version_flag, dwarf_flag }) catch return error.OutOfMemory;
+            writer.print("!{d} = !{{i32 2, !\"Debug Info Version\", i32 3}}\n", .{version_flag}) catch return error.OutOfMemory;
+            writer.print("!{d} = !{{i32 7, !\"Dwarf Version\", i32 4}}\n", .{dwarf_flag}) catch return error.OutOfMemory;
+            writer.print("{s}", .{self.debug_metadata.writer.buffered()}) catch return error.OutOfMemory;
+        }
         return module.writer.buffered();
+    }
+
+    // the std::process::arguments lang item (section 5.1a), recognized by
+    // its canonical module key and name like the checker's lang items
+    fn processArgumentsLangItem(self: *const Codegen, symbol: resolution.Symbol) bool {
+        const key = self.views[symbol.view_index].key orelse return false;
+        if (!std.mem.eql(u8, key, "std::process")) return false;
+        const fn_def = symbol.definition.kind.fn_def;
+        return std.mem.eql(u8, fn_def.name.slice(self.views[symbol.view_index].source), "arguments");
     }
 
     fn findMain(self: *Codegen) ?resolution.Symbol {
@@ -297,10 +379,40 @@ pub const Codegen = struct {
         return null;
     }
 
-    // the process entry adapts the Alloy 'main' result to the C 'int'
+    // the process entry adapts the Alloy 'main' result to the C 'int' and
+    // captures argv as slices for std::process::arguments (section 5.1a)
     fn emitMainWrapper(self: *Codegen, info: *FunctionInfo) Error!void {
         const writer = &self.functions.writer;
-        writer.print("define i32 @main() {{\nentry:\n", .{}) catch return error.OutOfMemory;
+        try self.declareMalloc();
+        if (!self.extern_declarations.contains("strlen")) {
+            try self.extern_declarations.put(self.arena, "strlen", "declare i64 @\"strlen\"(ptr)");
+        }
+        writer.print("define i32 @main(i32 %argc, ptr %argv) {{\nentry:\n", .{}) catch return error.OutOfMemory;
+        writer.print(
+            \\  %count = sext i32 %argc to i64
+            \\  store i64 %count, ptr @"alloy.process.argument_count"
+            \\  %bytes = mul i64 %count, 16
+            \\  %slices = call ptr @"malloc"(i64 %bytes)
+            \\  store ptr %slices, ptr @"alloy.process.argument_data"
+            \\  br label %capture.head
+            \\capture.head:
+            \\  %index = phi i64 [ 0, %entry ], [ %index.next, %capture.body ]
+            \\  %done = icmp uge i64 %index, %count
+            \\  br i1 %done, label %capture.done, label %capture.body
+            \\capture.body:
+            \\  %argument.slot = getelementptr inbounds ptr, ptr %argv, i64 %index
+            \\  %argument = load ptr, ptr %argument.slot
+            \\  %argument.length = call i64 @"strlen"(ptr %argument)
+            \\  %pair.offset = mul i64 %index, 16
+            \\  %pair = getelementptr inbounds i8, ptr %slices, i64 %pair.offset
+            \\  store ptr %argument, ptr %pair
+            \\  %pair.length = getelementptr inbounds i8, ptr %pair, i64 8
+            \\  store i64 %argument.length, ptr %pair.length
+            \\  %index.next = add i64 %index, 1
+            \\  br label %capture.head
+            \\capture.done:
+            \\
+        , .{}) catch return error.OutOfMemory;
         const resolved = try self.resolvedOf(info.return_type);
         if (resolved.* == .primitive and !resolved.primitive.isFloat() and resolved.primitive != .bool) {
             const llvm = scalarTypeText(resolved.primitive);
@@ -425,6 +537,82 @@ pub const Codegen = struct {
         };
     }
 
+    const SignatureParameter = struct {
+        register: []const u8,
+        class: Class,
+    };
+
+    const Signature = struct {
+        header: []const u8,
+        return_text: []const u8,
+        aggregate_return: bool,
+        parameters: []const SignatureParameter,
+    };
+
+    // the one mapping from Alloy types to an LLVM function signature:
+    // named functions, lambda bodies, and function-value thunks all share
+    // it so their calling conventions can never drift apart
+    fn functionSignature(self: *Codegen, name: []const u8, leading_closure: bool, parameter_types: []const *const Type, return_type: *const Type, span: Token.Location, subprogram: ?usize) Error!Signature {
+        const return_class = try self.classify(return_type, span);
+        const aggregate_return = return_class == .aggregate;
+        const return_text: []const u8 = switch (return_class) {
+            .void_class, .aggregate => "void",
+            .scalar => |llvm| llvm,
+        };
+        var header: std.Io.Writer.Allocating = .init(self.arena);
+        const writer = &header.writer;
+        writer.print("define internal {s} @\"{s}\"(", .{ return_text, name }) catch return error.OutOfMemory;
+        var first = true;
+        if (leading_closure) {
+            writer.print("ptr %closure", .{}) catch return error.OutOfMemory;
+            first = false;
+        }
+        if (aggregate_return) {
+            if (!first) writer.print(", ", .{}) catch return error.OutOfMemory;
+            writer.print("ptr %return.slot", .{}) catch return error.OutOfMemory;
+            first = false;
+        }
+        const parameters = try self.arena.alloc(SignatureParameter, parameter_types.len);
+        for (parameter_types, parameters, 0..) |parameter_type, *parameter, index| {
+            if (!first) writer.print(", ", .{}) catch return error.OutOfMemory;
+            first = false;
+            const register = try std.fmt.allocPrint(self.arena, "%argument.{d}", .{index});
+            const class = try self.classify(parameter_type, span);
+            switch (class) {
+                .void_class => return self.report(span, "a parameter cannot have no runtime value", .{}),
+                .scalar => |llvm| writer.print("{s} {s}", .{ llvm, register }) catch return error.OutOfMemory,
+                .aggregate => writer.print("ptr {s}", .{register}) catch return error.OutOfMemory,
+            }
+            parameter.* = .{ .register = register, .class = class };
+        }
+        if (subprogram) |id| {
+            writer.print(") !dbg !{d} {{\nentry:\n", .{id}) catch return error.OutOfMemory;
+        } else {
+            writer.print(") {{\nentry:\n", .{}) catch return error.OutOfMemory;
+        }
+        return .{
+            .header = header.writer.buffered(),
+            .return_text = return_text,
+            .aggregate_return = aggregate_return,
+            .parameters = parameters,
+        };
+    }
+
+    fn bindParameters(self: *Codegen, names: []const []const u8, parameter_types: []const *const Type, parameters: []const SignatureParameter) Error!void {
+        for (names, parameter_types, parameters) |name, parameter_type, parameter| {
+            switch (parameter.class) {
+                .void_class => unreachable,
+                .scalar => |llvm| {
+                    // a slot makes the parameter addressable like any local
+                    const slot = try self.scalarSlot(llvm);
+                    try self.storeScalar(slot, .{ .text = parameter.register, .llvm = llvm });
+                    try self.bindLocal(name, slot, parameter_type);
+                },
+                .aggregate => try self.bindLocal(name, parameter.register, parameter_type),
+            }
+        }
+    }
+
     fn emitFunction(self: *Codegen, symbol: resolution.Symbol, info: *FunctionInfo) Error!void {
         const fn_def = symbol.definition.kind.fn_def;
         self.current_view = symbol.view_index;
@@ -434,67 +622,42 @@ pub const Codegen = struct {
         self.terminated = false;
         self.scopes = .empty;
         self.break_targets = .empty;
+        self.yield_targets = .empty;
         self.return_type = info.return_type;
         self.return_slot = null;
         self.current_bindings = info.bindings_environment;
         try self.pushFrame();
 
-        var header: std.Io.Writer.Allocating = .init(self.arena);
-        const writer = &header.writer;
-        const return_text: []const u8 = if (info.aggregate_return)
-            "void"
-        else switch (try self.classify(info.return_type, fn_def.name.location)) {
-            .void_class => "void",
-            .scalar => |llvm| llvm,
-            .aggregate => "void",
-        };
-        writer.print("define internal {s} @\"{s}\"(", .{ return_text, info.name }) catch return error.OutOfMemory;
-        var first = true;
-        if (info.aggregate_return) {
-            writer.print("ptr %return.slot", .{}) catch return error.OutOfMemory;
-            self.return_slot = "%return.slot";
-            first = false;
+        var subprogram: ?usize = null;
+        if (!self.release_mode) {
+            const view_source_name = fn_def.name.slice(self.views[symbol.view_index].source);
+            subprogram = try self.beginDebugFunction(view_source_name, symbol.view_index, fn_def.name.location.start);
         }
-        for (fn_def.function.parameters, info.parameter_types, 0..) |parameter, parameter_type, index| {
-            if (!first) writer.print(", ", .{}) catch return error.OutOfMemory;
-            first = false;
-            const register = try std.fmt.allocPrint(self.arena, "%argument.{d}", .{index});
-            switch (try self.classify(parameter_type, parameter.name.location)) {
-                .void_class => return self.report(parameter.name.location, "a parameter cannot have no runtime value", .{}),
-                .scalar => |llvm| writer.print("{s} {s}", .{ llvm, register }) catch return error.OutOfMemory,
-                .aggregate => writer.print("ptr {s}", .{register}) catch return error.OutOfMemory,
-            }
-        }
-        writer.print(") {{\nentry:\n", .{}) catch return error.OutOfMemory;
+        const signature = try self.functionSignature(info.name, false, info.parameter_types, info.return_type, fn_def.name.location, subprogram);
+        if (signature.aggregate_return) self.return_slot = "%return.slot";
 
         const view_source = self.views[symbol.view_index].source;
-        for (fn_def.function.parameters, info.parameter_types, 0..) |parameter, parameter_type, index| {
-            const register = try std.fmt.allocPrint(self.arena, "%argument.{d}", .{index});
-            const name = parameter.name.slice(view_source);
-            switch (try self.classify(parameter_type, parameter.name.location)) {
-                .void_class => unreachable,
-                .scalar => |llvm| {
-                    // a slot makes the parameter addressable like any local
-                    const slot = try self.scalarSlot(llvm);
-                    try self.storeScalar(slot, .{ .text = register, .llvm = llvm });
-                    try self.bindLocal(name, slot, parameter_type);
-                },
-                .aggregate => try self.bindLocal(name, register, parameter_type),
-            }
+        const names = try self.arena.alloc([]const u8, fn_def.function.parameters.len);
+        for (fn_def.function.parameters, names) |parameter, *name| {
+            name.* = parameter.name.slice(view_source);
         }
+        try self.bindParameters(names, info.parameter_types, signature.parameters);
 
         try self.execStatement(fn_def.function.body);
         if (!self.terminated) try self.emitDefaultReturn();
 
         const out = &self.functions.writer;
-        out.print("{s}", .{header.writer.buffered()}) catch return error.OutOfMemory;
+        out.print("{s}", .{signature.header}) catch return error.OutOfMemory;
         out.print("{s}", .{self.allocas.writer.buffered()}) catch return error.OutOfMemory;
         out.print("{s}", .{self.body.writer.buffered()}) catch return error.OutOfMemory;
         out.print("}}\n", .{}) catch return error.OutOfMemory;
+        self.debug_subprogram = null;
+        self.debug_location = null;
     }
 
-    // flow analysis is deferred, so a typed function may still fall through;
-    // the fall-through yields the type's zero value
+    // the checker's path-termination analysis rejects typed functions that
+    // can fall through (section 4.3); this default return remains as the
+    // structural safety net for void functions and conservative cases
     fn emitDefaultReturn(self: *Codegen) Error!void {
         try self.emitDropsDownTo(0, null);
         if (self.return_slot != null) {
@@ -518,6 +681,10 @@ pub const Codegen = struct {
     }
 
     fn execStatement(self: *Codegen, statement: *const ast.Statement) Error!void {
+        // stepping granularity: one location per statement
+        if (self.debug_subprogram != null) {
+            try self.setDebugLocation(self.statementOffset(statement));
+        }
         switch (statement.*) {
             .block => |statements| {
                 try self.pushFrame();
@@ -532,11 +699,12 @@ pub const Codegen = struct {
                 const target = if (self.break_targets.items.len != 0)
                     self.break_targets.items[self.break_targets.items.len - 1]
                 else
-                    return self.report(break_stmt.keyword.location, "'break' outside a breakable construct", .{});
+                    return self.report(break_stmt.keyword.location, "'break' outside a loop", .{});
                 if (break_stmt.value) |value_expression| {
                     const value = try self.evalExpression(value_expression);
                     if (target.slot) |slot| {
-                        const coerced = try self.coerceOperand(value, try self.typeOf(value_expression), slot.value_type, break_stmt.keyword.location);
+                        var coerced = try self.coerceOperand(value, try self.typeOf(value_expression), slot.value_type, break_stmt.keyword.location);
+                        coerced = try self.copyOwnedScalarRead(value_expression, coerced, break_stmt.keyword.location);
                         try self.storeOperand(slot.pointer, coerced, slot.value_type, break_stmt.keyword.location);
                     } else {
                         try self.dropDiscarded(value, try self.typeOf(value_expression), break_stmt.keyword.location);
@@ -546,10 +714,32 @@ pub const Codegen = struct {
                 try self.instruction("br label %{s}", .{target.exit_label});
                 self.terminated = true;
             },
+            .yield_stmt => |yield_stmt| {
+                const target = if (self.yield_targets.items.len != 0)
+                    self.yield_targets.items[self.yield_targets.items.len - 1]
+                else
+                    return self.report(yield_stmt.keyword.location, "'yield' outside an if or match used as a value", .{});
+                const value = try self.evalExpression(yield_stmt.value);
+                if (target.slot) |slot| {
+                    var coerced = try self.coerceOperand(value, try self.typeOf(yield_stmt.value), slot.value_type, yield_stmt.keyword.location);
+                    coerced = try self.copyOwnedScalarRead(yield_stmt.value, coerced, yield_stmt.keyword.location);
+                    try self.storeOperand(slot.pointer, coerced, slot.value_type, yield_stmt.keyword.location);
+                } else {
+                    try self.dropDiscarded(value, try self.typeOf(yield_stmt.value), yield_stmt.keyword.location);
+                }
+                try self.emitDropsDownTo(target.frame_depth, null);
+                try self.instruction("br label %{s}", .{target.exit_label});
+                self.terminated = true;
+            },
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value_expression| {
                     const value = try self.evalExpression(value_expression);
-                    const coerced = try self.coerceOperand(value, try self.typeOf(value_expression), self.return_type, return_stmt.keyword.location);
+                    var coerced = try self.coerceOperand(value, try self.typeOf(value_expression), self.return_type, return_stmt.keyword.location);
+                    // no implicit move (section 4.2): a bare read of an
+                    // owning heap-array local returns by value, so its
+                    // allocation clones before the scope-end drops below
+                    // free the original; 'return move v' transfers instead
+                    coerced = try self.copyOwnedScalarRead(value_expression, coerced, return_stmt.keyword.location);
                     if (self.return_slot) |slot| {
                         try self.storeOperand(slot, coerced, self.return_type, return_stmt.keyword.location);
                         try self.emitDropsDownTo(0, null);
@@ -734,6 +924,73 @@ pub const Codegen = struct {
         }
     }
 
+    // 'arr[start..end]' borrows a slice fat pair viewing the subject's
+    // element range in place (section 3.2); checked builds fault on
+    // bounds that escape the subject
+    fn evalSubslice(self: *Codegen, expression: *const ast.Expression) Error!Operand {
+        const subslice = expression.subslice;
+        const span = self.spanOf(expression);
+        const object = (try self.evalPlace(subslice.object)) orelse object: {
+            const value = try self.evalExpression(subslice.object);
+            const object_type = try self.typeOf(subslice.object);
+            const memory = try self.ensureMemory(value, object_type, span);
+            break :object try self.piercePlace(.{ .pointer = memory.pointer, .value_type = object_type });
+        };
+        const resolved = try self.resolvedOf(object.value_type);
+        var element_type: *const Type = undefined;
+        var data_pointer: []const u8 = undefined;
+        var length_text: []const u8 = undefined;
+        switch (resolved.*) {
+            .fixed_array => |array| {
+                element_type = array.element;
+                data_pointer = object.pointer;
+                length_text = try std.fmt.allocPrint(self.arena, "{d}", .{array.length});
+            },
+            .slice => |slice| {
+                element_type = slice.child;
+                data_pointer = try self.loadPointerField(object.pointer, 0);
+                length_text = try self.loadIntegerField(object.pointer, 8);
+            },
+            .heap_array => |heap| {
+                element_type = heap.child;
+                const heap_view = try self.heapArrayView(object.pointer);
+                data_pointer = heap_view.data;
+                length_text = heap_view.length;
+            },
+            else => return self.report(span, "subslicing is not supported on this type", .{}),
+        }
+        const element_layout = (try self.layoutQuery(element_type, 0)) orelse
+            return self.report(span, "this element type has no defined layout", .{});
+        var start_text: []const u8 = "0";
+        if (subslice.start) |start_expression| {
+            const start = try self.evalExpression(start_expression);
+            const start_type = try self.resolvedOf(try self.typeOf(start_expression));
+            start_text = try self.widenToIndex(start.scalar, start_type);
+        }
+        const end = try self.evalExpression(subslice.end);
+        const end_type = try self.resolvedOf(try self.typeOf(subslice.end));
+        const end_text = try self.widenToIndex(end.scalar, end_type);
+        if (!self.release_mode) {
+            const ordered = try self.freshTemp();
+            try self.instruction("{s} = icmp ule i64 {s}, {s}", .{ ordered, start_text, end_text });
+            try self.faultUnless(ordered, "runtime fault: subslice bounds out of order (section 3.2)");
+            const within = try self.freshTemp();
+            try self.instruction("{s} = icmp ule i64 {s}, {s}", .{ within, end_text, length_text });
+            try self.faultUnless(within, "runtime fault: subslice out of bounds (section 3.2)");
+        }
+        const scaled = try self.freshTemp();
+        try self.instruction("{s} = mul i64 {s}, {d}", .{ scaled, start_text, element_layout.size });
+        const view_data = try self.freshTemp();
+        try self.instruction("{s} = getelementptr inbounds i8, ptr {s}, i64 {s}", .{ view_data, data_pointer, scaled });
+        const view_length = try self.freshTemp();
+        try self.instruction("{s} = sub i64 {s}, {s}", .{ view_length, end_text, start_text });
+        const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+        try self.instruction("store ptr {s}, ptr {s}", .{ view_data, pair });
+        const length_slot = try self.byteOffset(pair, 8);
+        try self.instruction("store i64 {s}, ptr {s}", .{ view_length, length_slot });
+        return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
+    }
+
     const HeapArrayView = struct {
         data: []const u8,
         length: []const u8,
@@ -824,7 +1081,8 @@ pub const Codegen = struct {
                 if ((try self.enumFrameQuery(recorded)) != null and expression.path.len >= 2) {
                     return self.enumConstruction(expression, expression.path[expression.path.len - 1].slice(self.source()), &.{});
                 }
-                return self.report(self.spanOf(expression), "this name has no runtime value here (function values are not yet supported by native code generation)", .{});
+                if (recorded.* == .function) return self.functionValue(expression);
+                return self.report(self.spanOf(expression), "this name has no runtime value here", .{});
             },
             .implied_variant => |token| return self.enumConstruction(expression, token.slice(self.source()), &.{}),
             .member, .index => {
@@ -832,6 +1090,7 @@ pub const Codegen = struct {
                     return self.report(self.spanOf(expression), "cannot read this expression", .{});
                 return self.loadPlace(place, self.spanOf(expression));
             },
+            .subslice => return self.evalSubslice(expression),
             .comptime_expr => |inner| {
                 if (self.comptime_values.get(expression)) |value| {
                     return self.constantFromValue(value, expression);
@@ -850,7 +1109,7 @@ pub const Codegen = struct {
             .while_expr => |while_expr| return self.evalWhile(expression, while_expr),
             .for_expr => |for_expr| return self.evalFor(expression, for_expr),
             .match_expr => |match_expr| return self.evalMatch(expression, match_expr),
-            .lambda => return self.report(self.spanOf(expression), "lambdas are not yet supported by native code generation", .{}),
+            .lambda => return self.evalLambda(expression),
         }
     }
 
@@ -936,6 +1195,16 @@ pub const Codegen = struct {
             .ampersand => {
                 const place = (try self.evalPlace(unary.operand)) orelse
                     return self.report(span, "'&' needs an addressable operand", .{});
+                // borrowing a heap array yields a slice fat pair viewing
+                // its elements in place (section 4.2)
+                if ((try self.resolvedOf(place.value_type)).* == .heap_array) {
+                    const view = try self.heapArrayView(place.pointer);
+                    const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+                    try self.instruction("store ptr {s}, ptr {s}", .{ view.data, pair });
+                    const length_slot = try self.byteOffset(pair, 8);
+                    try self.instruction("store i64 {s}, ptr {s}", .{ view.length, length_slot });
+                    return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
+                }
                 return .{ .scalar = .{ .text = place.pointer, .llvm = "ptr" } };
             },
             .keyword_new => return self.evalNew(expression),
@@ -944,6 +1213,17 @@ pub const Codegen = struct {
                 // source, transferring ownership (section 4.2)
                 const place = (try self.evalPlaceRaw(unary.operand)) orelse
                     return self.report(span, "'move' needs an addressable operand", .{});
+                // an owning interface object is a 16-byte fat pair: the
+                // whole pair transfers, and nulling the data half marks
+                // the source moved-from (section 5.2)
+                if ((try self.classify(place.value_type, span)) == .aggregate) {
+                    const layout = (try self.layoutQuery(place.value_type, 0)) orelse
+                        return self.report(span, "this type has no defined runtime layout", .{});
+                    const pair = try self.aggregateSlot(layout);
+                    try self.copyBytes(pair, place.pointer, layout.size);
+                    try self.instruction("store ptr null, ptr {s}", .{place.pointer});
+                    return .{ .memory = .{ .pointer = pair, .layout = layout, .fresh = true } };
+                }
                 const taken = try self.freshTemp();
                 try self.instruction("{s} = load ptr, ptr {s}", .{ taken, place.pointer });
                 try self.instruction("store ptr null, ptr {s}", .{place.pointer});
@@ -960,12 +1240,29 @@ pub const Codegen = struct {
         try self.declareMalloc();
         switch (result_type.*) {
             .pointer => |indirection| {
+                // 'new' under an interface-typed expectation allocates the
+                // concrete operand and yields an owning interface object:
+                // the fat pair carries the identity for the virtual drop
+                // (section 5.2)
+                if ((try self.resolvedOf(indirection.child)).* == .interface) {
+                    const concrete = try self.resolvedOf(try self.typeOf(operand));
+                    if (concrete.* != .declared) {
+                        return self.report(span, "only named types convert to interface objects (section 5.2)", .{});
+                    }
+                    const concrete_layout = (try self.layoutQuery(concrete, 0)) orelse
+                        return self.report(span, "this pointee type has no defined layout", .{});
+                    const value = try self.evalExpression(operand);
+                    const coerced = try self.coerceOperand(value, try self.typeOf(operand), concrete, span);
+                    const allocation = try self.allocateFixed(concrete_layout.size);
+                    try self.zeroFill(allocation, concrete_layout.size);
+                    try self.storeOperand(allocation, coerced, concrete, span);
+                    return self.interfacePair(allocation, concrete.declared.definition);
+                }
                 const pointee_layout = (try self.layoutQuery(indirection.child, 0)) orelse
                     return self.report(span, "this pointee type has no defined layout", .{});
                 const value = try self.evalExpression(operand);
                 const coerced = try self.coerceOperand(value, try self.typeOf(operand), indirection.child, span);
-                const allocation = try self.freshTemp();
-                try self.instruction("{s} = call ptr @\"malloc\"(i64 {d})", .{ allocation, pointee_layout.size });
+                const allocation = try self.allocateFixed(pointee_layout.size);
                 try self.zeroFill(allocation, pointee_layout.size);
                 try self.storeOperand(allocation, coerced, indirection.child, span);
                 return .{ .scalar = .{ .text = allocation, .llvm = "ptr" } };
@@ -994,7 +1291,9 @@ pub const Codegen = struct {
                 const fill_value = try self.evalExpression(array_fill.value);
                 const fill_type = try self.typeOf(array_fill.value);
                 const coerced = try self.coerceOperand(fill_value, fill_type, element_type, span);
-                try self.emitRuntimeFill(data, wide, coerced, element_type, element_layout.size, span);
+                const fill = try self.fillSource(coerced, element_type, span);
+                try self.emitRuntimeFill(data, wide, fill.operand, element_type, element_layout.size, span);
+                try self.dropFillSource(fill, element_type, span);
                 return .{ .scalar = .{ .text = data, .llvm = "ptr" } };
             },
             .array_range => |array_range| {
@@ -1074,13 +1373,11 @@ pub const Codegen = struct {
     // malloc(8 + length * stride): the length lands in the prefix and the
     // returned pointer addresses the first element (section 4.2)
     fn allocateHeapArray(self: *Codegen, length: []const u8, stride: u64) Error![]const u8 {
-        try self.declareMalloc();
         const data_size = try self.freshTemp();
         try self.instruction("{s} = mul i64 {s}, {d}", .{ data_size, length, stride });
         const total = try self.freshTemp();
         try self.instruction("{s} = add i64 {s}, 8", .{ total, data_size });
-        const base = try self.freshTemp();
-        try self.instruction("{s} = call ptr @\"malloc\"(i64 {s})", .{ base, total });
+        const base = try self.allocateDynamic(total);
         try self.instruction("store i64 {s}, ptr {s}", .{ length, base });
         const data = try self.freshTemp();
         try self.instruction("{s} = getelementptr inbounds i8, ptr {s}, i64 8", .{ data, base });
@@ -1445,6 +1742,19 @@ pub const Codegen = struct {
             return self.enumConstruction(expression, callee.implied_variant.slice(self.source()), call.arguments);
         }
         if (self.call_targets.get(expression)) |symbol| {
+            // std::process::arguments is compiler-provided (section 5.1a):
+            // the main wrapper captured argv as slices at startup
+            if (symbol.definition.kind == .fn_def and self.processArgumentsLangItem(symbol)) {
+                const data = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr @\"alloy.process.argument_data\"", .{data});
+                const count = try self.freshTemp();
+                try self.instruction("{s} = load i64, ptr @\"alloy.process.argument_count\"", .{count});
+                const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+                try self.instruction("store ptr {s}, ptr {s}", .{ data, pair });
+                const length_slot = try self.byteOffset(pair, 8);
+                try self.instruction("store i64 {s}, ptr {s}", .{ count, length_slot });
+                return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
+            }
             return switch (symbol.definition.kind) {
                 .extern_def => self.callExtern(expression, symbol),
                 .fn_def => self.callFunction(expression, symbol, callee),
@@ -1459,14 +1769,65 @@ pub const Codegen = struct {
             if (std.mem.eql(u8, name, "length") and call.arguments.len == 0) {
                 return self.lengthCall(callee.member.object, span);
             }
-            // a call with no static target dispatches at runtime through
-            // the interface object's type identity (section 5.2)
-            if (try self.evalPlace(callee.member.object)) |place| {
-                if (try self.interfaceOfPlace(place)) |interface| {
-                    return self.interfaceDispatch(expression, callee.member, place, interface);
+            // the receiver place evaluates exactly once: a second walk
+            // would re-run subscript side effects; a temporary receiver
+            // materializes and drops after the call (section 4.5)
+            var receiver_cleanup: ?Place = null;
+            const object_place = (try self.evalPlace(callee.member.object)) orelse object: {
+                const value = try self.evalExpression(callee.member.object);
+                const object_type = try self.typeOf(callee.member.object);
+                const memory = try self.ensureMemory(value, object_type, span);
+                if (memory.fresh and try self.ownsHeap(object_type, 0)) {
+                    receiver_cleanup = .{ .pointer = memory.pointer, .value_type = object_type };
                 }
+                break :object try self.piercePlace(.{ .pointer = memory.pointer, .value_type = object_type });
+            };
+            // a call with no static target dispatches at runtime through
+            // the interface object's type identity (section 5.2), or calls
+            // through a function-typed field (section 4.4)
+            const result = if (try self.interfaceOfPlace(object_place)) |interface|
+                try self.interfaceDispatch(expression, callee.member, object_place, interface)
+            else result: {
+                const slots = (try self.fieldSlotsQuery(object_place.value_type)) orelse
+                    return self.report(span, "this callee is not callable", .{});
+                const slot = for (slots) |candidate| {
+                    if (std.mem.eql(u8, candidate.name, name)) break candidate;
+                } else return self.report(callee.member.name.location, "no field '{s}' here", .{name});
+                const field_place = try self.piercePlace(.{
+                    .pointer = try self.byteOffset(object_place.pointer, slot.offset),
+                    .value_type = slot.field_type,
+                });
+                if ((try self.resolvedOf(field_place.value_type)).* != .function) {
+                    return self.report(span, "this callee is not callable", .{});
+                }
+                break :result try self.indirectCall(expression, field_place);
+            };
+            if (receiver_cleanup) |cleanup| {
+                const helper = try self.dropHelper(cleanup.value_type, span);
+                try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, cleanup.pointer });
             }
-            return self.report(span, "this dynamic call is not yet supported by native code generation", .{});
+            return result;
+        }
+        // a function-typed place (a local) calls indirectly through its
+        // closure block (section 4.4)
+        if (try self.evalPlace(callee)) |place| {
+            if ((try self.resolvedOf(place.value_type)).* == .function) {
+                return self.indirectCall(expression, place);
+            }
+            return self.report(span, "this callee is not callable", .{});
+        }
+        const callee_type = try self.resolvedOf(try self.typeOf(callee));
+        if (callee_type.* == .function) {
+            // an immediately invoked function value: a fresh closure drops
+            // once the call returns (section 4.2)
+            const operand = try self.evalExpression(callee);
+            const memory = try self.ensureMemory(operand, try self.typeOf(callee), span);
+            const result = try self.indirectCall(expression, .{ .pointer = memory.pointer, .value_type = try self.typeOf(callee) });
+            if (memory.fresh) {
+                const helper = try self.dropHelper(try self.typeOf(callee), span);
+                try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, memory.pointer });
+            }
+            return result;
         }
         return self.report(span, "this call form is not yet supported by native code generation", .{});
     }
@@ -1611,7 +1972,12 @@ pub const Codegen = struct {
     fn lowerArgument(self: *Codegen, operand: Operand, parameter_type: *const Type, span: Token.Location) Error![]const u8 {
         switch (try self.classify(parameter_type, span)) {
             .void_class => return self.report(span, "an argument cannot have no runtime value", .{}),
-            .scalar => |llvm| return std.fmt.allocPrint(self.arena, "{s} {s}", .{ llvm, operand.scalar.text }),
+            .scalar => |llvm| {
+                if (operand != .scalar) {
+                    return self.report(span, "internal: this scalar argument has no scalar operand", .{});
+                }
+                return std.fmt.allocPrint(self.arena, "{s} {s}", .{ llvm, operand.scalar.text });
+            },
             .aggregate => |layout| {
                 const memory = try self.ensureMemory(operand, parameter_type, span);
                 // a by-value parameter owns its copy and drops it at the
@@ -1718,6 +2084,331 @@ pub const Codegen = struct {
         return joined.writer.buffered();
     }
 
+    // a closure is a heap block: the call, drop, and copy function pointers
+    // head the block, the captured environment follows (section 4.4)
+    const closure_header_size: u64 = 24;
+
+    const ClosureCapture = struct {
+        capture: ast.Capture,
+        // the checker's capture typing, already substituted through the
+        // active instance's bindings
+        binding_type: *const Type,
+        mode: CaptureMode,
+        offset: u64,
+        layout: Checker.Layout,
+    };
+
+    const ClosureShape = struct {
+        captures: []const ClosureCapture,
+        size: u64,
+    };
+
+    fn closureShape(self: *Codegen, expression: *const ast.Expression, lambda: ast.Lambda, span: Token.Location) Error!ClosureShape {
+        const bindings = self.checker.lambda_captures.get(expression) orelse &.{};
+        if (bindings.len != lambda.captures.len) {
+            return self.report(span, "internal: no capture typing recorded for this lambda", .{});
+        }
+        const captures = try self.arena.alloc(ClosureCapture, bindings.len);
+        var cursor: u64 = closure_header_size;
+        for (lambda.captures, bindings, 0..) |capture, binding, index| {
+            const binding_type = try self.substituted(binding.binding_type);
+            if (try self.unsupportedReason(binding_type, 0)) |reason| {
+                return self.report(capture.name.location, "{s} are not yet supported by native code generation", .{reason});
+            }
+            // the mode mirrors the checker's captureBinding (section 2.1):
+            // a prefix modifier borrows or takes ownership; an annotation
+            // borrows only when the checker typed it as a reference, and
+            // otherwise deep-copies (an annotation like '&[u8]' names a
+            // slice VALUE, not a borrow)
+            const mode: CaptureMode = if (capture.modifier) |modifier| switch (modifier) {
+                .reference, .reference_var => .reference,
+                .pointer, .pointer_var => .owning,
+            } else if ((try self.resolvedOf(binding_type)).* == .reference) .reference else .copy;
+            const layout: Checker.Layout = switch (mode) {
+                .reference => .{ .size = 8, .alignment = 8 },
+                // an owning capture moves the whole owning value: a thin
+                // pointer is 8 bytes, an interface object's fat pair is 16
+                .owning, .copy => (try self.layoutQuery(binding_type, 0)) orelse
+                    return self.report(capture.name.location, "this capture type has no defined runtime layout", .{}),
+            };
+            cursor = Checker.alignForward(cursor, layout.alignment);
+            captures[index] = .{ .capture = capture, .binding_type = binding_type, .mode = mode, .offset = cursor, .layout = layout };
+            cursor += layout.size;
+        }
+        return .{ .captures = captures, .size = Checker.alignForward(cursor, 8) };
+    }
+
+    fn evalLambda(self: *Codegen, expression: *const ast.Expression) Error!Operand {
+        const lambda = expression.lambda;
+        const span = self.spanOf(expression);
+        const fn_resolved = try self.resolvedOf(try self.typeOf(expression));
+        if (fn_resolved.* != .function) {
+            return self.report(span, "internal: a lambda without a function type", .{});
+        }
+        var parameter_types: std.ArrayList(*const Type) = .empty;
+        for (fn_resolved.function.parameter_types) |parameter_type| {
+            const concrete = try self.substituted(parameter_type);
+            if (try self.unsupportedReason(concrete, 0)) |reason| {
+                return self.report(span, "{s} are not yet supported by native code generation", .{reason});
+            }
+            try parameter_types.append(self.arena, concrete);
+        }
+        const return_type = try self.substituted(fn_resolved.function.return_type);
+        if (try self.unsupportedReason(return_type, 0)) |reason| {
+            return self.report(span, "{s} are not yet supported by native code generation", .{reason});
+        }
+        const shape = try self.closureShape(expression, lambda, span);
+
+        const id = self.global_counter;
+        self.global_counter += 1;
+        const body_name = try std.fmt.allocPrint(self.arena, "alloy.lambda.{d}", .{id});
+        const drop_name = try std.fmt.allocPrint(self.arena, "alloy.lambda.drop.{d}", .{id});
+        const copy_name = try std.fmt.allocPrint(self.arena, "alloy.lambda.copy.{d}", .{id});
+        try self.emitLambdaBody(body_name, lambda, parameter_types.items, return_type, shape.captures);
+        // a capture-less lambda carries no state: a constant block with
+        // null drop and copy slots costs nothing to share or release
+        if (shape.captures.len == 0) {
+            const block_name = try std.fmt.allocPrint(self.arena, "alloy.closure.{d}", .{id});
+            self.constants.writer.print("@\"{s}\" = internal constant {{ ptr, ptr, ptr }} {{ ptr @\"{s}\", ptr null, ptr null }}\n", .{ block_name, body_name }) catch return error.OutOfMemory;
+            const slot = try self.scalarSlot("ptr");
+            try self.instruction("store ptr @\"{s}\", ptr {s}", .{ block_name, slot });
+            return .{ .memory = .{ .pointer = slot, .layout = .{ .size = 8, .alignment = 8 }, .fresh = true } };
+        }
+        try self.emitLambdaDrop(drop_name, shape.captures, span);
+        try self.emitLambdaCopy(copy_name, shape.captures, shape.size, span);
+
+        const block = try self.allocateFixed(shape.size);
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ body_name, block });
+        const drop_slot = try self.byteOffset(block, 8);
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ drop_name, drop_slot });
+        const copy_slot = try self.byteOffset(block, 16);
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ copy_name, copy_slot });
+
+        // capture values come from the enclosing scope at construction
+        // (section 4.4): copies clone, references alias the place, owning
+        // captures take the owning value and null its source
+        for (shape.captures) |closure_capture| {
+            const capture_name = closure_capture.capture.name.slice(self.source());
+            const local = self.lookupLocal(capture_name) orelse
+                return self.report(closure_capture.capture.name.location, "a capture must name a local variable (section 4.4)", .{});
+            const raw = Place{ .pointer = local.pointer, .value_type = local.declared_type };
+            const environment_slot = try self.byteOffset(block, closure_capture.offset);
+            switch (closure_capture.mode) {
+                .copy => {
+                    const pierced = try self.piercePlace(raw);
+                    const value = try self.loadPlace(pierced, span);
+                    const coerced = try self.coerceOperand(value, pierced.value_type, closure_capture.binding_type, span);
+                    try self.storeOperand(environment_slot, coerced, closure_capture.binding_type, span);
+                },
+                .reference => {
+                    const pierced = try self.piercePlace(raw);
+                    try self.instruction("store ptr {s}, ptr {s}", .{ pierced.pointer, environment_slot });
+                },
+                .owning => {
+                    // the whole owning value transfers (a thin pointer or
+                    // an interface fat pair); nulling the leading pointer
+                    // marks the source moved-from (section 4.2)
+                    try self.copyBytes(environment_slot, raw.pointer, closure_capture.layout.size);
+                    try self.instruction("store ptr null, ptr {s}", .{raw.pointer});
+                },
+            }
+        }
+        const slot = try self.scalarSlot("ptr");
+        try self.instruction("store ptr {s}, ptr {s}", .{ block, slot });
+        return .{ .memory = .{ .pointer = slot, .layout = .{ .size = 8, .alignment = 8 }, .fresh = true } };
+    }
+
+    // the lambda's body compiles like a named function with a leading
+    // closure parameter; captures bind to environment slots, pinned so the
+    // frame never drops storage the closure owns
+    fn emitLambdaBody(self: *Codegen, name: []const u8, lambda: ast.Lambda, parameter_types: []const *const Type, return_type: *const Type, captures: []const ClosureCapture) Error!void {
+        const zero_span = Token.Location{ .start = 0, .end = 0 };
+        const saved = self.beginHelperFunction();
+        const saved_scopes = self.scopes;
+        const saved_break_targets = self.break_targets;
+        const saved_yield_targets = self.yield_targets;
+        const saved_return_type = self.return_type;
+        const saved_return_slot = self.return_slot;
+        self.scopes = .empty;
+        self.break_targets = .empty;
+        self.yield_targets = .empty;
+        self.return_type = return_type;
+        self.return_slot = null;
+
+        var subprogram: ?usize = null;
+        if (!self.release_mode) {
+            subprogram = try self.beginDebugFunction("lambda", self.current_view, self.statementOffset(lambda.function.body));
+        }
+        const signature = try self.functionSignature(name, true, parameter_types, return_type, zero_span, subprogram);
+        if (signature.aggregate_return) self.return_slot = "%return.slot";
+
+        try self.pushFrame();
+        for (captures) |closure_capture| {
+            const capture_name = closure_capture.capture.name.slice(self.source());
+            const environment_slot = try self.byteOffset("%closure", closure_capture.offset);
+            try self.bindPinned(capture_name, environment_slot, closure_capture.binding_type);
+        }
+        const names = try self.arena.alloc([]const u8, lambda.function.parameters.len);
+        for (lambda.function.parameters, names) |parameter, *parameter_name| {
+            parameter_name.* = parameter.name.slice(self.source());
+        }
+        try self.bindParameters(names, parameter_types, signature.parameters);
+
+        try self.execStatement(lambda.function.body);
+        if (!self.terminated) try self.emitDefaultReturn();
+        try self.finishHelperFunction(saved, signature.header);
+
+        self.scopes = saved_scopes;
+        self.break_targets = saved_break_targets;
+        self.yield_targets = saved_yield_targets;
+        self.return_type = saved_return_type;
+        self.return_slot = saved_return_slot;
+    }
+
+    fn capturedOwnership(self: *Codegen, closure_capture: ClosureCapture) Error!bool {
+        return switch (closure_capture.mode) {
+            .reference => false,
+            .copy, .owning => self.ownsHeap(closure_capture.binding_type, 0),
+        };
+    }
+
+    fn emitLambdaDrop(self: *Codegen, name: []const u8, captures: []const ClosureCapture, span: Token.Location) Error!void {
+        try self.declareFree();
+        const saved = self.beginHelperFunction();
+        for (captures) |closure_capture| {
+            if (!try self.capturedOwnership(closure_capture)) continue;
+            const environment_slot = try self.byteOffset("%closure", closure_capture.offset);
+            const helper = try self.dropHelper(closure_capture.binding_type, span);
+            try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, environment_slot });
+        }
+        try self.instruction("call void @\"free\"(ptr %closure)", .{});
+        try self.instruction("ret void", .{});
+        self.terminated = true;
+        const header = try std.fmt.allocPrint(self.arena, "define internal void @\"{s}\"(ptr %closure) {{\nentry:\n", .{name});
+        try self.finishHelperFunction(saved, header);
+    }
+
+    fn emitLambdaCopy(self: *Codegen, name: []const u8, captures: []const ClosureCapture, size: u64, span: Token.Location) Error!void {
+        const saved = self.beginHelperFunction();
+        const fresh_block = try self.allocateFixed(size);
+        try self.copyBytes(fresh_block, "%closure", size);
+        for (captures) |closure_capture| {
+            if (!try self.capturedOwnership(closure_capture)) continue;
+            const destination = try self.byteOffset(fresh_block, closure_capture.offset);
+            const origin = try self.byteOffset("%closure", closure_capture.offset);
+            const helper = try self.copyHelper(closure_capture.binding_type, span);
+            try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, destination, origin });
+        }
+        try self.instruction("ret ptr {s}", .{fresh_block});
+        self.terminated = true;
+        const header = try std.fmt.allocPrint(self.arena, "define internal ptr @\"{s}\"(ptr %closure) {{\nentry:\n", .{name});
+        try self.finishHelperFunction(saved, header);
+    }
+
+    // a named function used as a value: a constant block whose null drop
+    // and copy slots mark it static, with a thunk absorbing the closure
+    // argument (section 4.4); the checker recorded exactly which symbol
+    // this path resolved to
+    fn functionValue(self: *Codegen, expression: *const ast.Expression) Error!Operand {
+        const span = self.spanOf(expression);
+        const symbol = self.checker.value_targets.get(expression) orelse
+            return self.report(span, "internal: no recorded function for this function value", .{});
+        const info = try self.functionInfo(symbol, span, &.{});
+        const block = try self.staticClosure(info, span);
+        const slot = try self.scalarSlot("ptr");
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ block, slot });
+        return .{ .memory = .{ .pointer = slot, .layout = .{ .size = 8, .alignment = 8 }, .fresh = true } };
+    }
+
+    fn staticClosure(self: *Codegen, info: *FunctionInfo, span: Token.Location) Error![]const u8 {
+        if (self.static_closures.get(info.name)) |existing| return existing;
+        const id = self.global_counter;
+        self.global_counter += 1;
+        const thunk_name = try std.fmt.allocPrint(self.arena, "alloy.fnvalue.{d}", .{id});
+        const block_name = try std.fmt.allocPrint(self.arena, "alloy.closure.{d}", .{id});
+        try self.static_closures.put(self.arena, info.name, block_name);
+
+        const saved = self.beginHelperFunction();
+        const signature = try self.functionSignature(thunk_name, true, info.parameter_types, info.return_type, span, null);
+        var forwarded: std.ArrayList([]const u8) = .empty;
+        if (signature.aggregate_return) {
+            try forwarded.append(self.arena, "ptr %return.slot");
+        }
+        for (signature.parameters) |parameter| {
+            const text = switch (parameter.class) {
+                .void_class => unreachable,
+                .scalar => |llvm| try std.fmt.allocPrint(self.arena, "{s} {s}", .{ llvm, parameter.register }),
+                .aggregate => try std.fmt.allocPrint(self.arena, "ptr {s}", .{parameter.register}),
+            };
+            try forwarded.append(self.arena, text);
+        }
+        const joined = try self.joinArguments(forwarded.items);
+        if (std.mem.eql(u8, signature.return_text, "void")) {
+            try self.instruction("call void @\"{s}\"({s})", .{ info.name, joined });
+            try self.instruction("ret void", .{});
+        } else {
+            const result = try self.freshTemp();
+            try self.instruction("{s} = call {s} @\"{s}\"({s})", .{ result, signature.return_text, info.name, joined });
+            try self.instruction("ret {s} {s}", .{ signature.return_text, result });
+        }
+        self.terminated = true;
+        try self.finishHelperFunction(saved, signature.header);
+
+        self.constants.writer.print("@\"{s}\" = internal constant {{ ptr, ptr, ptr }} {{ ptr @\"{s}\", ptr null, ptr null }}\n", .{ block_name, thunk_name }) catch return error.OutOfMemory;
+        return block_name;
+    }
+
+    // a call through a function value: the block's first slot is the call
+    // target, which receives the block itself as its leading argument
+    fn indirectCall(self: *Codegen, expression: *const ast.Expression, place: Place) Error!Operand {
+        const call = expression.call;
+        const span = self.spanOf(expression);
+        const fn_resolved = try self.resolvedOf(place.value_type);
+        const fn_type = fn_resolved.function;
+        const return_type = try self.substituted(fn_type.return_type);
+        const return_class = try self.classify(return_type, span);
+        var lowered: std.ArrayList([]const u8) = .empty;
+        var result_slot: ?[]const u8 = null;
+        if (return_class == .aggregate) {
+            result_slot = try self.aggregateSlot(return_class.aggregate);
+            try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{result_slot.?}));
+        }
+        for (call.arguments, 0..) |argument, index| {
+            if (index >= fn_type.parameter_types.len) break;
+            const parameter_type = try self.substituted(fn_type.parameter_types[index]);
+            const value = try self.evalExpression(argument);
+            const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
+            try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
+        }
+        // the block loads AFTER the arguments: an argument may reassign the
+        // callee place, and the call must go through the live block
+        const block = try self.loadScalar(place.pointer, "ptr");
+        if (!self.release_mode) {
+            const live = try self.freshTemp();
+            try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, block });
+            try self.faultUnless(live, "runtime fault: call through an absent function value (section 4.4)");
+        }
+        const call_pointer = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr {s}", .{ call_pointer, block });
+        try lowered.insert(self.arena, 0, try std.fmt.allocPrint(self.arena, "ptr {s}", .{block}));
+        const joined = try self.joinArguments(lowered.items);
+        switch (return_class) {
+            .aggregate => |layout| {
+                try self.instruction("call void {s}({s})", .{ call_pointer, joined });
+                return .{ .memory = .{ .pointer = result_slot.?, .layout = layout, .fresh = true } };
+            },
+            .void_class => {
+                try self.instruction("call void {s}({s})", .{ call_pointer, joined });
+                return .none;
+            },
+            .scalar => |llvm| {
+                const result = try self.freshTemp();
+                try self.instruction("{s} = call {s} {s}({s})", .{ result, llvm, call_pointer, joined });
+                return .{ .scalar = .{ .text = result, .llvm = llvm } };
+            },
+        }
+    }
+
     fn evalStructInit(self: *Codegen, expression: *const ast.Expression) Error!Operand {
         const struct_init = expression.struct_init;
         const span = self.spanOf(expression);
@@ -1779,8 +2470,34 @@ pub const Codegen = struct {
         try self.zeroFill(storage, layout.size);
         const value = try self.evalExpression(array_fill.value);
         const coerced = try self.coerceOperand(value, try self.typeOf(array_fill.value), element_type, span);
-        try self.emitFillLoop(storage, coerced, element_type, element_layout.size, resolved.fixed_array.length, span);
+        const fill = try self.fillSource(coerced, element_type, span);
+        try self.emitFillLoop(storage, fill.operand, element_type, element_layout.size, resolved.fixed_array.length, span);
+        try self.dropFillSource(fill, element_type, span);
         return .{ .memory = .{ .pointer = storage, .layout = layout, .fresh = true } };
+    }
+
+    const FillSource = struct {
+        operand: Operand,
+        // a fresh owning fill value transfers into the loop as clones, so
+        // the original drops once after the last element copies
+        drop_after: bool,
+    };
+
+    // every element of a fill owns its own deep copy (section 5.1): an
+    // owning fill value is pinned as a non-fresh memory operand so each
+    // element store clones instead of aliasing one allocation
+    fn fillSource(self: *Codegen, operand: Operand, element_type: *const Type, span: Token.Location) Error!FillSource {
+        if (!try self.ownsHeap(element_type, 0)) return .{ .operand = operand, .drop_after = false };
+        var memory = try self.ensureMemory(operand, element_type, span);
+        const owned_here = memory.fresh;
+        memory.fresh = false;
+        return .{ .operand = .{ .memory = memory }, .drop_after = owned_here };
+    }
+
+    fn dropFillSource(self: *Codegen, fill: FillSource, element_type: *const Type, span: Token.Location) Error!void {
+        if (!fill.drop_after) return;
+        const helper = try self.dropHelper(element_type, span);
+        try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, fill.operand.memory.pointer });
     }
 
     fn evalArrayRange(self: *Codegen, expression: *const ast.Expression) Error!Operand {
@@ -1910,7 +2627,11 @@ pub const Codegen = struct {
             self.terminated = true;
         }
 
-        try self.break_targets.append(self.arena, .{ .exit_label = exit_label, .slot = slot, .frame_depth = self.scopes.items.len });
+        // only a value-position if receives 'yield'; a statement-position
+        // if is transparent so yields reach the enclosing value construct
+        if (slot != null) {
+            try self.yield_targets.append(self.arena, .{ .exit_label = exit_label, .slot = slot, .frame_depth = self.scopes.items.len });
+        }
         try self.startBlock(then_label);
         try self.pushFrame();
         if (capture_binding) |binding| {
@@ -1936,7 +2657,7 @@ pub const Codegen = struct {
                 self.terminated = true;
             }
         }
-        _ = self.break_targets.pop();
+        if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit_label);
         return self.slotOperand(slot, span);
     }
@@ -2011,14 +2732,20 @@ pub const Codegen = struct {
         const tag = try self.loadTag(place.pointer, frame);
         const matches = try self.freshTemp();
         try self.instruction("{s} = icmp eq {s} {s}, {d}", .{ matches, tagTypeText(frame.tag_size), tag, variant_index });
+        // the payload address computes before the branch terminates this
+        // block; afterwards it would land in an unreachable block and fail
+        // to dominate the capture binding in the then block
+        const payload_type = frame.variants[variant_index].payload;
+        const payload_pointer = if (payload_type != null)
+            try self.byteOffset(place.pointer, frame.payload_offset)
+        else
+            place.pointer;
         try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, then_label, miss_label });
         self.terminated = true;
-        const payload_type = frame.variants[variant_index].payload orelse
-            return .{ .capture = capture, .payload_pointer = place.pointer, .payload_type = &void_type };
         return .{
             .capture = capture,
-            .payload_pointer = try self.byteOffset(place.pointer, frame.payload_offset),
-            .payload_type = payload_type,
+            .payload_pointer = payload_pointer,
+            .payload_type = payload_type orelse &void_type,
         };
     }
 
@@ -2079,6 +2806,9 @@ pub const Codegen = struct {
             }
         }
         const slot = try self.resultSlot(expression);
+        // the loop frame owns materialized subject temporaries: 'break'
+        // leaves it intact and it drops once at the shared exit block
+        try self.pushFrame();
         var subjects: std.ArrayList(ForSubject) = .empty;
         for (for_expr.subjects) |subject_expression| {
             try subjects.append(self.arena, try self.forSubject(subject_expression));
@@ -2151,6 +2881,9 @@ pub const Codegen = struct {
         }
         _ = self.break_targets.pop();
         try self.startBlock(exit);
+        // both the break path and the normal path pass through the exit
+        // block, so the loop frame drops exactly once here
+        try self.closeFrame();
         return self.slotOperand(slot, span);
     }
 
@@ -2161,10 +2894,17 @@ pub const Codegen = struct {
         const slot = try self.resultSlot(expression);
         const protocol = (try self.checker.cursorProtocolOf(subject_type)) orelse
             return self.report(span, "this subject is not iterable: provide 'iterator()' and 'next()' extension functions (section 4.3)", .{});
+        // the loop frame owns the cursor state and any materialized
+        // subject temporary: 'break' leaves it intact and it drops once
+        // at the shared exit block; 'return' unwinds it like any frame
+        try self.pushFrame();
         const subject_expression = for_expr.subjects[0];
         const place = (try self.evalPlace(subject_expression)) orelse place: {
             const value = try self.evalExpression(subject_expression);
             const memory = try self.ensureMemory(value, subject_type, span);
+            if (memory.fresh and try self.ownsHeap(subject_type, 0)) {
+                try self.bindLocal("", memory.pointer, subject_type);
+            }
             break :place Place{ .pointer = memory.pointer, .value_type = subject_type };
         };
 
@@ -2213,6 +2953,11 @@ pub const Codegen = struct {
         const some_index = try self.variantIndex(frame, "Some", span);
         const option_slot = try self.aggregateSlot(frame.layout);
         const option_owns = try self.ownsHeap(option_type, 0);
+        // a break can leave a live 'Some' payload in the option slot, and
+        // the cursor itself may own heap: the loop frame releases both
+        try self.zeroFill(option_slot, frame.layout.size);
+        if (option_owns) try self.bindLocal("", option_slot, option_type);
+        if (try self.ownsHeap(cursor_type, 0)) try self.bindLocal("", cursor_slot, cursor_type);
 
         const header = try self.freshLabel("cursor.header");
         const body = try self.freshLabel("cursor.body");
@@ -2255,6 +3000,9 @@ pub const Codegen = struct {
         }
         _ = self.break_targets.pop();
         try self.startBlock(exit);
+        // both the break path and the normal path pass through the exit
+        // block, so the loop frame drops exactly once here
+        try self.closeFrame();
         return self.slotOperand(slot, span);
     }
 
@@ -2293,6 +3041,11 @@ pub const Codegen = struct {
         const place = (try self.evalPlace(subject_expression)) orelse place: {
             const value = try self.evalExpression(subject_expression);
             const memory = try self.ensureMemory(value, subject_type, span);
+            // a fresh owning temporary joins the loop frame, which drops
+            // it on every exit path (section 4.2)
+            if (memory.fresh and try self.ownsHeap(subject_type, 0)) {
+                try self.bindLocal("", memory.pointer, subject_type);
+            }
             break :place Place{ .pointer = memory.pointer, .value_type = subject_type };
         };
         const resolved = try self.resolvedOf(place.value_type);
@@ -2395,7 +3148,10 @@ pub const Codegen = struct {
             }
         };
 
-        try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // only a value-position match receives 'yield' (section 4.3)
+        if (slot != null) {
+            try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        }
         var arm_labels: std.ArrayList([]const u8) = .empty;
         for (match_expr.arms) |_| {
             try arm_labels.append(self.arena, try self.freshLabel("match.arm"));
@@ -2488,7 +3244,7 @@ pub const Codegen = struct {
                 self.terminated = true;
             }
         }
-        _ = self.break_targets.pop();
+        if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit);
         if (subject_cleanup) |cleanup| {
             // a materialized owning subject drops once the match is done;
@@ -2508,27 +3264,47 @@ pub const Codegen = struct {
         };
     }
 
-    // an interface-object arm names a concrete type (section 4.3)
+    // unqualified visibility from one view (section 5.4): own library plus
+    // the 'exp' symbols of libraries the view imported without an alias,
+    // mirroring the checker's rule
+    fn firstVisible(self: *const Codegen, name: []const u8, view_index: usize) ?resolution.Symbol {
+        const symbols = self.globals.get(name) orelse return null;
+        for (symbols.items) |symbol| {
+            if (resolution.sameLibrary(self.views[view_index].library, self.views[symbol.view_index].library)) return symbol;
+            if (symbol.visibility != .exported) continue;
+            const library = self.views[symbol.view_index].library orelse continue;
+            if (self.injected[view_index].contains(library)) return symbol;
+        }
+        return null;
+    }
+
+    // an interface-object arm names a concrete type (section 4.3); the
+    // checker recorded which definition the pattern resolved to
     fn patternDescriptor(self: *Codegen, pattern: *const ast.Expression) Error!Descriptor {
         const span = self.spanOf(pattern);
         const unwrapped = unwrapGrouped(pattern);
-        if (unwrapped.* != .path or unwrapped.path.len != 1) {
+        if (unwrapped.* != .path) {
             return self.report(span, "this arm must name a concrete type (section 4.3)", .{});
         }
-        const name = unwrapped.path[0].slice(self.source());
-        const symbols = self.globals.get(name) orelse
+        const name = unwrapped.path[unwrapped.path.len - 1].slice(self.source());
+        if (self.checker.type_targets.get(pattern)) |target| {
+            const concrete = try self.implementerType(.{
+                .definition = target.definition,
+                .view_index = target.view_index,
+                .name = name,
+            });
+            return .{ .name = try self.typeDescriptor(target.definition), .concrete = concrete };
+        }
+        const symbol = self.firstVisible(name, self.current_view) orelse
             return self.report(span, "'{s}' names no type here", .{name});
-        const symbol = symbols.items[0];
         if (symbol.definition.kind != .type_def) {
             return self.report(span, "'{s}' is not a type", .{name});
         }
-        const concrete = try self.arena.create(Type);
-        concrete.* = .{ .declared = .{
+        const concrete = try self.implementerType(.{
             .definition = symbol.definition,
             .view_index = symbol.view_index,
             .name = name,
-            .arguments = &.{},
-        } };
+        });
         return .{ .name = try self.typeDescriptor(symbol.definition), .concrete = concrete };
     }
 
@@ -2615,17 +3391,18 @@ pub const Codegen = struct {
             },
             .reference => try self.bindBorrowed(name, payload_pointer, payload_type),
             .owning => {
-                // an owning capture takes the pointer payload out, leaving
-                // the source moved-from (section 2.1)
+                // an owning capture takes the owning payload out, leaving
+                // the source moved-from (section 2.1); an interface fat
+                // pair moves whole, its data half nulled (section 5.2)
                 const resolved = try self.resolvedOf(payload_type);
                 if (resolved.* != .pointer and resolved.* != .heap_array) {
                     return self.report(span, "an owning capture needs a pointer payload (section 2.1)", .{});
                 }
-                const slot = try self.scalarSlot("ptr");
-                const taken = try self.freshTemp();
-                try self.instruction("{s} = load ptr, ptr {s}", .{ taken, payload_pointer });
+                const layout = (try self.layoutQuery(payload_type, 0)) orelse
+                    return self.report(span, "this payload type has no defined layout", .{});
+                const slot = try self.aggregateSlot(layout);
+                try self.copyBytes(slot, payload_pointer, layout.size);
                 try self.instruction("store ptr null, ptr {s}", .{payload_pointer});
-                try self.storeScalar(slot, .{ .text = taken, .llvm = "ptr" });
                 try self.bindLocal(name, slot, payload_type);
             },
         }
@@ -2664,7 +3441,12 @@ pub const Codegen = struct {
                 }
                 return .{ .scalar = "ptr" };
             },
-            .heap_array, .function => .{ .scalar = "ptr" },
+            .heap_array => .{ .scalar = "ptr" },
+            // a function value is one block pointer, but it OWNS the block:
+            // classifying it as an 8-byte aggregate routes every consumer
+            // through the memory machinery, whose clone-versus-transfer
+            // rules already handle ownership (section 4.2)
+            .function => .{ .aggregate = .{ .size = 8, .alignment = 8 } },
             else => {
                 const layout = (try self.layoutQuery(resolved, 0)) orelse
                     return self.report(span, "this type has no defined runtime layout", .{});
@@ -2679,11 +3461,7 @@ pub const Codegen = struct {
         switch (resolved.*) {
             .pointer => |indirection| return self.unsupportedReason(indirection.child, depth + 1),
             .heap_array => |indirection| return self.unsupportedReason(indirection.child, depth + 1),
-            .function => return "function values",
             .type_parameter => return "generics",
-            // reachable through '*I' (the pointer arm recurses): dropping
-            // through an interface needs a virtual drop, deferred for now
-            .interface => return "owning interface objects ('*I')",
             .reference => return null,
             .slice => |indirection| return self.unsupportedReason(indirection.child, depth + 1),
             .fixed_array => |array| return self.unsupportedReason(array.element, depth + 1),
@@ -2712,6 +3490,8 @@ pub const Codegen = struct {
         const resolved = try self.resolvedOf(candidate);
         switch (resolved.*) {
             .pointer, .heap_array => return true,
+            // a closure owns its captured environment (section 4.2)
+            .function => return true,
             .fixed_array => |array| return self.ownsHeap(array.element, depth + 1),
             .structural, .declared, .inline_enum, .structural_enum => {
                 if (try self.enumFrameQuery(resolved)) |frame| {
@@ -2740,7 +3520,10 @@ pub const Codegen = struct {
             .primitive => |primitive| return @tagName(primitive),
             .reference => return "&",
             .slice => return "&[]",
+            // every closure shares one runtime shape: a block pointer whose
+            // header carries its own drop and copy functions
             .function => return "fn",
+            .interface => |interface| return std.fmt.allocPrint(self.arena, "interface.{d}", .{@intFromPtr(interface.definition)}),
             .pointer => |indirection| return std.fmt.allocPrint(self.arena, "*({s})", .{try self.typeKey(indirection.child, depth + 1)}),
             .heap_array => |indirection| return std.fmt.allocPrint(self.arena, "*[{s}]", .{try self.typeKey(indirection.child, depth + 1)}),
             .fixed_array => |array| return std.fmt.allocPrint(self.arena, "[{s}:{d}]", .{ try self.typeKey(array.element, depth + 1), array.length }),
@@ -2776,6 +3559,11 @@ pub const Codegen = struct {
         body: std.Io.Writer.Allocating,
         temp_counter: usize,
         terminated: bool,
+        // helpers emit without a debug scope: a location pointing into the
+        // enclosing user function would fail the verifier
+        debug_subprogram: ?usize,
+        debug_location: ?usize,
+        debug_scopes: std.ArrayList(usize),
     };
 
     // helper functions generate while another function is mid-emission, so
@@ -2786,11 +3574,17 @@ pub const Codegen = struct {
             .body = self.body,
             .temp_counter = self.temp_counter,
             .terminated = self.terminated,
+            .debug_subprogram = self.debug_subprogram,
+            .debug_location = self.debug_location,
+            .debug_scopes = self.debug_scopes,
         };
         self.allocas = .init(self.arena);
         self.body = .init(self.arena);
         self.temp_counter = 0;
         self.terminated = false;
+        self.debug_subprogram = null;
+        self.debug_location = null;
+        self.debug_scopes = .empty;
         return saved;
     }
 
@@ -2804,12 +3598,33 @@ pub const Codegen = struct {
         self.body = saved.body;
         self.temp_counter = saved.temp_counter;
         self.terminated = saved.terminated;
+        self.debug_subprogram = saved.debug_subprogram;
+        self.debug_location = saved.debug_location;
+        self.debug_scopes = saved.debug_scopes;
     }
 
     fn declareMalloc(self: *Codegen) Error!void {
         if (!self.extern_declarations.contains("malloc")) {
             try self.extern_declarations.put(self.arena, "malloc", "declare ptr @\"malloc\"(i64)");
         }
+    }
+
+    // every allocation goes through here: checked builds fault when the
+    // allocator is exhausted instead of piercing a null block
+    fn allocateDynamic(self: *Codegen, size: []const u8) Error![]const u8 {
+        try self.declareMalloc();
+        const allocation = try self.freshTemp();
+        try self.instruction("{s} = call ptr @\"malloc\"(i64 {s})", .{ allocation, size });
+        if (!self.release_mode) {
+            const live = try self.freshTemp();
+            try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, allocation });
+            try self.faultUnless(live, "runtime fault: out of memory");
+        }
+        return allocation;
+    }
+
+    fn allocateFixed(self: *Codegen, size: u64) Error![]const u8 {
+        return self.allocateDynamic(try std.fmt.allocPrint(self.arena, "{d}", .{size}));
     }
 
     fn declareFree(self: *Codegen) Error!void {
@@ -2833,6 +3648,31 @@ pub const Codegen = struct {
         const saved = self.beginHelperFunction();
         switch (resolved.*) {
             .pointer => |indirection| {
+                const child_resolved = try self.resolvedOf(indirection.child);
+                if (child_resolved.* == .interface) {
+                    try self.emitInterfaceDrop(child_resolved.interface, span);
+                } else {
+                    const loaded = try self.freshTemp();
+                    try self.instruction("{s} = load ptr, ptr %value", .{loaded});
+                    const live = try self.freshTemp();
+                    try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, loaded });
+                    const live_label = try self.freshLabel("live");
+                    const done_label = try self.freshLabel("done");
+                    try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+                    self.terminated = true;
+                    try self.startBlock(live_label);
+                    if (try self.ownsHeap(indirection.child, 0)) {
+                        const child_drop = try self.dropHelper(indirection.child, span);
+                        try self.instruction("call void @\"{s}\"(ptr {s})", .{ child_drop, loaded });
+                    }
+                    try self.instruction("call void @\"free\"(ptr {s})", .{loaded});
+                    try self.startBlock(done_label);
+                }
+            },
+            .function => {
+                // the block's own drop function releases captures and the
+                // block; a null drop pointer marks a static block (a named
+                // function value), a null block a transferred-away value
                 const loaded = try self.freshTemp();
                 try self.instruction("{s} = load ptr, ptr %value", .{loaded});
                 const live = try self.freshTemp();
@@ -2842,11 +3682,16 @@ pub const Codegen = struct {
                 try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
                 self.terminated = true;
                 try self.startBlock(live_label);
-                if (try self.ownsHeap(indirection.child, 0)) {
-                    const child_drop = try self.dropHelper(indirection.child, span);
-                    try self.instruction("call void @\"{s}\"(ptr {s})", .{ child_drop, loaded });
-                }
-                try self.instruction("call void @\"free\"(ptr {s})", .{loaded});
+                const drop_slot = try self.byteOffset(loaded, 8);
+                const drop_pointer = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr {s}", .{ drop_pointer, drop_slot });
+                const owned = try self.freshTemp();
+                try self.instruction("{s} = icmp ne ptr {s}, null", .{ owned, drop_pointer });
+                const owned_label = try self.freshLabel("owned");
+                try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ owned, owned_label, done_label });
+                self.terminated = true;
+                try self.startBlock(owned_label);
+                try self.instruction("call void {s}(ptr {s})", .{ drop_pointer, loaded });
                 try self.startBlock(done_label);
             },
             .heap_array => |indirection| {
@@ -2915,6 +3760,37 @@ pub const Codegen = struct {
         const saved = self.beginHelperFunction();
         switch (resolved.*) {
             .pointer => |indirection| {
+                const child_resolved = try self.resolvedOf(indirection.child);
+                if (child_resolved.* == .interface) {
+                    try self.emitInterfaceCopy(child_resolved.interface, span);
+                } else {
+                    const loaded = try self.freshTemp();
+                    try self.instruction("{s} = load ptr, ptr %origin", .{loaded});
+                    try self.instruction("store ptr {s}, ptr %destination", .{loaded});
+                    const live = try self.freshTemp();
+                    try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, loaded });
+                    const live_label = try self.freshLabel("live");
+                    const done_label = try self.freshLabel("done");
+                    try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+                    self.terminated = true;
+                    try self.startBlock(live_label);
+                    const pointee_layout = (try self.layoutQuery(indirection.child, 0)) orelse
+                        return self.report(span, "this pointee type has no defined layout", .{});
+                    const allocation = try self.allocateFixed(pointee_layout.size);
+                    if (try self.ownsHeap(indirection.child, 0)) {
+                        const child_copy = try self.copyHelper(indirection.child, span);
+                        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ child_copy, allocation, loaded });
+                    } else {
+                        try self.copyBytes(allocation, loaded, pointee_layout.size);
+                    }
+                    try self.instruction("store ptr {s}, ptr %destination", .{allocation});
+                    try self.startBlock(done_label);
+                }
+            },
+            .function => {
+                // the block's own copy function clones captures into a
+                // fresh block; a null copy pointer marks a static block,
+                // shared rather than cloned
                 const loaded = try self.freshTemp();
                 try self.instruction("{s} = load ptr, ptr %origin", .{loaded});
                 try self.instruction("store ptr {s}, ptr %destination", .{loaded});
@@ -2925,17 +3801,18 @@ pub const Codegen = struct {
                 try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
                 self.terminated = true;
                 try self.startBlock(live_label);
-                const pointee_layout = (try self.layoutQuery(indirection.child, 0)) orelse
-                    return self.report(span, "this pointee type has no defined layout", .{});
-                const allocation = try self.freshTemp();
-                try self.instruction("{s} = call ptr @\"malloc\"(i64 {d})", .{ allocation, pointee_layout.size });
-                if (try self.ownsHeap(indirection.child, 0)) {
-                    const child_copy = try self.copyHelper(indirection.child, span);
-                    try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ child_copy, allocation, loaded });
-                } else {
-                    try self.copyBytes(allocation, loaded, pointee_layout.size);
-                }
-                try self.instruction("store ptr {s}, ptr %destination", .{allocation});
+                const copy_slot = try self.byteOffset(loaded, 16);
+                const copy_pointer = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr {s}", .{ copy_pointer, copy_slot });
+                const owned = try self.freshTemp();
+                try self.instruction("{s} = icmp ne ptr {s}, null", .{ owned, copy_pointer });
+                const owned_label = try self.freshLabel("owned");
+                try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ owned, owned_label, done_label });
+                self.terminated = true;
+                try self.startBlock(owned_label);
+                const cloned = try self.freshTemp();
+                try self.instruction("{s} = call ptr {s}(ptr {s})", .{ cloned, copy_pointer, loaded });
+                try self.instruction("store ptr {s}, ptr %destination", .{cloned});
                 try self.startBlock(done_label);
             },
             .heap_array => |indirection| {
@@ -2959,8 +3836,7 @@ pub const Codegen = struct {
                 try self.instruction("{s} = mul i64 {s}, {d}", .{ data_size, length, element_layout.size });
                 const total = try self.freshTemp();
                 try self.instruction("{s} = add i64 {s}, 8", .{ total, data_size });
-                const new_base = try self.freshTemp();
-                try self.instruction("{s} = call ptr @\"malloc\"(i64 {s})", .{ new_base, total });
+                const new_base = try self.allocateDynamic(total);
                 try self.instruction("store i64 {s}, ptr {s}", .{ length, new_base });
                 const new_data = try self.freshTemp();
                 try self.instruction("{s} = getelementptr inbounds i8, ptr {s}, i64 8", .{ new_data, new_base });
@@ -3075,9 +3951,22 @@ pub const Codegen = struct {
 
     fn typeDescriptor(self: *Codegen, definition: *const ast.Definition) Error![]const u8 {
         if (self.type_descriptors.get(definition)) |existing| return existing;
-        const name = try std.fmt.allocPrint(self.arena, "alloy.type.{d}", .{self.global_counter});
+        // the type name rides in the symbol so debuggers resolving the
+        // identity pointer show which concrete type an interface holds
+        const type_name = switch (definition.kind) {
+            .type_def => |type_def| name: {
+                const view = for (self.views) |view| {
+                    if (definitionBelongsTo(view.module, definition)) break view;
+                } else self.views[0];
+                break :name type_def.name.slice(view.source);
+            },
+            else => "type",
+        };
+        const name = try std.fmt.allocPrint(self.arena, "alloy.type.{s}.{d}", .{ type_name, self.global_counter });
         self.global_counter += 1;
-        self.constants.writer.print("@\"{s}\" = private constant i8 0\n", .{name}) catch return error.OutOfMemory;
+        // internal (not private) linkage keeps the symbol visible to
+        // debuggers, which resolve the identity pointer through it
+        self.constants.writer.print("@\"{s}\" = internal constant i8 0\n", .{name}) catch return error.OutOfMemory;
         try self.type_descriptors.put(self.arena, definition, name);
         return name;
     }
@@ -3102,16 +3991,20 @@ pub const Codegen = struct {
     };
 
     // the merged unit is the whole program, so the implementers of an
-    // interface form a closed world the dispatch chain can enumerate
+    // interface form a closed world the dispatch chain can enumerate;
+    // memoized because dispatch sites and the virtual drop and copy
+    // helpers all enumerate the same list
     fn interfaceImplementers(self: *Codegen, interface: Type.Interface) Error![]const Implementer {
+        if (self.implementer_lists.get(interface.definition)) |existing| return existing;
         var implementers: std.ArrayList(Implementer) = .empty;
         for (self.views, 0..) |view, view_index| {
             for (view.module.definitions) |*definition| {
                 if (definition.kind != .type_def) continue;
                 const type_def = definition.kind.type_def;
                 for (type_def.interfaces) |marker| {
-                    const symbols = self.globals.get(marker.slice(view.source)) orelse continue;
-                    if (symbols.items[0].definition != interface.definition) continue;
+                    // the marker resolves where the type is declared
+                    const symbol = self.firstVisible(marker.slice(view.source), view_index) orelse continue;
+                    if (symbol.definition != interface.definition) continue;
                     try implementers.append(self.arena, .{
                         .definition = definition,
                         .view_index = view_index,
@@ -3121,7 +4014,116 @@ pub const Codegen = struct {
                 }
             }
         }
-        return implementers.toOwnedSlice(self.arena);
+        const list = try implementers.toOwnedSlice(self.arena);
+        try self.implementer_lists.put(self.arena, interface.definition, list);
+        return list;
+    }
+
+    // the interface-object fat pair: the data pointer at offset 0 and the
+    // per-type identity at offset 8 (section 5.2)
+    fn interfacePair(self: *Codegen, data_pointer: []const u8, definition: *const ast.Definition) Error!Operand {
+        const descriptor = try self.typeDescriptor(definition);
+        const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+        try self.instruction("store ptr {s}, ptr {s}", .{ data_pointer, pair });
+        const identity_pointer = try self.byteOffset(pair, 8);
+        try self.instruction("store ptr @\"{s}\", ptr {s}", .{ descriptor, identity_pointer });
+        return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 }, .fresh = true } };
+    }
+
+    fn implementerType(self: *Codegen, implementer: Implementer) Error!*const Type {
+        const concrete = try self.arena.create(Type);
+        concrete.* = .{ .declared = .{
+            .definition = implementer.definition,
+            .view_index = implementer.view_index,
+            .name = implementer.name,
+            .arguments = &.{},
+        } };
+        return concrete;
+    }
+
+    // the drop body for an owning interface object '*I' (section 5.2):
+    // the type identity selects the concrete drop before the data frees,
+    // a virtual drop over the closed world of implementers
+    fn emitInterfaceDrop(self: *Codegen, interface: Type.Interface, span: Token.Location) Error!void {
+        const loaded = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr %value", .{loaded});
+        const live = try self.freshTemp();
+        try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, loaded });
+        const live_label = try self.freshLabel("live");
+        const done_label = try self.freshLabel("done");
+        try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+        self.terminated = true;
+        try self.startBlock(live_label);
+        const identity_slot = try self.byteOffset("%value", 8);
+        const identity = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr {s}", .{ identity, identity_slot });
+        const free_label = try self.freshLabel("free");
+        for (try self.interfaceImplementers(interface)) |implementer| {
+            const concrete = try self.implementerType(implementer);
+            // implementers without owned heap free the allocation alone
+            if (!try self.ownsHeap(concrete, 0)) continue;
+            const descriptor = try self.typeDescriptor(implementer.definition);
+            const arm = try self.freshLabel("drop.arm");
+            const miss = try self.freshLabel("drop.miss");
+            const matches = try self.freshTemp();
+            try self.instruction("{s} = icmp eq ptr {s}, @\"{s}\"", .{ matches, identity, descriptor });
+            try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, arm, miss });
+            self.terminated = true;
+            try self.startBlock(arm);
+            const concrete_drop = try self.dropHelper(concrete, span);
+            try self.instruction("call void @\"{s}\"(ptr {s})", .{ concrete_drop, loaded });
+            try self.instruction("br label %{s}", .{free_label});
+            self.terminated = true;
+            try self.startBlock(miss);
+        }
+        try self.startBlock(free_label);
+        try self.instruction("call void @\"free\"(ptr {s})", .{loaded});
+        try self.startBlock(done_label);
+    }
+
+    // the copy body for '*I': the identity selects the concrete clone, so
+    // the copy owns a fresh allocation of the right concrete type
+    fn emitInterfaceCopy(self: *Codegen, interface: Type.Interface, span: Token.Location) Error!void {
+        try self.copyBytes("%destination", "%origin", 16);
+        const loaded = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr %origin", .{loaded});
+        const live = try self.freshTemp();
+        try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, loaded });
+        const live_label = try self.freshLabel("live");
+        const done_label = try self.freshLabel("done");
+        try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ live, live_label, done_label });
+        self.terminated = true;
+        try self.startBlock(live_label);
+        const identity_slot = try self.byteOffset("%origin", 8);
+        const identity = try self.freshTemp();
+        try self.instruction("{s} = load ptr, ptr {s}", .{ identity, identity_slot });
+        for (try self.interfaceImplementers(interface)) |implementer| {
+            const concrete = try self.implementerType(implementer);
+            const descriptor = try self.typeDescriptor(implementer.definition);
+            const arm = try self.freshLabel("copy.arm");
+            const miss = try self.freshLabel("copy.miss");
+            const matches = try self.freshTemp();
+            try self.instruction("{s} = icmp eq ptr {s}, @\"{s}\"", .{ matches, identity, descriptor });
+            try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, arm, miss });
+            self.terminated = true;
+            try self.startBlock(arm);
+            const layout = (try self.layoutQuery(concrete, 0)) orelse
+                return self.report(span, "this implementer has no defined layout", .{});
+            const allocation = try self.allocateFixed(layout.size);
+            if (try self.ownsHeap(concrete, 0)) {
+                const concrete_copy = try self.copyHelper(concrete, span);
+                try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ concrete_copy, allocation, loaded });
+            } else {
+                try self.copyBytes(allocation, loaded, layout.size);
+            }
+            try self.instruction("store ptr {s}, ptr %destination", .{allocation});
+            try self.instruction("br label %{s}", .{done_label});
+            self.terminated = true;
+            try self.startBlock(miss);
+        }
+        // closed world: an unmatched identity cannot alias the original
+        try self.instruction("store ptr null, ptr %destination", .{});
+        try self.startBlock(done_label);
     }
 
     // the extension implementing 'name' for the concrete type, mirroring
@@ -3264,22 +4266,30 @@ pub const Codegen = struct {
             if (operand != .scalar) return self.report(span, "internal: a primitive operand is not a scalar", .{});
             return .{ .scalar = try self.convertNumeric(operand.scalar, from_resolved.primitive, to_resolved.primitive) };
         }
-        // a reference to a concrete implementer converts to an interface
-        // object: the fat pair carries the data pointer and the type
-        // identity (section 5.2)
-        if (to_resolved.* == .reference and (try self.resolvedOf(to_resolved.reference.child)).* == .interface) {
-            if (from_resolved.* == .reference) {
-                const pointee = try self.resolvedOf(from_resolved.reference.child);
+        // a reference or pointer to a concrete implementer converts to an
+        // interface object: the fat pair carries the data pointer and the
+        // type identity; an owning '*T' yields an owning '*I' (section 5.2)
+        const to_child: ?*const Type = switch (to_resolved.*) {
+            .reference => |indirection| indirection.child,
+            .pointer => |indirection| indirection.child,
+            else => null,
+        };
+        if (to_child != null and (try self.resolvedOf(to_child.?)).* == .interface) {
+            const from_child: ?*const Type = switch (from_resolved.*) {
+                .reference => |indirection| indirection.child,
+                .pointer => |indirection| indirection.child,
+                else => null,
+            };
+            if (from_child) |child| {
+                const pointee = try self.resolvedOf(child);
                 if (pointee.* == .interface) return operand;
                 if (pointee.* != .declared) {
                     return self.report(span, "only named types convert to interface objects (section 5.2)", .{});
                 }
-                const descriptor = try self.typeDescriptor(pointee.declared.definition);
-                const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
-                try self.instruction("store ptr {s}, ptr {s}", .{ operand.scalar.text, pair });
-                const identity_pointer = try self.byteOffset(pair, 8);
-                try self.instruction("store ptr @\"{s}\", ptr {s}", .{ descriptor, identity_pointer });
-                return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 }, .fresh = true } };
+                if (operand != .scalar) {
+                    return self.report(span, "internal: this indirection operand has no scalar pointer", .{});
+                }
+                return self.interfacePair(operand.scalar.text, pointee.declared.definition);
             }
         }
         switch (operand) {
@@ -3446,15 +4456,361 @@ pub const Codegen = struct {
             self.body.writer.print("{s}:\n", .{label}) catch return error.OutOfMemory;
             self.terminated = false;
         }
-        self.body.writer.print("  " ++ format ++ "\n", arguments) catch return error.OutOfMemory;
+        self.body.writer.print("  " ++ format, arguments) catch return error.OutOfMemory;
+        self.appendDebugLocation();
+        self.body.writer.print("\n", .{}) catch return error.OutOfMemory;
     }
 
     fn startBlock(self: *Codegen, label: []const u8) Error!void {
         if (!self.terminated) {
-            self.body.writer.print("  br label %{s}\n", .{label}) catch return error.OutOfMemory;
+            self.body.writer.print("  br label %{s}", .{label}) catch return error.OutOfMemory;
+            self.appendDebugLocation();
+            self.body.writer.print("\n", .{}) catch return error.OutOfMemory;
         }
         self.body.writer.print("{s}:\n", .{label}) catch return error.OutOfMemory;
         self.terminated = false;
+    }
+
+    fn appendDebugLocation(self: *Codegen) void {
+        if (self.debug_subprogram == null) return;
+        const location = self.debug_location orelse return;
+        self.body.writer.print(", !dbg !{d}", .{location}) catch {};
+    }
+
+    fn nextMetadata(self: *Codegen) usize {
+        const id = self.metadata_counter;
+        self.metadata_counter += 1;
+        return id;
+    }
+
+    // DWARF strings use forward slashes; a backslash would need escaping
+    fn printDebugPath(self: *Codegen, path: []const u8) void {
+        for (path) |byte| {
+            const printable = if (byte == '\\') '/' else byte;
+            if (printable == '"') continue;
+            self.debug_metadata.writer.print("{c}", .{printable}) catch {};
+        }
+    }
+
+    fn debugFile(self: *Codegen, view_index: usize) Error!usize {
+        if (self.debug_files.get(view_index)) |existing| return existing;
+        const id = self.nextMetadata();
+        const path = self.views[view_index].path;
+        const separator = std.mem.lastIndexOfAny(u8, path, "/\\");
+        const base = if (separator) |index| path[index + 1 ..] else path;
+        const directory = if (separator) |index| path[0..index] else ".";
+        self.debug_metadata.writer.print("!{d} = !DIFile(filename: \"", .{id}) catch return error.OutOfMemory;
+        self.printDebugPath(base);
+        self.debug_metadata.writer.print("\", directory: \"", .{}) catch return error.OutOfMemory;
+        self.printDebugPath(directory);
+        self.debug_metadata.writer.print("\")\n", .{}) catch return error.OutOfMemory;
+        try self.debug_files.put(self.arena, view_index, id);
+        return id;
+    }
+
+    fn debugCompileUnit(self: *Codegen, view_index: usize) Error!usize {
+        if (self.debug_compile_unit) |existing| return existing;
+        const file = try self.debugFile(view_index);
+        const id = self.nextMetadata();
+        self.debug_metadata.writer.print(
+            "!{d} = distinct !DICompileUnit(language: DW_LANG_C99, file: !{d}, producer: \"alloyc\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)\n",
+            .{ id, file },
+        ) catch return error.OutOfMemory;
+        self.debug_compile_unit = id;
+        return id;
+    }
+
+    fn debugSubroutineType(self: *Codegen) Error!usize {
+        if (self.debug_subroutine_type) |existing| return existing;
+        const operands = self.nextMetadata();
+        const id = self.nextMetadata();
+        self.debug_metadata.writer.print("!{d} = !{{null}}\n!{d} = !DISubroutineType(types: !{d})\n", .{ operands, id, operands }) catch return error.OutOfMemory;
+        self.debug_subroutine_type = id;
+        return id;
+    }
+
+    // opens the debug scope of a user function or lambda: subsequent
+    // statements attach line locations until the scope clears
+    fn beginDebugFunction(self: *Codegen, display_name: []const u8, view_index: usize, offset: usize) Error!usize {
+        const unit = try self.debugCompileUnit(view_index);
+        const file = try self.debugFile(view_index);
+        const subroutine_type = try self.debugSubroutineType();
+        const position = lineColumnOf(self.views[view_index].source, offset);
+        const id = self.nextMetadata();
+        self.debug_metadata.writer.print(
+            "!{d} = distinct !DISubprogram(name: \"{s}\", scope: !{d}, file: !{d}, line: {d}, type: !{d}, scopeLine: {d}, spFlags: DISPFlagDefinition, unit: !{d})\n",
+            .{ id, display_name, file, file, position.line, subroutine_type, position.line, unit },
+        ) catch return error.OutOfMemory;
+        self.debug_subprogram = id;
+        self.debug_file_id = file;
+        self.debug_location = null;
+        self.debug_scopes.clearRetainingCapacity();
+        try self.setDebugLocation(offset);
+        return id;
+    }
+
+    fn currentDebugScope(self: *const Codegen) usize {
+        if (self.debug_scopes.items.len != 0) {
+            return self.debug_scopes.items[self.debug_scopes.items.len - 1];
+        }
+        return self.debug_subprogram.?;
+    }
+
+    fn setDebugLocation(self: *Codegen, offset: usize) Error!void {
+        if (self.debug_subprogram == null) return;
+        const scope = self.currentDebugScope();
+        const position = lineColumnOf(self.source(), offset);
+        self.debug_line = position.line;
+        self.debug_column = position.column;
+        const key = (@as(u128, scope) << 64) | (@as(u128, position.line) << 32) | position.column;
+        if (self.debug_location_memo.get(key)) |existing| {
+            self.debug_location = existing;
+            return;
+        }
+        const id = self.nextMetadata();
+        self.debug_metadata.writer.print("!{d} = !DILocation(line: {d}, column: {d}, scope: !{d})\n", .{ id, position.line, position.column, scope }) catch return error.OutOfMemory;
+        try self.debug_location_memo.put(self.arena, key, id);
+        self.debug_location = id;
+    }
+
+    const LineColumn = struct {
+        line: usize,
+        column: usize,
+    };
+
+    // 1-based line and byte column for debug locations
+    fn lineColumnOf(text: []const u8, offset: usize) LineColumn {
+        const clamped = @min(offset, text.len);
+        var line: usize = 1;
+        var line_start: usize = 0;
+        for (text[0..clamped], 0..) |byte, index| {
+            if (byte == '\n') {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+        return .{ .line = line, .column = clamped - line_start + 1 };
+    }
+
+    // renders a DWARF type for a checked type, mirroring the section 3.9
+    // layouts; null when the type has no meaningful runtime description
+    fn debugType(self: *Codegen, candidate: *const Type, depth: usize) Error!?usize {
+        if (depth > 8) return null;
+        const resolved = self.resolvedOf(candidate) catch return null;
+        const key = self.typeKey(resolved, 0) catch return null;
+        if (self.debug_types.get(key)) |existing| return existing;
+        const out = &self.debug_metadata.writer;
+        switch (resolved.*) {
+            .primitive => |primitive| {
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const encoding: []const u8 = if (primitive == .bool)
+                    "DW_ATE_boolean"
+                else if (primitive.isFloat())
+                    "DW_ATE_float"
+                else if (primitive.isSigned())
+                    "DW_ATE_signed"
+                else
+                    "DW_ATE_unsigned";
+                out.print("!{d} = !DIBasicType(name: \"{s}\", size: {d}, encoding: {s})\n", .{ id, @tagName(primitive), @as(u32, primitive.width()) * 8, encoding }) catch return error.OutOfMemory;
+                return id;
+            },
+            .reference, .pointer => {
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const child = switch (resolved.*) {
+                    .reference => |reference| reference.child,
+                    .pointer => |pointer| pointer.child,
+                    else => unreachable,
+                };
+                if (try self.debugType(child, depth + 1)) |child_id| {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !{d}, size: 64)\n", .{ id, child_id }) catch return error.OutOfMemory;
+                } else {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)\n", .{id}) catch return error.OutOfMemory;
+                }
+                return id;
+            },
+            .heap_array => |heap| {
+                // a NAMED typedef over the data pointer, so debugger
+                // formatters can recognize heap arrays and read the
+                // length prefix at pointer - 8
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const pointer_id = self.nextMetadata();
+                if (try self.debugType(heap.child, depth + 1)) |child_id| {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !{d}, size: 64)\n", .{ pointer_id, child_id }) catch return error.OutOfMemory;
+                } else {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)\n", .{pointer_id}) catch return error.OutOfMemory;
+                }
+                const element_name = heap.child.render(self.arena) catch "T";
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_typedef, name: \"*[{s}]\", baseType: !{d})\n", .{ id, element_name, pointer_id }) catch return error.OutOfMemory;
+                return id;
+            },
+            .function => {
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)\n", .{id}) catch return error.OutOfMemory;
+                return id;
+            },
+            .slice => |slice| {
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const data_pointer = self.nextMetadata();
+                if (try self.debugType(slice.child, depth + 1)) |child_id| {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !{d}, size: 64)\n", .{ data_pointer, child_id }) catch return error.OutOfMemory;
+                } else {
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)\n", .{data_pointer}) catch return error.OutOfMemory;
+                }
+                const length_type = (try self.debugType(&u64_type, depth + 1)).?;
+                const data_member = self.nextMetadata();
+                const length_member = self.nextMetadata();
+                const elements = self.nextMetadata();
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"data\", baseType: !{d}, size: 64, offset: 0)\n", .{ data_member, data_pointer }) catch return error.OutOfMemory;
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"length\", baseType: !{d}, size: 64, offset: 64)\n", .{ length_member, length_type }) catch return error.OutOfMemory;
+                out.print("!{d} = !{{!{d}, !{d}}}\n", .{ elements, data_member, length_member }) catch return error.OutOfMemory;
+                out.print("!{d} = !DICompositeType(tag: DW_TAG_structure_type, name: \"slice\", size: 128, elements: !{d})\n", .{ id, elements }) catch return error.OutOfMemory;
+                return id;
+            },
+            .interface => |interface| {
+                // the fat pair as {data, identity}: resolving the identity
+                // pointer to its symbol names the concrete type
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const raw_pointer = self.nextMetadata();
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)\n", .{raw_pointer}) catch return error.OutOfMemory;
+                const data_member = self.nextMetadata();
+                const identity_member = self.nextMetadata();
+                const elements = self.nextMetadata();
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"data\", baseType: !{d}, size: 64, offset: 0)\n", .{ data_member, raw_pointer }) catch return error.OutOfMemory;
+                out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"identity\", baseType: !{d}, size: 64, offset: 64)\n", .{ identity_member, raw_pointer }) catch return error.OutOfMemory;
+                out.print("!{d} = !{{!{d}, !{d}}}\n", .{ elements, data_member, identity_member }) catch return error.OutOfMemory;
+                out.print("!{d} = !DICompositeType(tag: DW_TAG_structure_type, name: \"{s}\", size: 128, elements: !{d})\n", .{ id, interface.name, elements }) catch return error.OutOfMemory;
+                return id;
+            },
+            .fixed_array => |array| {
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                const element = (try self.debugType(array.element, depth + 1)) orelse return null;
+                const element_layout = (self.layoutQuery(array.element, 0) catch null) orelse return null;
+                const subrange = self.nextMetadata();
+                const elements = self.nextMetadata();
+                out.print("!{d} = !DISubrange(count: {d})\n", .{ subrange, array.length }) catch return error.OutOfMemory;
+                out.print("!{d} = !{{!{d}}}\n", .{ elements, subrange }) catch return error.OutOfMemory;
+                out.print("!{d} = !DICompositeType(tag: DW_TAG_array_type, baseType: !{d}, size: {d}, elements: !{d})\n", .{ id, element, element_layout.size * array.length * 8, elements }) catch return error.OutOfMemory;
+                return id;
+            },
+            .declared, .structural, .inline_enum, .structural_enum => {
+                const layout = (self.layoutQuery(resolved, 0) catch null) orelse return null;
+                const type_name: []const u8 = if (resolved.* == .declared) resolved.declared.name else "struct";
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
+                // enums render as tag + a union of variant payloads,
+                // mirroring the section 3.9 frame
+                if ((self.enumFrameQuery(resolved) catch null) != null) {
+                    const frame = (self.enumFrameQuery(resolved) catch null).?;
+                    try self.debugEnumType(id, type_name, layout, frame, depth);
+                    return id;
+                }
+                const field_slots = (self.fieldSlotsQuery(resolved) catch null) orelse {
+                    out.print("!{d} = !DICompositeType(tag: DW_TAG_structure_type, name: \"{s}\", size: {d})\n", .{ id, type_name, layout.size * 8 }) catch return error.OutOfMemory;
+                    return id;
+                };
+                var members: std.ArrayList(usize) = .empty;
+                for (field_slots) |slot| {
+                    const member_type = (try self.debugType(slot.field_type, depth + 1)) orelse continue;
+                    const member_layout = (self.layoutQuery(slot.field_type, 0) catch null) orelse continue;
+                    const member = self.nextMetadata();
+                    out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"{s}\", baseType: !{d}, size: {d}, offset: {d})\n", .{ member, slot.name, member_type, member_layout.size * 8, slot.offset * 8 }) catch return error.OutOfMemory;
+                    try members.append(self.arena, member);
+                }
+                const elements = self.nextMetadata();
+                out.print("!{d} = !{{", .{elements}) catch return error.OutOfMemory;
+                for (members.items, 0..) |member, index| {
+                    if (index != 0) out.print(", ", .{}) catch return error.OutOfMemory;
+                    out.print("!{d}", .{member}) catch return error.OutOfMemory;
+                }
+                out.print("}}\n", .{}) catch return error.OutOfMemory;
+                out.print("!{d} = !DICompositeType(tag: DW_TAG_structure_type, name: \"{s}\", size: {d}, elements: !{d})\n", .{ id, type_name, layout.size * 8, elements }) catch return error.OutOfMemory;
+                return id;
+            },
+            else => return null,
+        }
+    }
+
+    fn debugEnumType(self: *Codegen, id: usize, type_name: []const u8, layout: Checker.Layout, frame: Checker.EnumFrame, depth: usize) Error!void {
+        const out = &self.debug_metadata.writer;
+        const tag_type: *const Type = switch (frame.tag_size) {
+            1 => &u8_type,
+            2 => &u16_type,
+            else => &u32_type,
+        };
+        const tag_type_id = (try self.debugType(tag_type, depth + 1)).?;
+        const tag_member = self.nextMetadata();
+        out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"tag\", baseType: !{d}, size: {d}, offset: 0)\n", .{ tag_member, tag_type_id, frame.tag_size * 8 }) catch return error.OutOfMemory;
+
+        var union_members: std.ArrayList(usize) = .empty;
+        for (frame.variants) |variant| {
+            const payload_type = variant.payload orelse continue;
+            const payload_id = (try self.debugType(payload_type, depth + 1)) orelse continue;
+            const payload_layout = (self.layoutQuery(payload_type, 0) catch null) orelse continue;
+            const member = self.nextMetadata();
+            out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"{s}\", baseType: !{d}, size: {d}, offset: 0)\n", .{ member, variant.name, payload_id, payload_layout.size * 8 }) catch return error.OutOfMemory;
+            try union_members.append(self.arena, member);
+        }
+
+        var payload_member: ?usize = null;
+        if (union_members.items.len != 0) {
+            const union_elements = self.nextMetadata();
+            out.print("!{d} = !{{", .{union_elements}) catch return error.OutOfMemory;
+            for (union_members.items, 0..) |member, index| {
+                if (index != 0) out.print(", ", .{}) catch return error.OutOfMemory;
+                out.print("!{d}", .{member}) catch return error.OutOfMemory;
+            }
+            out.print("}}\n", .{}) catch return error.OutOfMemory;
+            const union_type = self.nextMetadata();
+            const payload_bits = (layout.size - frame.payload_offset) * 8;
+            out.print("!{d} = !DICompositeType(tag: DW_TAG_union_type, name: \"payload\", size: {d}, elements: !{d})\n", .{ union_type, payload_bits, union_elements }) catch return error.OutOfMemory;
+            const member = self.nextMetadata();
+            out.print("!{d} = !DIDerivedType(tag: DW_TAG_member, name: \"payload\", baseType: !{d}, size: {d}, offset: {d})\n", .{ member, union_type, payload_bits, frame.payload_offset * 8 }) catch return error.OutOfMemory;
+            payload_member = member;
+        }
+
+        const elements = self.nextMetadata();
+        if (payload_member) |member| {
+            out.print("!{d} = !{{!{d}, !{d}}}\n", .{ elements, tag_member, member }) catch return error.OutOfMemory;
+        } else {
+            out.print("!{d} = !{{!{d}}}\n", .{ elements, tag_member }) catch return error.OutOfMemory;
+        }
+        out.print("!{d} = !DICompositeType(tag: DW_TAG_structure_type, name: \"{s}\", size: {d}, elements: !{d})\n", .{ id, type_name, layout.size * 8, elements }) catch return error.OutOfMemory;
+    }
+
+    // a named local becomes visible to debuggers: a DILocalVariable plus
+    // an llvm.dbg.declare on its slot
+    fn declareDebugVariable(self: *Codegen, name: []const u8, pointer: []const u8, declared_type: *const Type) Error!void {
+        if (name.len == 0) return;
+        if (self.debug_subprogram == null) return;
+        const scope = self.currentDebugScope();
+        const file = self.debug_file_id orelse return;
+        const type_id = (try self.debugType(declared_type, 0)) orelse return;
+        const variable = self.nextMetadata();
+        self.debug_metadata.writer.print(
+            "!{d} = !DILocalVariable(name: \"{s}\", scope: !{d}, file: !{d}, line: {d}, type: !{d})\n",
+            .{ variable, name, scope, file, self.debug_line, type_id },
+        ) catch return error.OutOfMemory;
+        try self.intrinsic_declarations.put(self.arena, "declare void @llvm.dbg.declare(metadata, metadata, metadata)", {});
+        try self.instruction("call void @llvm.dbg.declare(metadata ptr {s}, metadata !{d}, metadata !DIExpression())", .{ pointer, variable });
+    }
+
+    fn statementOffset(self: *const Codegen, statement: *const ast.Statement) usize {
+        return switch (statement.*) {
+            .block => |statements| if (statements.len != 0) self.statementOffset(statements[0]) else 0,
+            .var_def => |var_def| var_def.name.location.start,
+            .assign => |assign| self.checker.expressionSpan(assign.target).start,
+            .expression => |expression| self.checker.expressionSpan(expression).start,
+            .break_stmt => |break_stmt| break_stmt.keyword.location.start,
+            .yield_stmt => |yield_stmt| yield_stmt.keyword.location.start,
+            .return_stmt => |return_stmt| return_stmt.keyword.location.start,
+        };
     }
 
     fn faultUnless(self: *Codegen, condition: []const u8, message: []const u8) Error!void {
@@ -3527,11 +4883,48 @@ pub const Codegen = struct {
     }
 
     fn pushFrame(self: *Codegen) Error!void {
-        try self.scopes.append(self.arena, .{ .locals = .empty });
+        // each frame opens a lexical block so debuggers resolve shadowed
+        // names to the innermost binding
+        var scope_pushed = false;
+        if (self.debug_subprogram != null) {
+            const parent = self.currentDebugScope();
+            const file = self.debug_file_id.?;
+            const block = self.nextMetadata();
+            self.debug_metadata.writer.print(
+                "!{d} = distinct !DILexicalBlock(scope: !{d}, file: !{d}, line: {d}, column: {d})\n",
+                .{ block, parent, file, self.debug_line, self.debug_column },
+            ) catch return error.OutOfMemory;
+            try self.debug_scopes.append(self.arena, block);
+            scope_pushed = true;
+        }
+        try self.scopes.append(self.arena, .{ .locals = .empty, .debug_scope_pushed = scope_pushed });
     }
 
     fn popFrame(self: *Codegen) void {
-        _ = self.scopes.pop();
+        const frame = self.scopes.pop().?;
+        if (frame.debug_scope_pushed) _ = self.debug_scopes.pop();
+    }
+
+    // reading an owning place yields a deep copy (section 4.2, no implicit
+    // move): a bare heap-array local flowing out of 'return', 'break', or
+    // 'yield' clones its allocation before the scope-end drops free the
+    // original; 'move v' transfers explicitly and needs no copy
+    fn copyOwnedScalarRead(self: *Codegen, value_expression: *const ast.Expression, operand: Operand, span: Token.Location) Error!Operand {
+        if (operand != .scalar) return operand;
+        const unwrapped = unwrapGrouped(value_expression);
+        if (unwrapped.* != .path or unwrapped.path.len != 1) return operand;
+        const local = self.lookupLocal(unwrapped.path[0].slice(self.source())) orelse return operand;
+        if (!try self.ownsHeap(local.declared_type, 0)) return operand;
+        if ((try self.classify(local.declared_type, span)) != .scalar) return operand;
+        // a pierced read ('return p' yielding the pointee copy) already
+        // copied: only a read of the owning slot itself clones here
+        const read_type = try self.resolvedOf(try self.typeOf(value_expression));
+        const local_type = try self.resolvedOf(local.declared_type);
+        if (!read_type.eql(local_type)) return operand;
+        const copied_slot = try self.scalarSlot("ptr");
+        const helper = try self.copyHelper(local_type, span);
+        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, copied_slot, local.pointer });
+        return .{ .scalar = .{ .text = try self.loadScalar(copied_slot, "ptr"), .llvm = "ptr" } };
     }
 
     // scope-end drop (section 4.2): owning locals release their heap when
@@ -3541,7 +4934,8 @@ pub const Codegen = struct {
         if (!self.terminated) {
             try self.emitFrameDrops(&self.scopes.items[self.scopes.items.len - 1], null);
         }
-        _ = self.scopes.pop();
+        const frame = self.scopes.pop().?;
+        if (frame.debug_scope_pushed) _ = self.debug_scopes.pop();
     }
 
     fn emitFrameDrops(self: *Codegen, frame: *const Frame, skip_pointer: ?[]const u8) Error!void {
@@ -3549,6 +4943,7 @@ pub const Codegen = struct {
         while (index > 0) {
             index -= 1;
             const local = frame.locals.items[index];
+            if (local.pinned) continue;
             if (skip_pointer) |skip| {
                 if (std.mem.eql(u8, skip, local.pointer)) continue;
             }
@@ -3591,6 +4986,13 @@ pub const Codegen = struct {
     fn bindLocal(self: *Codegen, name: []const u8, pointer: []const u8, declared_type: *const Type) Error!void {
         const frame = &self.scopes.items[self.scopes.items.len - 1];
         try frame.locals.append(self.arena, .{ .name = name, .pointer = pointer, .declared_type = declared_type });
+        try self.declareDebugVariable(name, pointer, declared_type);
+    }
+
+    fn bindPinned(self: *Codegen, name: []const u8, pointer: []const u8, declared_type: *const Type) Error!void {
+        const frame = &self.scopes.items[self.scopes.items.len - 1];
+        try frame.locals.append(self.arena, .{ .name = name, .pointer = pointer, .declared_type = declared_type, .pinned = true });
+        try self.declareDebugVariable(name, pointer, declared_type);
     }
 
     fn lookupLocal(self: *Codegen, name: []const u8) ?Local {
@@ -3628,7 +5030,18 @@ pub const Codegen = struct {
     }
 };
 
+fn definitionBelongsTo(module: *const ast.Module, definition: *const ast.Definition) bool {
+    for (module.definitions) |*candidate| {
+        if (candidate == definition) return true;
+    }
+    return false;
+}
+
 const void_type: Type = .void_type;
+const u8_type: Type = .{ .primitive = .u8 };
+const u16_type: Type = .{ .primitive = .u16 };
+const u32_type: Type = .{ .primitive = .u32 };
+const u64_type: Type = .{ .primitive = .u64 };
 const integer_type: Type = .{ .primitive = .i32 };
 
 fn scalarTypeText(primitive: types.Primitive) []const u8 {

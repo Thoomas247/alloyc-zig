@@ -1,0 +1,115 @@
+// The growable array.
+//
+// A Vector owns a heap buffer and a count of the elements in use. Growth
+// follows the manual pattern of LANGUAGE_SPEC.md section 4.2: allocate a
+// larger buffer, copy the elements across, and reassign the owning field,
+// which reclaims the previous buffer automatically. The buffer doubles on
+// exhaustion, so pushes are amortized constant.
+//
+// Element reads copy deeply, like every Alloy assignment (section 4.2).
+// The storage starts empty ('None') because a fresh allocation needs a
+// fill value, and no value of a generic element type exists until the
+// first push provides one.
+
+import std::option;
+import std::iterable;
+
+pub type Vector<T> : Iterable = struct {
+    storage: Option<*var [T]>,
+    count: u64,
+};
+
+// A vector with no elements and no allocation.
+pub fn empty_vector<T>() -> Vector<T> {
+    return Vector { .storage = ::None, .count = 0 };
+}
+
+// The number of elements in use (the Iterable requirement).
+pub fn length<T>(self vector: &Vector<T>) -> u64 {
+    return vector.count;
+}
+
+// Appends one element, growing the buffer when it is full. The new
+// buffer is filled with copies of the pushed element, so every slot is
+// initialized and reclaimable.
+pub fn push<T>(self vector: &var Vector<T>, item: T) {
+    const in_use = vector.count;
+    if (in_use == vector.capacity()) {
+        var grown_capacity: u64 = 4;
+        if (in_use != 0) {
+            grown_capacity = in_use * 2;
+        }
+        var grown: *var [T] = new [item : grown_capacity];
+        if (vector.storage is ::Some) |buffer: &| {
+            for ([..in_use]) |index| {
+                grown[index] = buffer[index];
+            }
+        }
+        vector.storage = ::Some(move grown);
+    }
+    if (vector.storage is ::Some) |buffer: &var| {
+        buffer[in_use] = item;
+    }
+    vector.count = in_use + 1;
+}
+
+// A copy of the element at the index, or 'None' past the end.
+pub fn get<T>(self vector: &Vector<T>, index: u64) -> Option<T> {
+    if (index >= vector.count) {
+        return ::None;
+    }
+    if (vector.storage is ::Some) |buffer: &| {
+        return ::Some(buffer[index]);
+    }
+    return ::None;
+}
+
+// Overwrites the element at the index; ignores an index past the end.
+pub fn set<T>(self vector: &var Vector<T>, index: u64, item: T) {
+    if (index >= vector.count) {
+        return;
+    }
+    if (vector.storage is ::Some) |buffer: &var| {
+        buffer[index] = item;
+    }
+}
+
+// Removes and returns the last element, or 'None' when empty. The
+// buffer is kept for future pushes.
+pub fn pop<T>(self vector: &var Vector<T>) -> Option<T> {
+    if (vector.count == 0) {
+        return ::None;
+    }
+    vector.count -= 1;
+    if (vector.storage is ::Some) |buffer: &| {
+        return ::Some(buffer[vector.count]);
+    }
+    return ::None;
+}
+
+// The allocated slot count; used internally by push.
+fn capacity<T>(self vector: &Vector<T>) -> u64 {
+    if (vector.storage is ::Some) |buffer: &| {
+        return buffer.length();
+    }
+    return 0;
+}
+
+// The cursor behind 'for (vector) |element|' (section 4.3): it borrows
+// the vector and hands out element copies in order.
+pub type VectorCursor<T> = struct {
+    subject: &Vector<T>,
+    index: u64,
+};
+
+pub fn iterator<T>(self vector: &Vector<T>) -> VectorCursor<T> {
+    return VectorCursor { .subject = &vector, .index = 0 };
+}
+
+pub fn next<T>(self cursor: &var VectorCursor<T>) -> Option<T> {
+    const result = cursor.subject.get(cursor.index);
+    if (result is ::Some) {
+        cursor.index += 1;
+    }
+    return result;
+}

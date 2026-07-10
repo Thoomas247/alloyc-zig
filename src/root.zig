@@ -35,6 +35,14 @@ pub const Interpreter = interpreter.Interpreter;
 pub const codegen = @import("codegen.zig");
 pub const Codegen = codegen.Codegen;
 
+pub const lsp = @import("lsp.zig");
+pub const LanguageServer = lsp.Server;
+
+pub const formatter = @import("formatter.zig");
+
+pub const dap = @import("dap.zig");
+pub const DebugAdapter = dap.Server;
+
 test {
     std.testing.refAllDecls(@This());
 }

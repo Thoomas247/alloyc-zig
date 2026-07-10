@@ -1,4 +1,9 @@
-// lang item std::number::Number (LANGUAGE_SPEC.md section 5.1a), satisfied
-// by the primitive numeric types (section 3.1)
+// The numeric constraint interface.
+//
+// Number is a lang item (LANGUAGE_SPEC.md section 5.1a) at the canonical
+// path std::number::Number. The compiler satisfies it for the primitive
+// numeric types (section 3.1); it bounds generic type parameters
+// ('fn add<T: Number>(...)') and the 'to' conversion cast (section 3.5).
+
 pub interface Number {
 }

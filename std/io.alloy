@@ -1,0 +1,90 @@
+// Console and file input/output.
+//
+// This module is the standard library's FFI barrier (LANGUAGE_SPEC.md
+// section 5.3): programs call these safe wrappers and never touch the C
+// functions underneath. The externs are C standard io; streams cross the
+// boundary as opaque i64 handles (a FILE pointer natively; the
+// interpreter implements the same names over the host filesystem, with
+// handles 1 and 2 as the standard streams). __acrt_iob_func is the
+// Windows C runtime's accessor for those standard streams; a per-target
+// switch can replace it when cross-compilation arrives.
+
+import std::option;
+
+extern fopen(path: &[u8], mode: &[u8]) -> i64;
+extern fclose(stream: i64) -> i32;
+extern fread(buffer: &[u8], size: u64, count: u64, stream: i64) -> u64;
+extern fwrite(buffer: &[u8], size: u64, count: u64, stream: i64) -> u64;
+extern fseek(stream: i64, offset: i32, origin: i32) -> i32;
+extern ftell(stream: i64) -> i32;
+extern __acrt_iob_func(index: u32) -> i64;
+
+// Writes the text to standard output.
+pub fn print(text: &[u8]) {
+    fwrite(text, 1, text.length(), __acrt_iob_func(1));
+}
+
+// Writes the text and a newline to standard output.
+pub fn print_line(text: &[u8]) {
+    print(text);
+    print("\n");
+}
+
+// Writes the text to standard error.
+pub fn print_error(text: &[u8]) {
+    fwrite(text, 1, text.length(), __acrt_iob_func(2));
+}
+
+// Writes the text and a newline to standard error.
+pub fn print_error_line(text: &[u8]) {
+    print_error(text);
+    print_error("\n");
+}
+
+// Reads a whole file into an owned byte array, or 'None' when the file
+// cannot be opened.
+pub fn read_file(path: &[u8]) -> Option<*[u8]> {
+    const terminated = null_terminated(path);
+    const stream = fopen(&terminated, "rb");
+    if (stream == 0) {
+        return ::None;
+    }
+    fseek(stream, 0, 2);
+    const size = ftell(stream);
+    fseek(stream, 0, 0);
+    if (size <= 0) {
+        fclose(stream);
+        var empty: *var [u8] = new [0 : 0];
+        return ::Some(move empty);
+    }
+    var contents: *var [u8] = new [0 : size to u64];
+    fread(&contents, 1, size to u64, stream);
+    fclose(stream);
+    return ::Some(move contents);
+}
+
+// Writes the bytes to the file, replacing any previous contents. False
+// when the file cannot be created.
+pub fn write_file(path: &[u8], contents: &[u8]) -> bool {
+    const terminated = null_terminated(path);
+    const stream = fopen(&terminated, "wb");
+    if (stream == 0) {
+        return false;
+    }
+    fwrite(contents, 1, contents.length(), stream);
+    fclose(stream);
+    return true;
+}
+
+// C strings are NUL-terminated: paths handed to fopen get an owned copy
+// with the terminator appended (string literals already carry one, but a
+// runtime-built path need not).
+fn null_terminated(path: &[u8]) -> *var [u8] {
+    var terminated: *var [u8] = new [0 : path.length() + 1];
+    var cursor: u64 = 0;
+    for (path) |byte| {
+        terminated[cursor] = byte;
+        cursor += 1;
+    }
+    return move terminated;
+}

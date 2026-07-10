@@ -1,5 +1,33 @@
-// lang item std::option::Option (LANGUAGE_SPEC.md section 5.1a)
+// The optional value: a payload ('Some') or its absence ('None').
+//
+// Option is a lang item (LANGUAGE_SPEC.md section 5.1a) at the canonical
+// path std::option::Option: the compiler's cursor-protocol 'for' lowering
+// matches on the Option returned by an iterator's 'next'. Nothing here is
+// otherwise special; it is an ordinary generic enum.
+
 pub type Option<T> = enum {
     Some: T,
     None,
 };
+
+// True when the option carries a payload.
+pub fn is_some<T>(self option: &Option<T>) -> bool {
+    match (option) {
+        ::Some { return true; }
+        ::None { return false; }
+    }
+}
+
+// True when the option is empty.
+pub fn is_none<T>(self option: &Option<T>) -> bool {
+    return !option.is_some();
+}
+
+// The payload when present, otherwise the given fallback. Both the
+// payload and the fallback are returned by copy.
+pub fn unwrap_or<T>(self option: &Option<T>, fallback: T) -> T {
+    match (option) {
+        ::Some |value| { return value; }
+        ::None { return fallback; }
+    }
+}

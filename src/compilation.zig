@@ -19,13 +19,20 @@ const Checker = @import("checker.zig").Checker;
 const types = @import("types.zig");
 const Interpreter = @import("interpreter.zig").Interpreter;
 const Codegen = @import("codegen.zig").Codegen;
+const library_format = @import("library.zig");
+
+/// The version stamped into every .alloylib; a mismatched payload falls
+/// back to recompiling the embedded source (section 5.4)
+pub const compiler_version = "0.1.0";
 
 /// Loads the source of an imported module given its relative file path
 /// ('std/vec.alloy'). Returns null when the file does not exist; the source
-/// must be allocated with the passed allocator.
+/// must be allocated with the passed allocator. The optional library hook
+/// fetches '.alloylib' container bytes for 'pkg::' imports by package name.
 pub const ModuleLoader = struct {
     context: ?*anyopaque,
     function: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8,
+    library: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 = null,
 };
 
 pub const Module = struct {
@@ -33,6 +40,9 @@ pub const Module = struct {
     source: []const u8,
     // canonical import key ('std::option'), null for the entry module
     key: ?[]const u8 = null,
+    // the package this module arrived from, null inside the executable's
+    // own unit; only 'exp' symbols cross a library boundary (section 5.4)
+    library: ?[]const u8 = null,
     tokens: std.ArrayList(Token),
     ast: ?ast.Ast = null,
 
@@ -78,8 +88,69 @@ pub const Module = struct {
     }
 };
 
+// a lock-guarded allocator wrapper for the parallel front-end stages: the
+// standard library's blocking mutex needs an Io handle the compilation
+// does not carry, so a spinlock guards the child allocator instead (the
+// stages allocate in amortized chunks, and batches are small)
+pub const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    flag: std.atomic.Value(bool) = .init(false),
+
+    pub fn allocator(self: *LockedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn lock(self: *LockedAllocator) void {
+        while (self.flag.swap(true, .acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *LockedAllocator) void {
+        self.flag.store(false, .release);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(context: *anyopaque, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.child.rawAlloc(length, alignment, return_address);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_length: usize, return_address: usize) bool {
+        const self: *LockedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.child.rawResize(memory, alignment, new_length, return_address);
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_length: usize, return_address: usize) ?[*]u8 {
+        const self: *LockedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        return self.child.rawRemap(memory, alignment, new_length, return_address);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *LockedAllocator = @ptrCast(@alignCast(context));
+        self.lock();
+        defer self.unlock();
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
 pub const Compilation = struct {
     allocator: std.mem.Allocator,
+    // wraps the caller's allocator for the parallel front-end stages; lives
+    // on the compilation because module arenas keep it as their child
+    thread_safe: LockedAllocator,
     // cross-stage allocations: imported sources, paths, keys, the merged unit
     arena: std.heap.ArenaAllocator,
     modules: std.ArrayList(Module),
@@ -94,6 +165,7 @@ pub const Compilation = struct {
     call_type_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const types.Type.Binding) = .empty,
     comptime_values: std.AutoHashMapUnmanaged(*const ast.Expression, Interpreter.Value) = .empty,
     cast_shapes: std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes) = .empty,
+    type_targets: std.AutoHashMapUnmanaged(*const ast.Expression, types.TypeIdentity) = .empty,
     // the checker outlives its stage: code generation queries it for
     // section 3.9 layouts instead of re-deriving them
     checker: ?*Checker = null,
@@ -103,6 +175,7 @@ pub const Compilation = struct {
     pub fn init(allocator: std.mem.Allocator) Compilation {
         return .{
             .allocator = allocator,
+            .thread_safe = .{ .child = allocator },
             .arena = std.heap.ArenaAllocator.init(allocator),
             .modules = .empty,
             .diagnostics = .empty,
@@ -152,14 +225,10 @@ pub const Compilation = struct {
             const batch_end = compilation.modules.items.len;
             processed = batch_end;
 
-            for (compilation.modules.items[batch_start..batch_end]) |*module| {
-                try module.tokenize(compilation.allocator, &compilation.diagnostics);
-            }
+            try compilation.runFrontEndStage(Module.tokenize, batch_start, batch_end);
             if (compilation.diagnostics.items.len != 0) return false;
 
-            for (compilation.modules.items[batch_start..batch_end]) |*module| {
-                try module.parse(compilation.allocator, &compilation.diagnostics);
-            }
+            try compilation.runFrontEndStage(Module.parse, batch_start, batch_end);
             if (compilation.diagnostics.items.len != 0) return false;
 
             try compilation.loadImports(batch_start, batch_end, loader);
@@ -174,6 +243,63 @@ pub const Compilation = struct {
 
         try compilation.checkTypes();
         return compilation.diagnostics.items.len == 0;
+    }
+
+    // a per-module front-end stage fans out across threads; every worker
+    // collects its own diagnostics, merged back in module order so the
+    // rendered output stays deterministic
+    fn runFrontEndStage(
+        compilation: *Compilation,
+        comptime stage: fn (*Module, std.mem.Allocator, *std.ArrayList(Diagnostic)) anyerror!void,
+        batch_start: usize,
+        batch_end: usize,
+    ) !void {
+        const batch = compilation.modules.items[batch_start..batch_end];
+        if (batch.len <= 1) {
+            for (batch) |*module| {
+                try stage(module, compilation.allocator, &compilation.diagnostics);
+            }
+            return;
+        }
+        const worker_allocator = compilation.thread_safe.allocator();
+        const Worker = struct {
+            module: *Module,
+            allocator: std.mem.Allocator,
+            diagnostics: std.ArrayList(Diagnostic) = .empty,
+            failure: ?anyerror = null,
+
+            fn run(worker: *@This()) void {
+                stage(worker.module, worker.allocator, &worker.diagnostics) catch |err| {
+                    worker.failure = err;
+                };
+            }
+        };
+        const workers = try compilation.allocator.alloc(Worker, batch.len);
+        defer compilation.allocator.free(workers);
+        for (batch, workers) |*module, *worker| {
+            worker.* = .{ .module = module, .allocator = worker_allocator };
+        }
+        const threads = try compilation.allocator.alloc(std.Thread, batch.len);
+        defer compilation.allocator.free(threads);
+        var spawned: usize = 0;
+        for (workers) |*worker| {
+            // a spawn failure degrades to inline execution: every module
+            // still runs its stage exactly once
+            if (std.Thread.spawn(.{}, Worker.run, .{worker})) |thread| {
+                threads[spawned] = thread;
+                spawned += 1;
+            } else |_| {
+                worker.run();
+            }
+        }
+        for (threads[0..spawned]) |thread| thread.join();
+        var failure: ?anyerror = null;
+        for (workers) |*worker| {
+            try compilation.diagnostics.appendSlice(compilation.allocator, worker.diagnostics.items);
+            worker.diagnostics.deinit(worker_allocator);
+            if (worker.failure) |err| failure = err;
+        }
+        if (failure) |err| return err;
     }
 
     // resolves 'import a::b::c' to the file 'a/b/c.alloy' through the loader
@@ -196,6 +322,17 @@ pub const Compilation = struct {
             const tree = module.ast orelse continue;
             for (tree.module.imports) |import| {
                 var key: std.ArrayList(u8) = .empty;
+                // a library's relative imports resolve inside its own
+                // namespace: the members were registered under the package
+                // prefix when the container unpacked (section 5.4)
+                if (module.library) |package_name| {
+                    const first_segment = import.path[0].slice(module.source);
+                    if (!std.mem.eql(u8, first_segment, "std") and !std.mem.eql(u8, first_segment, "pkg")) {
+                        try key.appendSlice(arena, "pkg::");
+                        try key.appendSlice(arena, package_name);
+                        try key.appendSlice(arena, "::");
+                    }
+                }
                 for (import.path, 0..) |segment, segment_index| {
                     if (segment_index != 0) try key.appendSlice(arena, "::");
                     try key.appendSlice(arena, segment.slice(module.source));
@@ -223,6 +360,10 @@ pub const Compilation = struct {
         }
 
         for (requests.items) |request| {
+            if (std.mem.startsWith(u8, request.key, "pkg::")) {
+                try compilation.loadPackage(request.key, request.span, request.importer_path, request.importer_source, loader);
+                continue;
+            }
             const file_path = try importFilePath(arena, request.key);
             const source: ?[]const u8 = if (loader) |active_loader|
                 try active_loader.function(active_loader.context, arena, file_path)
@@ -241,6 +382,92 @@ pub const Compilation = struct {
         }
     }
 
+    // 'pkg::name[::module]' resolves through the loader's library hook: the
+    // '.alloylib' container unpacks once, registering every member under
+    // the package's namespace (section 5.4)
+    fn loadPackage(compilation: *Compilation, key: []const u8, span: Token.Location, importer_path: []const u8, importer_source: []const u8, loader: ?ModuleLoader) !void {
+        const arena = compilation.arena.allocator();
+        const remainder = key["pkg::".len..];
+        const name_length = std.mem.indexOf(u8, remainder, "::") orelse remainder.len;
+        const package_name = remainder[0..name_length];
+        if (package_name.len == 0) {
+            try compilation.diagnostics.append(compilation.allocator, .{
+                .path = importer_path,
+                .source = importer_source,
+                .span = span,
+                .message = "a 'pkg::' import needs a package name (section 5.4)",
+            });
+            return;
+        }
+        const package_key = try std.fmt.allocPrint(arena, "pkg::{s}", .{package_name});
+        if (!compilation.loaded_keys.contains(package_key)) {
+            const bytes: ?[]const u8 = if (loader) |active_loader|
+                if (active_loader.library) |library_hook|
+                    try library_hook(active_loader.context, arena, package_name)
+                else
+                    null
+            else
+                null;
+            const container = bytes orelse {
+                try compilation.diagnostics.append(compilation.allocator, .{
+                    .path = importer_path,
+                    .source = importer_source,
+                    .span = span,
+                    .message = try std.fmt.allocPrint(arena, "package '{s}' not found (expected 'pkg/{s}.alloylib')", .{ package_name, package_name }),
+                });
+                return;
+            };
+            const unpacked = library_format.unpack(arena, container) catch |err| {
+                const reason: []const u8 = switch (err) {
+                    error.UnsupportedFormatVersion => "its container format is newer than this compiler",
+                    else => "its container is malformed",
+                };
+                try compilation.diagnostics.append(compilation.allocator, .{
+                    .path = importer_path,
+                    .source = importer_source,
+                    .span = span,
+                    .message = try std.fmt.allocPrint(arena, "package '{s}' cannot be loaded: {s}", .{ package_name, reason }),
+                });
+                return;
+            };
+            // the embedded source is authoritative: a compiler-version
+            // mismatch only invalidates cache sections, never the library
+            for (unpacked.members) |member| {
+                const member_key = if (member.key.len == 0)
+                    package_key
+                else
+                    try std.fmt.allocPrint(arena, "pkg::{s}::{s}", .{ package_name, member.key });
+                if (compilation.loaded_keys.contains(member_key)) continue;
+                const module = try compilation.addImportedModule(member_key, member.path, member.source);
+                module.library = package_name;
+            }
+        }
+        if (!compilation.loaded_keys.contains(key)) {
+            try compilation.diagnostics.append(compilation.allocator, .{
+                .path = importer_path,
+                .source = importer_source,
+                .span = span,
+                .message = try std.fmt.allocPrint(arena, "package '{s}' has no module '{s}'", .{ package_name, key }),
+            });
+        }
+    }
+
+    /// Packs the fully checked unit into a '.alloylib' container: the entry
+    /// module plus every module of its own (std:: and pkg:: dependencies
+    /// stay imports the consumer resolves).
+    pub fn packLibrary(compilation: *Compilation, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        var members: std.ArrayList(library_format.Member) = .empty;
+        defer members.deinit(allocator);
+        for (compilation.modules.items) |module| {
+            const member_key: []const u8 = if (module.key) |key| key: {
+                if (std.mem.startsWith(u8, key, "std::") or std.mem.startsWith(u8, key, "pkg::")) continue;
+                break :key key;
+            } else "";
+            try members.append(allocator, .{ .key = member_key, .path = module.path, .source = module.source });
+        }
+        return library_format.pack(allocator, compiler_version, name, members.items);
+    }
+
     // stage 3, after the merge point: build the global symbol table and
     // resolve every name in every module
     fn resolveNames(compilation: *Compilation) !void {
@@ -251,6 +478,7 @@ pub const Compilation = struct {
                 .key = module.key,
                 .path = module.path,
                 .source = module.source,
+                .library = module.library,
                 .module = &module.ast.?.module,
             };
         }
@@ -265,7 +493,7 @@ pub const Compilation = struct {
         checker.* = Checker.init(
             compilation.arena.allocator(),
             compilation.views,
-            &compilation.merged.?.globals,
+            &compilation.merged.?,
             &compilation.diagnostics,
             compilation.allocator,
         );
@@ -277,22 +505,38 @@ pub const Compilation = struct {
         compilation.call_type_bindings = checker.call_type_bindings;
         compilation.comptime_values = checker.comptime_values;
         compilation.cast_shapes = checker.cast_shapes;
+        compilation.type_targets = checker.type_targets;
     }
+
+    /// The host facilities an interpreted program may use: the filesystem
+    /// behind the std::io externs and the argv behind std::process (section
+    /// 5.1a). The defaults keep tests hermetic.
+    pub const RunEnvironment = struct {
+        host_io: ?std.Io = null,
+        arguments: []const []const u8 = &.{},
+    };
 
     /// Stage 5: executes 'main' through the tree-walking interpreter.
     /// On error.RuntimeFault the message is available in 'fault'.
     pub fn interpret(compilation: *Compilation, output: *std.Io.Writer) !i64 {
+        return compilation.interpretWithEnvironment(output, .{});
+    }
+
+    pub fn interpretWithEnvironment(compilation: *Compilation, output: *std.Io.Writer, environment: RunEnvironment) !i64 {
         var interpreter = Interpreter.init(
             compilation.arena.allocator(),
             compilation.views,
-            &compilation.merged.?.globals,
+            &compilation.merged.?,
             &compilation.expression_types,
             &compilation.call_targets,
             &compilation.call_type_bindings,
             &compilation.comptime_values,
             &compilation.cast_shapes,
+            &compilation.type_targets,
             output,
         );
+        interpreter.host_io = environment.host_io;
+        interpreter.process_arguments = environment.arguments;
         return interpreter.run() catch |err| switch (err) {
             error.RuntimeFault => {
                 compilation.fault = interpreter.fault_message;
@@ -310,7 +554,7 @@ pub const Compilation = struct {
         var codegen = Codegen.init(
             compilation.arena.allocator(),
             compilation.views,
-            &compilation.merged.?.globals,
+            &compilation.merged.?,
             compilation.checker.?,
             &compilation.expression_types,
             &compilation.call_targets,
@@ -407,8 +651,8 @@ test "the interpreter handles structs enums and matches" {
         \\    var s = Shape { .width = 3, .height = 4 };
         \\    var st: State = ::Busy(s.area());
         \\    const described = match (st) {
-        \\        ::Idle { break 0; }
-        \\        ::Busy |load| { break load; }
+        \\        ::Idle { yield 0; }
+        \\        ::Busy |load| { yield load; }
         \\    };
         \\    if (st is ::Busy) |amount| {
         \\        return (described + amount) to i32;
@@ -431,11 +675,24 @@ test "the interpreter moves pointers and deep copies values" {
         \\    return q.value + a[0];
         \\}
     , 8, "");
-    try expectRunFault(
+    try expectCheckErrors(
         \\type Box = struct { value: i32 };
         \\fn main() -> i32 {
         \\    var p: *var Box = new Box { .value = 5 };
         \\    var q: *var Box = move p;
+        \\    return p.value;
+        \\}
+    , &.{"use of 'p' after 'move' (section 4.2)"});
+    // a conditional move stays a checked runtime fault
+    try expectRunFault(
+        \\type Box = struct { value: i32 };
+        \\fn consume(b: *Box) -> i32 { return b.value; }
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 5 };
+        \\    var flag = true;
+        \\    if (flag) {
+        \\        var taken = consume(move p);
+        \\    }
         \\    return p.value;
         \\}
     , "moved-from pointer");
@@ -481,14 +738,14 @@ test "the interpreter runs lambdas with captured environments" {
         \\    return add_base(5) + counter;
         \\}
     , 22, "");
-    try expectRunFault(
+    try expectCheckErrors(
         \\type Box = struct { value: i32 };
         \\fn main() -> i32 {
         \\    var p: *var Box = new Box { .value = 5 };
-        \\    const get = |p: *| () -> i32 { return p.value; };
+        \\    const get = |*p| () -> i32 { return p.value; };
         \\    return get() + p.value;
         \\}
-    , "moved-from pointer");
+    , &.{"use of 'p' after 'move' (section 4.2)"});
 }
 
 test "the interpreter drives custom iterables through the cursor protocol" {
@@ -553,7 +810,7 @@ test "comptime expressions evaluate during compilation" {
         \\fn main() -> i32 {
         \\    const base = 10;
         \\    const computed = #double(base + 1);
-        \\    const choice = #if (base > 4) break 50 else break 100;
+        \\    const choice = #if (base > 4) yield 50 else yield 100;
         \\    return computed + choice;
         \\}
         \\fn double(x: i32) -> i32 { return x * 2; }
@@ -1226,8 +1483,8 @@ test "value-yielding constructs unify break values" {
         \\fn f() -> u64 {
         \\    var counter: u64 = 0;
         \\    var label = match (counter) {
-        \\        0 { break "zero"; }
-        \\        else { break "more"; }
+        \\        0 { yield "zero"; }
+        \\        else { yield "more"; }
         \\    };
         \\    var capped = while (counter < 10) {
         \\        counter += 1;
@@ -1450,9 +1707,9 @@ test "interface objects match on concrete types" {
         \\fn area(self s: &Square) -> f32 { return s.side; }
         \\fn measure(shape: &Shape) -> f32 {
         \\    return match (shape) {
-        \\        Circle |c| { break c.area(); }
-        \\        Square |s| { break s.area(); }
-        \\        else { break 0.0; }
+        \\        Circle |c| { yield c.area(); }
+        \\        Square |s| { yield s.area(); }
+        \\        else { yield 0.0; }
         \\    };
         \\}
     );
@@ -1465,10 +1722,10 @@ test "interface objects match on concrete types" {
         \\fn area(self c: &Circle) -> f32 { return c.radius; }
         \\fn measure(shape: &Shape) -> f32 {
         \\    return match (shape) {
-        \\        Blob |b| { break b.x; }
-        \\        5 { break 1.0; }
-        \\        Circle |c: &| { break c.area(); }
-        \\        else { break 0.0; }
+        \\        Blob |b| { yield b.x; }
+        \\        5 { yield 1.0; }
+        \\        Circle |c: &| { yield c.area(); }
+        \\        else { yield 0.0; }
         \\    };
         \\}
     , &.{
@@ -1491,8 +1748,8 @@ test "implied enum variants infer their type" {
         \\        return load;
         \\    }
         \\    return match (s) {
-        \\        ::Idle { break 0; }
-        \\        ::Busy |load| { break load; }
+        \\        ::Idle { yield 0; }
+        \\        ::Busy |load| { yield load; }
         \\    };
         \\}
     );
@@ -1515,8 +1772,8 @@ test "inline enum types are structural" {
         \\type Status = enum { Ok, Err: u32 };
         \\fn consume(s: enum { Ok, Err: u32 }) -> u32 {
         \\    return match (s) {
-        \\        ::Ok { break 0; }
-        \\        ::Err |code| { break code; }
+        \\        ::Ok { yield 0; }
+        \\        ::Err |code| { yield code; }
         \\    };
         \\}
         \\fn f() -> u32 {
@@ -1591,16 +1848,16 @@ test "matches must be exhaustive" {
         \\type State = enum { Idle, Busy: u32 };
         \\fn f(s: State) -> u32 {
         \\    return match (s) {
-        \\        State::Idle { break 0; }
-        \\        State::Busy |load| { break load; }
+        \\        State::Idle { yield 0; }
+        \\        State::Busy |load| { yield load; }
         \\    } else {
-        \\        break 0;
+        \\        yield 0;
         \\    };
         \\}
         \\fn g(s: State) -> u32 {
         \\    return match (s) {
-        \\        State::Busy |load| { break load; }
-        \\        else { break 0; }
+        \\        State::Busy |load| { yield load; }
+        \\        else { yield 0; }
         \\    };
         \\}
     );
@@ -1866,10 +2123,14 @@ fn testClang(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 fn expectBuildsAndRuns(name: []const u8, source: []const u8, expected_exit: u8, expected_output: []const u8) !void {
-    return expectBuildsAndRunsWith(name, source, null, expected_exit, expected_output);
+    return expectBuildsAndRunsMode(name, source, null, false, expected_exit, expected_output);
 }
 
 fn expectBuildsAndRunsWith(name: []const u8, source: []const u8, extra_sources: ?*const TestSources, expected_exit: u8, expected_output: []const u8) !void {
+    return expectBuildsAndRunsMode(name, source, extra_sources, false, expected_exit, expected_output);
+}
+
+fn expectBuildsAndRunsMode(name: []const u8, source: []const u8, extra_sources: ?*const TestSources, release_mode: bool, expected_exit: u8, expected_output: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1883,7 +2144,12 @@ fn expectBuildsAndRunsWith(name: []const u8, source: []const u8, extra_sources: 
     else
         null;
     try std.testing.expect(try compilation.run(loader));
-    const ir_text = (try compilation.generate(false)) orelse {
+    try expectNativeRun(arena, clang, &compilation, name, release_mode, expected_exit, expected_output);
+}
+
+// lowers an already-checked compilation to a native executable and runs it
+fn expectNativeRun(arena: std.mem.Allocator, clang: []const u8, compilation: *Compilation, name: []const u8, release_mode: bool, expected_exit: u8, expected_output: []const u8) !void {
+    const ir_text = (try compilation.generate(release_mode)) orelse {
         for (compilation.diagnostics.items) |diagnostic| {
             std.debug.print("unexpected diagnostic: {s}\n", .{diagnostic.message});
         }
@@ -1896,8 +2162,9 @@ fn expectBuildsAndRunsWith(name: []const u8, source: []const u8, extra_sources: 
     const executable_path = try std.fmt.allocPrint(arena, ".zig-cache/alloyc-native-tests/{s}.exe", .{name});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ir_path, .data = ir_text });
 
+    const optimization: []const u8 = if (release_mode) "-O2" else "-O0";
     const link_result = try std.process.run(arena, io, .{
-        .argv = &.{ clang, ir_path, "-o", executable_path, "-O0", "-Wno-override-module" },
+        .argv = &.{ clang, ir_path, "-o", executable_path, optimization, "-Wno-override-module" },
     });
     if (link_result.term != .exited or link_result.term.exited != 0) {
         std.debug.print("clang failed:\n{s}\n", .{link_result.stderr});
@@ -1916,6 +2183,363 @@ fn expectBuildsAndRunsWith(name: []const u8, source: []const u8, extra_sources: 
     }
 }
 
+const TestPackage = struct {
+    name: []const u8,
+    bytes: []const u8,
+
+    fn loadLibrary(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
+        const package: *const TestPackage = @ptrCast(@alignCast(context.?));
+        if (!std.mem.eql(u8, package.name, package_name)) return null;
+        return try allocator.dupe(u8, package.bytes);
+    }
+
+    fn loadNoFiles(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
+        _ = context;
+        _ = allocator;
+        _ = file_path;
+        return null;
+    }
+};
+
+const TestPackageSet = struct {
+    packages: []const TestPackage,
+
+    fn loadLibrary(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
+        const set: *const TestPackageSet = @ptrCast(@alignCast(context.?));
+        for (set.packages) |package| {
+            if (std.mem.eql(u8, package.name, package_name)) return try allocator.dupe(u8, package.bytes);
+        }
+        return null;
+    }
+};
+
+test "packages load from alloylib containers and expose only exp symbols" {
+    const members = [_]library_format.Member{
+        .{ .key = "", .path = "mathx.alloy", .source =
+        \\import inner;
+        \\exp fn twice(x: i64) -> i64 { return inner::double(x); }
+        \\pub fn hidden(x: i64) -> i64 { return x; }
+        },
+        .{ .key = "inner", .path = "inner.alloy", .source = "pub fn double(x: i64) -> i64 { return x * 2; }" },
+    };
+    const container = try library_format.pack(std.testing.allocator, compiler_version, "mathx", &members);
+    defer std.testing.allocator.free(container);
+    var package = TestPackage{ .name = "mathx", .bytes = container };
+    const loader: ModuleLoader = .{
+        .context = @ptrCast(&package),
+        .function = TestPackage.loadNoFiles,
+        .library = TestPackage.loadLibrary,
+    };
+
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::mathx;
+            \\fn main() -> i32 {
+            \\    return mathx::twice(21) to i32;
+            \\}
+        );
+        try std.testing.expect(try compilation.run(loader));
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.testing.expectEqual(@as(i64, 42), try compilation.interpret(&output.writer));
+    }
+
+    // 'pub' reaches across modules inside a unit, but not across the
+    // library boundary (section 5.4)
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::mathx;
+            \\fn main() -> i32 {
+            \\    return mathx::hidden(1) to i32;
+            \\}
+        );
+        try std.testing.expect(!try compilation.run(loader));
+        const found = for (compilation.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "is not exported; mark it 'exp'") != null) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+}
+
+test "unqualified lookup sees exp symbols and the own library shadows foreign ones" {
+    const liba_members = [_]library_format.Member{.{ .key = "", .path = "liba.alloy", .source =
+    \\pub fn helper() -> i64 { return 10; }
+    \\exp fn contribute() -> i64 { return helper(); }
+    \\exp type Pair = struct { left: i64 };
+    \\exp fn make_pair(left: i64) -> Pair { return Pair { .left = left }; }
+    }};
+    const libb_members = [_]library_format.Member{.{ .key = "", .path = "libb.alloy", .source =
+    \\pub fn helper() -> i64 { return 20; }
+    \\exp fn boost() -> i64 { return helper(); }
+    \\exp type Pair = struct { left: i64 };
+    }};
+    const liba_container = try library_format.pack(std.testing.allocator, compiler_version, "liba", &liba_members);
+    defer std.testing.allocator.free(liba_container);
+    const libb_container = try library_format.pack(std.testing.allocator, compiler_version, "libb", &libb_members);
+    defer std.testing.allocator.free(libb_container);
+    const packages = [_]TestPackage{
+        .{ .name = "liba", .bytes = liba_container },
+        .{ .name = "libb", .bytes = libb_container },
+    };
+    var set = TestPackageSet{ .packages = &packages };
+    const loader: ModuleLoader = .{
+        .context = @ptrCast(&set),
+        .function = TestPackage.loadNoFiles,
+        .library = TestPackageSet.loadLibrary,
+    };
+
+    // an unaliased import injects 'exp' names unqualified; an aliased one
+    // is reachable through the alias only, so the two 'Pair' types do not
+    // collide; both libraries reuse the internal name 'helper' and each
+    // exported function calls its own one; the qualified struct literal
+    // 'liba::Pair { ... }' names the injected library explicitly
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::liba;
+            \\import pkg::libb as bb;
+            \\fn main() -> i32 {
+            \\    const bare = Pair { .left = 100 };
+            \\    const qualified = liba::Pair { .left = 200 };
+            \\    return (bare.left + qualified.left + contribute() + bb::boost()) to i32;
+            \\}
+        );
+        const ran = try compilation.run(loader);
+        if (!ran) {
+            for (compilation.diagnostics.items) |diagnostic| {
+                std.debug.print("diagnostic: {s}\n", .{diagnostic.message});
+            }
+        }
+        try std.testing.expect(ran);
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try std.testing.expectEqual(@as(i64, 330), try compilation.interpret(&output.writer));
+    }
+
+    // a foreign library-internal name stays invisible unqualified
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::liba;
+            \\fn main() -> i32 {
+            \\    return helper() to i32;
+            \\}
+        );
+        try std.testing.expect(!try compilation.run(loader));
+        const found = for (compilation.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "'helper' is not exported") != null) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+
+    // an aliased import does not inject: the bare name errors and points
+    // at qualified access
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::liba as la;
+            \\fn main() -> i32 {
+            \\    return contribute() to i32;
+            \\}
+        );
+        try std.testing.expect(!try compilation.run(loader));
+        const found = for (compilation.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "'contribute' is exported by 'liba' but not imported unqualified") != null) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+
+    // the same name injected from two libraries is an error at the import
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::liba;
+            \\import pkg::libb;
+            \\fn main() -> i32 {
+            \\    return contribute() to i32;
+            \\}
+        );
+        try std.testing.expect(!try compilation.run(loader));
+        const found = for (compilation.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "'Pair' is visible from both") != null and
+                std.mem.indexOf(u8, diagnostic.message, "alias the import") != null) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+
+    // an own declaration colliding with an injected name is the same error
+    {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        _ = try compilation.addModule("main.alloy",
+            \\import pkg::liba;
+            \\fn contribute() -> i64 { return 1; }
+            \\fn main() -> i32 {
+            \\    return contribute() to i32;
+            \\}
+        );
+        try std.testing.expect(!try compilation.run(loader));
+        const found = for (compilation.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "'contribute' is visible from both") != null) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+}
+
+test "runtime identity distinguishes same-named types from different libraries" {
+    const libshape_members = [_]library_format.Member{.{ .key = "", .path = "libshape.alloy", .source =
+    \\exp interface Shape {
+    \\    fn area() -> i64;
+    \\}
+    }};
+    const libcircle_members = [_]library_format.Member{.{ .key = "", .path = "libcircle.alloy", .source =
+    \\import pkg::libshape;
+    \\exp type Circle : Shape = struct { radius: i64 };
+    \\exp fn area(self c: &Circle) -> i64 { return 10; }
+    \\exp fn make() -> *Shape { return new Circle { .radius = 1 }; }
+    }};
+    const libshape_container = try library_format.pack(std.testing.allocator, compiler_version, "libshape", &libshape_members);
+    defer std.testing.allocator.free(libshape_container);
+    const libcircle_container = try library_format.pack(std.testing.allocator, compiler_version, "libcircle", &libcircle_members);
+    defer std.testing.allocator.free(libcircle_container);
+    const packages = [_]TestPackage{
+        .{ .name = "libshape", .bytes = libshape_container },
+        .{ .name = "libcircle", .bytes = libcircle_container },
+    };
+    var set = TestPackageSet{ .packages = &packages };
+    const loader: ModuleLoader = .{
+        .context = @ptrCast(&set),
+        .function = TestPackage.loadNoFiles,
+        .library = TestPackageSet.loadLibrary,
+    };
+
+    // the program declares its OWN 'Circle' implementing the same interface
+    // (the library's Circle stays behind an alias); the interface object
+    // holds the LIBRARY's Circle, so the arm naming the program's Circle
+    // must not match, 'is' must say false, and dispatch must reach the
+    // library's 'area' - name-based identity got all three wrong
+    const source =
+        \\import pkg::libshape;
+        \\import pkg::libcircle as lc;
+        \\type Circle : Shape = struct { side: i64 };
+        \\fn area(self c: &Circle) -> i64 { return 20; }
+        \\fn main() -> i32 {
+        \\    var shape: *Shape = lc::make();
+        \\    var matched = match (shape) {
+        \\        Circle |c| { yield 1; }
+        \\        else { yield 2; }
+        \\    };
+        \\    if (shape is Circle) {
+        \\        matched += 100;
+        \\    }
+        \\    return (matched * 100 + shape.area()) to i32;
+        \\}
+    ;
+
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const ran = try compilation.run(loader);
+    if (!ran) {
+        for (compilation.diagnostics.items) |diagnostic| {
+            std.debug.print("identity diagnostic: {s}\n", .{diagnostic.message});
+        }
+    }
+    try std.testing.expect(ran);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(i64, 210), try compilation.interpret(&output.writer));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clang = testClang(arena) orelse return error.SkipZigTest;
+    try expectNativeRun(arena, clang, &compilation, "cross_library_identity", false, 210, "");
+}
+
+test "implementers_of reflects the whole merged unit" {
+    const libshape_members = [_]library_format.Member{.{ .key = "", .path = "libshape.alloy", .source =
+    \\exp interface Shape {
+    \\    fn area() -> i64;
+    \\}
+    }};
+    // the implementer is library-INTERNAL: reflection still sees it
+    const libcircle_members = [_]library_format.Member{.{ .key = "", .path = "libcircle.alloy", .source =
+    \\import pkg::libshape;
+    \\type Circle : Shape = struct { radius: i64 };
+    \\fn area(self c: &Circle) -> i64 { return 10; }
+    }};
+    const libshape_container = try library_format.pack(std.testing.allocator, compiler_version, "libshape", &libshape_members);
+    defer std.testing.allocator.free(libshape_container);
+    const libcircle_container = try library_format.pack(std.testing.allocator, compiler_version, "libcircle", &libcircle_members);
+    defer std.testing.allocator.free(libcircle_container);
+    const packages = [_]TestPackage{
+        .{ .name = "libshape", .bytes = libshape_container },
+        .{ .name = "libcircle", .bytes = libcircle_container },
+    };
+    var set = TestPackageSet{ .packages = &packages };
+    const loader: ModuleLoader = .{
+        .context = @ptrCast(&set),
+        .function = TestPackage.loadNoFiles,
+        .library = TestPackageSet.loadLibrary,
+    };
+
+    // three implementers: Square (before the use), Hexagon (after the
+    // use), and the library-internal Circle; the first in module then
+    // declaration order is Square (6 letters)
+    const source =
+        \\import pkg::libshape;
+        \\import pkg::libcircle;
+        \\type Square : Shape = struct { side: i64 };
+        \\type Plain = struct { value: i64 };
+        \\fn area(self s: &Square) -> i64 { return 4; }
+        \\fn main() -> i32 {
+        \\    const count = #(implementers_of(Shape).length());
+        \\    const first_name_length = #(implementers_of(Shape)[0].name().length());
+        \\    const square_conforms = #(Square.implements_interface(Shape));
+        \\    const plain_conforms = #(Plain.implements_interface(Shape));
+        \\    var total = count * 10 + first_name_length;
+        \\    if (square_conforms) {
+        \\        total += 100;
+        \\    }
+        \\    if (plain_conforms) {
+        \\        total += 1000;
+        \\    }
+        \\    return total to i32;
+        \\}
+        \\type Hexagon : Shape = struct { sides: i64 };
+        \\fn area(self h: &Hexagon) -> i64 { return 6; }
+    ;
+
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const ran = try compilation.run(loader);
+    if (!ran) {
+        for (compilation.diagnostics.items) |diagnostic| {
+            std.debug.print("implementers diagnostic: {s}\n", .{diagnostic.message});
+        }
+    }
+    try std.testing.expect(ran);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(i64, 136), try compilation.interpret(&output.writer));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clang = testClang(arena) orelse return error.SkipZigTest;
+    try expectNativeRun(arena, clang, &compilation, "implementers_reflection", false, 136, "");
+}
+
 test "native codegen emits checked LLVM IR" {
     try expectGenerates(
         \\fn double(value: i32) -> i32 { return value * 2; }
@@ -1927,39 +2551,113 @@ test "native codegen emits checked LLVM IR" {
         \\    return total;
         \\}
     , false, &.{
-        "define i32 @main()",
+        "define i32 @main(i32 %argc, ptr %argv)",
         "llvm.smul.with.overflow.i32",
         "@\"alloy.fault\"",
         "call void @llvm.trap()",
+        // checked builds carry DWARF debug info (section 5.4)
+        "!DISubprogram(name: \"main\"",
+        "!DILocation(line:",
+        "Debug Info Version",
+        ", !dbg !",
+        "!DILocalVariable(name: \"total\"",
+        "llvm.dbg.declare",
+        "!DIBasicType(name: \"i32\"",
     }, &.{});
     // release builds wrap arithmetic instead of trapping (section 4.2)
+    // and skip debug info
     try expectGenerates(
         \\fn main() -> i32 {
         \\    var total = 40;
         \\    total += 2;
         \\    return total;
         \\}
-    , true, &.{"add i32"}, &.{"with.overflow"});
+    , true, &.{"add i32"}, &.{ "with.overflow", "!dbg", "DISubprogram" });
+}
+
+test "release codegen wraps arithmetic and keeps move bookkeeping" {
+    try expectGenerates(
+        \\type Box = struct { value: i32 };
+        \\fn main() -> i32 {
+        \\    var total = 0;
+        \\    const digits = [7, 8, 9];
+        \\    for (digits) |d| {
+        \\        total += d * 3;
+        \\    }
+        \\    var p: *var Box = new Box { .value = 4 };
+        \\    var q: *var Box = move p;
+        \\    return total + q.value;
+        \\}
+    , true, &.{
+        "define i32 @main(i32 %argc, ptr %argv)",
+        // the moved-from mark stays in release: drops depend on it
+        "store ptr null",
+        "= mul i32",
+    }, &.{
+        "with.overflow",
+        "@\"alloy.fault\"",
+        "call void @llvm.trap()",
+    });
+    // division by zero faults in every build mode (section 4.2)
+    try expectGenerates(
+        \\fn main() -> i32 {
+        \\    var numerator = 10;
+        \\    var denominator = 2;
+        \\    return numerator / denominator;
+        \\}
+    , true, &.{
+        "@\"alloy.fault\"",
+    }, &.{
+        "with.overflow",
+    });
+}
+
+test "release executables match checked executables" {
+    try expectBuildsAndRunsMode("release_soundness",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn makeAdder(base: i64) -> (i64) -> i64 {
+        \\    return |base| (x: i64) -> i64 { return x + base; };
+        \\}
+        \\interface Critter {
+        \\    fn legs() -> i64;
+        \\}
+        \\type Spider : Critter = struct { hairs: *var i64 };
+        \\fn legs(self s: &Spider) -> i64 { return 8; }
+        \\fn main() -> i32 {
+        \\    var total: i64 = 0;
+        \\    const fixed = [makeAdder(1) : 4];
+        \\    total += fixed[0](1) + fixed[3](2);
+        \\    var pet: *Critter = new Spider { .hairs = new 5 };
+        \\    var second: *Critter = move pet;
+        \\    total += second.legs();
+        \\    pet = new Spider { .hairs = new 7 };
+        \\    if (pet is Spider) |s| {
+        \\        total += s.hairs;
+        \\    }
+        \\    printf("total %d\n", total to i32);
+        \\    return total to i32;
+        \\}
+    , null, true, 20, "total 20\n");
 }
 
 test "native codegen reports unsupported constructs" {
     try expectGenerateErrors(
-        \\interface Greeter {
-        \\    fn id() -> i32;
-        \\}
-        \\type Robot : Greeter = struct { tag: i32 };
-        \\fn id(self r: &Robot) -> i32 { return r.tag; }
+        \\type Point = struct { x: i32, y: i32 };
+        \\extern absorb(p: Point) -> i32;
         \\fn main() -> i32 {
-        \\    var owned: *Greeter = new Robot { .tag = 1 };
+        \\    const p = Point { .x = 1, .y = 2 };
+        \\    return absorb(p);
+        \\}
+    , &.{"this type cannot cross the extern boundary yet"});
+    try expectGenerateErrors(
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\type Point = struct { x: i32, y: i32 };
+        \\fn main() -> i32 {
+        \\    const p = Point { .x = 1, .y = 2 };
+        \\    printf("point %d\n", p);
         \\    return 0;
         \\}
-    , &.{"owning interface objects ('*I') are not yet supported by native code generation"});
-    try expectGenerateErrors(
-        \\fn main() -> i32 {
-        \\    const add = (a: i32, b: i32) -> i32 { return a + b; };
-        \\    return add(1, 2);
-        \\}
-    , &.{"function values are not yet supported by native code generation"});
+    , &.{"this argument cannot cross the extern boundary yet"});
 }
 
 test "native executables match the interpreter" {
@@ -2120,9 +2818,9 @@ test "native executables dispatch through interface objects" {
         \\    var total = describe(&square) + describe(&circle);
         \\    var viewed: &Shape = &circle;
         \\    var label = match (viewed) {
-        \\        Square { break 1; }
-        \\        Circle { break 2; }
-        \\        else { break 0; }
+        \\        Square { yield 1; }
+        \\        Circle { yield 2; }
+        \\        else { yield 0; }
         \\    };
         \\    return total + label;
         \\}
@@ -2150,9 +2848,9 @@ test "native executables match strings and run cursors" {
         \\}
         \\fn nameOf(code: i32) -> &[u8] {
         \\    var name = match (code) {
-        \\        1 { break "one"; }
-        \\        2 { break "two"; }
-        \\        else { break "many"; }
+        \\        1 { yield "one"; }
+        \\        2 { yield "two"; }
+        \\        else { yield "many"; }
         \\    };
         \\    return name;
         \\}
@@ -2172,4 +2870,491 @@ test "native executables match strings and run cursors" {
         \\    return sum + checks;
         \\}
     , &cursor_sources, 20, "sum 10 checks 10\n");
+}
+
+test "native executables run closures and function values" {
+    try expectBuildsAndRuns("closures",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn double(x: i64) -> i64 { return x * 2; }
+        \\fn apply(f: (i64) -> i64, x: i64) -> i64 {
+        \\    return f(x);
+        \\}
+        \\fn makeAdder(base: i64) -> (i64) -> i64 {
+        \\    return |base| (x: i64) -> i64 { return x + base; };
+        \\}
+        \\type Box = struct { p: *var i64 };
+        \\type Counter = struct { step: (i64) -> i64 };
+        \\fn main() -> i32 {
+        \\    var total: i64 = 0;
+        \\    const add = (a: i64, b: i64) -> i64 { return a + b; };
+        \\    total += add(3, 4);
+        \\    var named: (i64) -> i64 = double;
+        \\    total += named(5);
+        \\    total += apply(double, 6);
+        \\    total += apply(named, 7);
+        \\    const add_ten = makeAdder(10);
+        \\    total += add_ten(1);
+        \\    var box = Box { .p = new 100 };
+        \\    const peek = |box| () -> i64 { return box.p; };
+        \\    total += peek();
+        \\    box.p = new 1;
+        \\    total += peek();
+        \\    var owned: *var i64 = new 9;
+        \\    const eat = |*owned| () -> i64 { return owned; };
+        \\    total += eat();
+        \\    total += eat();
+        \\    const counter = Counter { .step = |&total| (n: i64) -> i64 { return total + n; } };
+        \\    total += counter.step(1);
+        \\    total += ((x: i64) -> i64 { return x + 100; })(0);
+        \\    var f: (i64) -> i64 = (x: i64) -> i64 { return x + 1; };
+        \\    f = (x: i64) -> i64 { return x + 2; };
+        \\    total += f(0);
+        \\    printf("total %d\n", total to i32);
+        \\    return (total - 502) to i32;
+        \\}
+    , 145, "total 647\n");
+}
+
+test "native executables drop owning interface objects" {
+    try expectBuildsAndRuns("owning_interfaces",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\interface Critter {
+        \\    fn legs() -> i64;
+        \\}
+        \\type Spider : Critter = struct { hairs: *var i64 };
+        \\type Worm : Critter = struct { tag: i64 };
+        \\fn legs(self s: &Spider) -> i64 { return 8; }
+        \\fn legs(self w: &Worm) -> i64 { return 0; }
+        \\fn main() -> i32 {
+        \\    var pet: *Critter = new Spider { .hairs = new 1000 };
+        \\    var count = pet.legs();
+        \\    if (pet is Spider) |s| {
+        \\        count += s.hairs;
+        \\    }
+        \\    pet = new Worm { .tag = 3 };
+        \\    count += pet.legs();
+        \\    var second: *Critter = new Spider { .hairs = new 50 };
+        \\    match (second) {
+        \\        Spider |sp| { count += sp.hairs; }
+        \\        else { count += 1; }
+        \\    }
+        \\    printf("count %d\n", count to i32);
+        \\    return (count - 1000) to i32;
+        \\}
+    , 58, "count 1058\n");
+}
+
+test "native executables monomorphize lambdas inside generics" {
+    try expectBuildsAndRuns("generic_lambdas",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn pick<T>(flag: bool, a: T, b: T) -> T {
+        \\    const choose = |flag| (x: T, y: T) -> T {
+        \\        if (flag) { return x; }
+        \\        return y;
+        \\    };
+        \\    return choose(a, b);
+        \\}
+        \\fn main() -> i32 {
+        \\    var total: i64 = pick(true, 40 to i64, 2 to i64);
+        \\    total += pick(false, 1 to i64, 2 to i64);
+        \\    var index = 0;
+        \\    while (index < 3) {
+        \\        var boxed: *var i64 = new (index to i64);
+        \\        const grab = |*boxed| () -> i64 { return boxed; };
+        \\        total += grab();
+        \\        index += 1;
+        \\    }
+        \\    printf("total %d\n", total to i32);
+        \\    return total to i32;
+        \\}
+    , 45, "total 45\n");
+}
+
+test "function values reject comparison, externs, and generics" {
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const a = (x: i64) -> i64 { return x; };
+        \\    const b = a;
+        \\    if (a == b) { return 1; }
+        \\    return 0;
+        \\}
+    , &.{"function values cannot be compared (section 4.4)"});
+    try expectCheckErrors(
+        \\extern abs(x: i32) -> i32;
+        \\fn main() -> i32 {
+        \\    var f: (i32) -> i32 = abs;
+        \\    return f(-1);
+        \\}
+    , &.{"an extern function cannot be used as a function value yet (section 5.3)"});
+    try expectCheckErrors(
+        \\fn pick<T>(a: T, b: T) -> T { return a; }
+        \\fn main() -> i32 {
+        \\    const f = pick;
+        \\    return 0;
+        \\}
+    , &.{"a generic function cannot become a function value; its type parameters are unbound (section 4.4)"});
+}
+
+test "extensions win over function-typed fields in dynamic dispatch" {
+    try expectRuns(
+        \\interface Greeter {
+        \\    fn id() -> i64;
+        \\}
+        \\type Robot : Greeter = struct { id: () -> i64 };
+        \\fn id(self r: &Robot) -> i64 { return 100; }
+        \\fn main() -> i32 {
+        \\    var robot = Robot { .id = () -> i64 { return 7; } };
+        \\    var viewed: &Greeter = &robot;
+        \\    return viewed.id() to i32;
+        \\}
+    , 100, "");
+}
+
+test "move analysis rejects definite uses and accepts conditional ones" {
+    try expectCheckErrors(
+        \\type Box = struct { value: i32 };
+        \\fn eat(b: *Box) -> i32 { return b.value; }
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 1 };
+        \\    var first = eat(move p);
+        \\    var second = eat(move p);
+        \\    return first + second;
+        \\}
+    , &.{"'p' was already moved (section 4.2)"});
+    try expectCheckErrors(
+        \\type Box = struct { value: i32 };
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 1 };
+        \\    var q: *var Box = move p;
+        \\    p.value = 3;
+        \\    return q.value;
+        \\}
+    , &.{"use of 'p' after 'move' (section 4.2)"});
+    try expectChecks(
+        \\type Box = struct { value: i32 };
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 1 };
+        \\    var q: *var Box = move p;
+        \\    p = new Box { .value = 2 };
+        \\    return p.value + q.value;
+        \\}
+    );
+    try expectChecks(
+        \\type Box = struct { value: i32 };
+        \\fn eat(b: *Box) -> i32 { return b.value; }
+        \\fn main() -> i32 {
+        \\    var p: *var Box = new Box { .value = 1 };
+        \\    var flag = true;
+        \\    var total = 0;
+        \\    if (flag) {
+        \\        total += eat(move p);
+        \\    } else {
+        \\        total += p.value;
+        \\    }
+        \\    return total;
+        \\}
+    );
+    try expectChecks(
+        \\type Box = struct { value: i32 };
+        \\fn eat(b: *Box) -> i32 { return b.value; }
+        \\fn main() -> i32 {
+        \\    var items = [1, 2];
+        \\    var p: *var Box = new Box { .value = 1 };
+        \\    var total = 0;
+        \\    for (items) |n| {
+        \\        total += eat(move p) + n;
+        \\        p = new Box { .value = 2 };
+        \\    }
+        \\    return total;
+        \\}
+    );
+}
+
+test "flow analysis requires every path to return or yield" {
+    try expectCheckErrors(
+        \\fn pick(flag: bool) -> i32 {
+        \\    if (flag) { return 1; }
+        \\}
+    , &.{"control can fall off the end of 'pick', which must return i32 on every path (section 4.3)"});
+    try expectCheckErrors(
+        \\fn drain() -> i32 {
+        \\    while (true) {
+        \\        if (done()) { break; }
+        \\    }
+        \\}
+        \\fn done() -> bool { return true; }
+    , &.{"control can fall off the end of 'drain'"});
+    try expectCheckErrors(
+        \\fn label(flag: bool) -> i32 {
+        \\    var chosen = if (flag) { yield 1; } else { };
+        \\    return chosen;
+        \\}
+    , &.{"a branch of this value-yielding if can complete without 'yield' (section 4.3)"});
+    try expectCheckErrors(
+        \\fn grade(code: i32) -> i32 {
+        \\    var value = match (code) {
+        \\        0 { yield 1; }
+        \\        else { }
+        \\    };
+        \\    return value;
+        \\}
+    , &.{"an arm of this value-yielding match can complete without 'yield'; add 'yield' to every arm or an external 'else' (section 4.3)"});
+    try expectCheckErrors(
+        \\fn count() -> i32 {
+        \\    var total = 0;
+        \\    var capped = while (total < 5) {
+        \\        total += 1;
+        \\        break total;
+        \\    } else { };
+        \\    return capped;
+        \\}
+    , &.{"the 'else' of this value-yielding loop can complete without 'break value' (section 4.3)"});
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const f = (flag: bool) -> i32 {
+        \\        if (flag) { return 1; }
+        \\    };
+        \\    return f(true);
+        \\}
+    , &.{"control can fall off the end of this lambda, which must return i32 on every path (section 4.3)"});
+    try expectChecks(
+        \\fn spin() -> i32 {
+        \\    while (true) {
+        \\        poke();
+        \\    }
+        \\}
+        \\fn poke() { }
+    );
+    try expectChecks(
+        \\fn pick(flag: bool) -> i32 {
+        \\    if (flag) { return 1; }
+        \\    return 2;
+        \\}
+    );
+}
+
+test "break exits loops through ifs and yield reaches the value construct" {
+    const source =
+        \\fn main() -> i32 {
+        \\    var total = 0;
+        \\    for ([..10]) |n| {
+        \\        total += n;
+        \\        if (total > 6) { break; }
+        \\    }
+        \\    var label = if (total == 10) { yield 5; } else { yield 0; };
+        \\    var crossed = if (true) {
+        \\        for ([..5]) |k| {
+        \\            if (k == 2) { yield 100; }
+        \\        }
+        \\        yield 1;
+        \\    } else { yield 0; };
+        \\    return total + label + crossed;
+        \\}
+    ;
+    try expectRuns(source, 115, "");
+    try expectBuildsAndRuns("break_yield_targets", source, 115, "");
+}
+
+test "native executables release loop temporaries and interrupted cursors" {
+    const option_sources = TestSources.initComptime(.{
+        .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None, };" },
+    });
+    try expectBuildsAndRunsWith("loop_releases",
+        \\import std::option;
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\type Wallet = struct { cash: *var i64 };
+        \\fn makeWallets() -> [Wallet : 2] {
+        \\    return [Wallet { .cash = new 3 } : 2];
+        \\}
+        \\type Boxes = struct { limit: i64 };
+        \\type BoxCursor = struct { remaining: i64 };
+        \\fn iterator(self b: &Boxes) -> BoxCursor {
+        \\    return BoxCursor { .remaining = b.limit };
+        \\}
+        \\fn next(self it: &var BoxCursor) -> Option<*var i64> {
+        \\    if (it.remaining == 0) {
+        \\        return ::None;
+        \\    }
+        \\    it.remaining -= 1;
+        \\    return ::Some(new (it.remaining * 10));
+        \\}
+        \\fn main() -> i32 {
+        \\    var total: i64 = 0;
+        \\    for (makeWallets()) |w| {
+        \\        total += w.cash;
+        \\    }
+        \\    const boxes = Boxes { .limit = 5 };
+        \\    for (boxes) |value| {
+        \\        total += value;
+        \\        break;
+        \\    }
+        \\    const bump = (x: i64) -> i64 { return x + 1; };
+        \\    total += bump(0);
+        \\    printf("total %d\n", total to i32);
+        \\    return total to i32;
+        \\}
+    , &option_sources, 47, "total 47\n");
+}
+
+test "native executables fill, move, and receive closures soundly" {
+    try expectBuildsAndRuns("closure_soundness",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\interface Critter {
+        \\    fn legs() -> i64;
+        \\}
+        \\type Spider : Critter = struct { hairs: *var i64 };
+        \\fn legs(self s: &Spider) -> i64 { return 8; }
+        \\fn makeAdder(base: i64) -> (i64) -> i64 {
+        \\    return |base| (x: i64) -> i64 { return x + base; };
+        \\}
+        \\type Holder = struct { callback: (i64) -> i64 };
+        \\fn pick() -> i64 {
+        \\    printf("pick\n");
+        \\    return 0;
+        \\}
+        \\type Counter = struct { step: (i64) -> i64 };
+        \\fn makeCounter() -> Counter {
+        \\    return Counter { .step = (x: i64) -> i64 { return x + 1; } };
+        \\}
+        \\fn main() -> i32 {
+        \\    var total: i64 = 0;
+        \\    const fixed = [makeAdder(1) : 4];
+        \\    total += fixed[0](1) + fixed[3](2);
+        \\    var heap: *[(i64) -> i64] = new [makeAdder(10) : 3];
+        \\    total += heap[2](5);
+        \\    var pet: *Critter = new Spider { .hairs = new 5 };
+        \\    var second: *Critter = move pet;
+        \\    total += second.legs();
+        \\    var third: *Critter = new Spider { .hairs = new 7 };
+        \\    const kill = |*third| () -> i64 { return third.legs(); };
+        \\    total += kill();
+        \\    var holders = [Holder { .callback = (x: i64) -> i64 { return x + 1; } }];
+        \\    total += holders[pick()].callback(4);
+        \\    total += makeCounter().step(41);
+        \\    var text = "abc";
+        \\    const sized = |text: &[u8]| () -> i64 { return text.length() to i64; };
+        \\    total += sized();
+        \\    printf("total %d\n", total to i32);
+        \\    return (total - 60) to i32;
+        \\}
+    , 26, "pick\ntotal 86\n");
+}
+
+test "heap arrays borrow as slices, subslice, and move on return" {
+    try expectRuns(
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn sum(values: &[u8]) -> i64 {
+        \\    var total: i64 = 0;
+        \\    for (values) |value| {
+        \\        total += value to i64;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn make(length: u64) -> *var [u8] {
+        \\    var buffer: *var [u8] = new [3 : length];
+        \\    buffer[0] = 9;
+        \\    return move buffer;
+        \\}
+        \\fn duplicate(values: &[u8]) -> *var [u8] {
+        \\    var copied: *var [u8] = new [0 : values.length()];
+        \\    var index: u64 = 0;
+        \\    for (values) |value| {
+        \\        copied[index] = value;
+        \\        index += 1;
+        \\    }
+        \\    // a bare return hands out a deep copy; the local drops
+        \\    return copied;
+        \\}
+        \\fn main() -> i64 {
+        \\    const owned = make(4);
+        \\    const view: &[u8] = &owned;
+        \\    const tail = owned[2..4];
+        \\    const doubled = duplicate(view);
+        \\    const text: &[u8] = "abc";
+        \\    const middle = text[1..2];
+        \\    printf("%d %d %d %d %d\n", view.length(), sum(view), sum(tail), middle[0], sum(&doubled));
+        \\    return sum(view) + sum(tail);
+        \\}
+    , 24, "4 18 6 98 18\n");
+    try expectRunFault(
+        \\fn main() -> i64 {
+        \\    var buffer: *var [u8] = new [1 : 4];
+        \\    const bad = buffer[3..9];
+        \\    return bad.length() to i64;
+        \\}
+    , "out of bounds");
+}
+
+test "native executables borrow, subslice, and return heap arrays" {
+    try expectBuildsAndRuns("stdlib_views",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn sum(values: &[u8]) -> i64 {
+        \\    var total: i64 = 0;
+        \\    for (values) |value| {
+        \\        total += value to i64;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn make(length: u64) -> *var [u8] {
+        \\    var buffer: *var [u8] = new [3 : length];
+        \\    buffer[0] = 9;
+        \\    return move buffer;
+        \\}
+        \\fn duplicate(values: &[u8]) -> *var [u8] {
+        \\    var copied: *var [u8] = new [0 : values.length()];
+        \\    var index: u64 = 0;
+        \\    for (values) |value| {
+        \\        copied[index] = value;
+        \\        index += 1;
+        \\    }
+        \\    // a bare return hands out a deep copy; the local drops
+        \\    return copied;
+        \\}
+        \\fn main() -> i32 {
+        \\    const owned = make(4);
+        \\    const view: &[u8] = &owned;
+        \\    const tail = owned[2..4];
+        \\    const doubled = duplicate(view);
+        \\    const text: &[u8] = "abc";
+        \\    const middle = text[1..2];
+        \\    printf("%d %d %d %d %d\n", view.length(), sum(view), sum(tail), middle[0], sum(&doubled));
+        \\    return (sum(view) + sum(tail)) to i32;
+        \\}
+    , 24, "4 18 6 98 18\n");
+}
+
+test "file io externs fault without a host filesystem" {
+    try expectRunFault(
+        \\extern fopen(path: &[u8], mode: &[u8]) -> i64;
+        \\fn main() -> i64 {
+        \\    return fopen("anything.txt", "rb");
+        \\}
+    , "file io is unavailable here");
+}
+
+test "the interpreter serves process arguments through the lang item" {
+    var sources = TestSources.initComptime(.{
+        .{ "std/process.alloy", "pub fn arguments() -> &[&[u8]] {\n    const empty: [&[u8] : 1] = [\"\"];\n    return empty[..0];\n}" },
+    });
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy",
+        \\import std::process;
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn main() -> i64 {
+        \\    const all = arguments();
+        \\    for (all) |argument| {
+        \\        printf("%s\n", argument);
+        \\    }
+        \\    return all.length() to i64;
+        \\}
+    );
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const run_arguments = [_][]const u8{ "program.alloy", "alpha", "beta" };
+    const exit_code = try compilation.interpretWithEnvironment(&output.writer, .{ .arguments = &run_arguments });
+    try std.testing.expectEqualStrings("program.alloy\nalpha\nbeta\n", output.writer.buffered());
+    try std.testing.expectEqual(@as(i64, 3), exit_code);
 }

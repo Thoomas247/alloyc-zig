@@ -50,9 +50,9 @@ Reserved — cannot be used as identifiers:
 ```
 import   as       extern   type     enum     struct
 const    var      fn       if       else     while
-for      match    break    return   new      move    self
-pub      exp      true     false    interface macro    is
-to
+for      match    break    yield    return   new     move
+self     pub      exp      true     false    interface macro
+is       to
 
 ```
 
@@ -180,12 +180,14 @@ statement       = var_def
                 | while_expr
                 | match_expr
                 | break_stmt
+                | yield_stmt
                 | return_stmt
                 | expr_stmt ;
 
 var_def         = ( "var" | "const" ) ident [ ":" type ] "=" expression terminator ;
 stmt_block      = "{" { statement } "}" ;
 break_stmt      = "break" [ expression ] ( terminator | <block-like operand> ) ;
+yield_stmt      = "yield" expression ( terminator | <block-like operand> ) ;
 return_stmt     = "return" [ expression ] terminator ;
 expr_stmt       = expression ( assign_op expression terminator | terminator ) ;
 
@@ -206,7 +208,8 @@ postfix_expr    = primary_expr { postfix_suffix } ;
 postfix_suffix  = "(" [ expr { "," expr } ] ")"                            (* call *)
                 | "<" type { "," type } ">" "(" [ expr { "," expr } ] ")"  (* generic call *)
                 | "." ident                                                  (* member access *)
-                | "[" expression "]" ;                                       (* array index *)
+                | "[" expression "]"                                         (* array index *)
+                | "[" [ expression ] ".." expression "]" ;                   (* subslice *)
 
 primary_expr    = literal
                 | identifier_expr
@@ -232,7 +235,7 @@ array_literal     = "[" expression { "," expression } "]" ;
 array_fill        = "[" expression ":" expression "]" ;
 array_range       = "[" [ expression ] ".." expression "]" ;
 
-named_struct_init = ident "{" [ member_init { "," member_init } ] "}" ;
+named_struct_init = ident { "::" ident } "{" [ member_init { "," member_init } ] "}" ;
 anon_struct_init  = "{" [ member_init { "," member_init } ] "}" ;
 member_init       = "." ident "=" expression ;
 
@@ -266,7 +269,7 @@ compile-time evaluation (§6). It binds as a postfix expression: `#f(x)` is
 declarations. Newlines are plain whitespace, so a statement may span any
 number of lines and several statements may share one. A statement also
 terminates implicitly before `}`, before `else`, and at end of file, which
-permits forms like `{ break 10 }` and `break a else break b` without a
+permits forms like `{ yield 10 }` and `yield a else yield b` without a
 trailing `;`. Redundant semicolons are permitted and parse as empty
 statements.
 
@@ -286,9 +289,17 @@ produce a stack array `[T : end - start]`; runtime bounds require `new`
 (yielding `*[T]`) — except as a `for` subject, where the range never
 materializes and runtime bounds are always valid (§4.3).
 
-**`break` operand termination.** When a `break`'s operand is a block-like
-expression (`if` / `while` / `for` / `match`), that operand is self-terminating:
-`break if (c) break a else break b`.
+**Subslicing.** `arr[start..end]` borrows a slice (`&[T]`) viewing the
+subject's elements `start` (inclusive) to `end` (exclusive) **in place** — no
+copy is made. Omitting the start (`arr[..end]`) starts at `0`. The subject may
+be any array form (`[T : N]`, `&[T]`, `*[T]`); the view is mutable when the
+subject location is. Bounds must satisfy `start <= end <= length`; a violation
+is a runtime fault in checked builds. Like any reference, the view is
+invalidated when the subject is dropped, moved, or reallocated.
+
+**`break` and `yield` operand termination.** When a `break`'s or `yield`'s
+operand is a block-like expression (`if` / `while` / `for` / `match`), that
+operand is self-terminating: `break if (c) yield a else yield b`.
 
 **Capture typing.** A capture (`|a|`) binds a **deep copy** of the captured
 value by default. An explicit `: type` annotation overrides this, and the
@@ -471,6 +482,7 @@ Inline `struct { ... }` and `enum { ... }` types are permitted **wherever a type
 - **`#T`** — prefixing a type name with the comptime token `#` yields the `#Type` reflecting `T` (e.g. `#u32`, `#Packet`). `#T.member_names()` reflects on `T` directly.
 - **`#type_of(expr)`** — a built-in macro returning the `#Type` of the value `expr`'s type.
 - **`#struct_type()` / `#enum_type()`** — built-in macros returning a fresh, empty struct / enum `#Type`, for synthesising a type from scratch.
+- **`#implementers_of(I)`** — a built-in macro returning an array of the `#Type`s of every type in the merged unit implementing the interface `I`, whole-world across libraries (§6.4).
 - **`#void`** — the `#Type` denoting the absence of a payload. Passed as the member type to `add_member` on an enum `#Type`, it marks a payload-less variant; reflected enums encode their payload-less variants the same way in `member_types()`. `void` is not a value type: `#void` in any runtime position is a compile-time error.
 
 #### `#Type` methods
@@ -483,7 +495,7 @@ All are evaluated at compile time and called with dot syntax on a `#Type` value.
 | `is_enum`              | `() -> bool`                 | True iff the type is an enum.                                                   |
 | `is_primitive`         | `() -> bool`                 | True iff the type is a built-in primitive.                                      |
 | `is_interface`         | `() -> bool`                 | True iff the type is an interface.                                              |
-| `implements_interface` | `(other: #Type) -> bool`     | True iff this type declares `other` (an interface) among its interface markers. |
+| `implements_interface` | `(other: #Type) -> bool`     | True iff this type implements `other` (an interface), by the same conformance rule as §5.2 — declared markers resolved by definition identity (same-named interfaces from different libraries never confuse it) plus lang-item conformance (`Number`, `Iterable`). Synthesised `#Type`s implement nothing. |
 | `name`                 | `() -> &[u8]`                | The type's declared name.                                                       |
 | `equals`               | `(other: #Type) -> bool`     | True iff the two `#Type`s denote the same type.                                 |
 | `add_member`           | `(name: &[u8], type: #Type)` | Appends a member (struct field or enum variant) of the given name and type.     |
@@ -541,7 +553,7 @@ A generic function's type parameters are bound at each call site:
    parameter type is matched structurally against the corresponding argument
    type (the `self` receiver participates like any argument), and every
    occurrence of an unbound type parameter binds to the type found in its
-   position. `vec.push(x)` with `fn push<T>(self v: &var Vec<T>, item: T)`
+   position. `vector.push(x)` with `fn push<T>(self v: &var Vector<T>, item: T)`
    binds `T` from the receiver and checks `x` against it.
 3. A type parameter still unbound after unification is a compile-time error;
    conflicting bindings (`T` unified with both `u32` and `f32`) are too.
@@ -610,7 +622,7 @@ Three operators step outside pointee transparency:
 
 - **`move`** is the **only** operator that treats its operand as an address rather than a value: `var q: *T = move p` transfers `p`'s pointer into `q` (and clears `p`, see below). It is valid for any pointer-typed operand — `*T`, `*var T`, and `*[T]` alike — and always yields the operand's own pointer type.
 - **`new <expression>`** evaluates any expression and deep-copies the resulting value into a fresh heap allocation, yielding a pointer: `new 5`, `new T {}`, `new [0 : n]`, `new some_local`. It is the pointer-producing allocator.
-- **Unary `&`** yields a reference to any value — a stack local, a struct field, an array element, or a heap value behind a pointer (`&p` references the pointee of `p`).
+- **Unary `&`** yields a reference to any value — a stack local, a struct field, an array element, or a heap value behind a pointer (`&p` references the pointee of `p`). Applied to a heap array, `&` yields a **slice** (`&[T]`) viewing every element in place — the only non-owning view of a `*[T]`'s contents (`arr[start..end]` subslicing, §2.1, views a range the same way).
 
 #### Explicit Assignment Restrictions
 
@@ -640,14 +652,15 @@ Ownership is **structural and automatic**. A value _owns heap_ if it is a `*T` /
 
 - **Scope-end drop.** When an owning local goes out of scope (at every `return` path and at the implicit fall-through), the runtime _drops_ it: it recursively frees the heap it owns. Dropping a pointer frees its allocation (the `*[T]` form releases the malloc base at `user_ptr - 8`); dropping a `*[T]` first drops every one of its elements (all elements of an array are initialised, so each is reclaimable); dropping a struct/array/enum drops each owning field/element/active payload; dropping a closure frees its environment. Recursive owning types (e.g. a node holding `*Self`) terminate at the first null pointer.
 - **`move` transfers ownership.** `move` is the only operator that reads its operand as an address rather than a value (§4.2 Pointee Transparency). `var q = move p` copies the pointer into `q` and clears (zeroes) the source binding, so the source is no longer an owner. After `move p`, `p` is a null pointer and its scope-end drop is a no-op. `move` always yields a `*T` value — whole-struct transfer is therefore expressed by moving a `*Struct` pointer (or by borrowing through `&var`), not by copying the struct.
-- **Implicit move on return.** `return v`, where `v` is exactly an owning local, transfers ownership to the caller (the local is zeroed and not dropped). A value built in the `return` expression itself (a constructor, `new`, …) is likewise owned by the caller.
+- **Returning owned values is explicit — no implicit move.** `return move v` transfers the local's allocation to the caller: the source is cleared and its scope-end drop is a no-op. A bare `return v` returns **by value** — like any read, it yields a deep copy of what `v` holds, and the local's own heap is reclaimed by its normal scope-end drop. The same by-value rule applies to `break v` and `yield v`. A value built in the `return` expression itself (a constructor, `new`, …) is owned by the caller directly.
 - **Pointer parameters take ownership.** A parameter of type `*T` / `*var T` / `*[T]` declares "I am taking ownership of this allocation". The caller **must** either `move` an existing pointer in (`take(move p)`) or allocate inline (`take(new T {})`); a `*T` value is **never** borrowed. The callee becomes the owner, and the parameter is dropped at the function's scope end like any owning local (unless moved on or returned). To lend a value without transferring it, pass a reference (`&T` / `&var T`) instead.
 - **By-value parameters follow assignment semantics.** Passing a non-pointer value by value deep-copies it into the parameter, exactly like assignment (§4.2 Pointee Transparency); references borrow without copying.
 - **Free-on-reassign.** Assigning to an owning binding (`buf = new […]`, `obj.field = move p`) first drops whatever that binding currently owns, then stores the new value — so the previous allocation is reclaimed rather than leaked.
 - **Integer overflow:** arithmetic that exceeds its type's range is a **runtime fault in checked builds** (like the null checks below) and **wraps two's-complement in release builds**. Compile-time evaluation and the interpreter always fault. Division by zero is a fault in every build mode.
-- **Debug builds** insert a null check on every dereference of a `*T` binding. A use-after-move accesses the null slot and traps (`@llvm.trap`). **Release builds** skip both the null check and the null-store on `move`, so a use-after-move dereferences null and the OS faults.
+- **Debug builds** insert a null check on every dereference of a `*T` binding. A use-after-move accesses the null slot and traps (`@llvm.trap`). **Release builds** skip the null checks, so a use-after-move dereferences null and the OS faults. The null-store on `move` itself is kept in every build mode: it is the moved-from mark the drop machinery reads, so scope-end drops and free-on-reassign stay single-free after a transfer.
+- **Definite use-after-move is a compile-time error.** The compiler tracks moves of bare local variables flow-sensitively: after `move x` (or an owning lambda capture `|*x|`), reading `x`, writing through `x.field`, moving it again, or capturing it is rejected at compile time — until a plain `=` rebinds it. The analysis merges branches conservatively: a move survives a merge only when every falling-through path performs it, so moves under a condition, inside one branch, inside a loop body, or of a field (`move x.inner`) remain checked **runtime** faults rather than compile errors.
 
-**Growth is manual.** A `*[T]` array has a fixed length once allocated (its length lives in the `user_ptr - 8` prefix); there is no in-place resize or `realloc` primitive. A growable collection (`Vec`/`String`) is built by hand: allocate a larger `*var [T]` buffer with a runtime-sized `new [value : count]`, copy the elements across, and reassign the owning field — free-on-reassign reclaims the old buffer automatically. A generic `Vec<T>` and an owning `String` written this way are demonstrated in `samples/vec.alloy` and `samples/string.alloy`; their mutating operations (`push`, `push_str`, …) take a `&var self` receiver and are invoked as methods (`vec.push(x)`).
+**Growth is manual.** A `*[T]` array has a fixed length once allocated (its length lives in the `user_ptr - 8` prefix); there is no in-place resize or `realloc` primitive. A growable collection (`Vector`/`String`) is built by hand: allocate a larger `*var [T]` buffer with a runtime-sized `new [value : count]`, copy the elements across, and reassign the owning field — free-on-reassign reclaims the old buffer automatically. The standard library's generic `Vector<T>` (`std/vector.alloy`) and owning `String` (`std/string.alloy`) are written exactly this way; their mutating operations (`push`, `append`, …) take a `&var self` receiver and are invoked as methods (`vector.push(x)`).
 
 > **Manual-safety caveats.** Alloy does not run a borrow checker. References are unchecked raw pointers: a `&T` can outlive the value it points at (a dropped local, a moved-from or reassigned owner) and dangle. Double-frees are ruled out by construction — deep copying plus pointer uniqueness (§4.2) means no two owners ever share an allocation — at the cost of implicit allocation when an owning value is copied; use `move` to transfer or `&`/`&var` to borrow where a copy is not intended.
 
@@ -659,16 +672,33 @@ Ownership is **structural and automatic**. A value _owns heap_ if it is a `*T` /
 Immediately exits the enclosing function, yielding `value` as its result.
 
 **`break [value]`**
-Exits the **innermost** value-yielding construct — a `for` loop, a `while` loop, a `match`, or an `if`. When a value is provided, that construct evaluates directly to the value.
+Exits the **innermost enclosing loop** — a `for` or a `while` — passing transparently through any `if` or `match` in between, so a conditional loop exit is written naturally:
+
+```alloy
+for (items) |item| {
+    if (item.done()) { break; } // exits the 'for'
+}
+```
+
+When a value is provided, the loop evaluates directly to the value. A `break` outside a loop is a compile-time error.
+
+**`yield value`**
+Produces the value of the **innermost enclosing value-position `if` or `match`**, passing transparently through any loop in between (the loop is exited on the way out, its owned locals dropping normally). A `yield` with no enclosing value-position `if` or `match` is a compile-time error — a statement-position `if` or `match` has nothing to receive the value and is transparent to both `break` and `yield`.
 
 #### `if` as a Value-Yielding Construct
 
-An `if` is itself a value-yielding construct: a `break value` in either branch makes the `if` evaluate to that value, consistent with `for` / `while` / `match`. Because `break` always targets the _innermost_ such construct, a `break` placed inside an `if` body yields from that `if` and can never exit an enclosing loop directly. To break an enclosing loop from conditional logic, the condition is written as the loop-break's operand:
+An `if` used as a value yields via `yield value` in its branches; every branch must yield (or the construct is a compile-time error), and an `else` branch is required:
 
 ```alloy
-// breaks the 'while', yielding 'a' or 'b'
-break if (cond) break a else break b
+var grade = if (score > 90) { yield "high"; } else { yield "low"; };
 ```
+
+#### Path Termination
+
+The compiler performs a conservative flow analysis over every function body (§ compile-time, no runtime cost). A statement **terminates** when control cannot fall out of it normally: `return`, `break`, and `yield` terminate; a block terminates when any of its statements does; an `if` with an `else` terminates when both branches do; a `match` terminates when every arm does; `while (true)` with no `break` reaching it never completes (divergence). Conditions are never assumed and ordinary loops always count as skippable.
+
+- **Definite return:** a function or lambda with a non-void return type must terminate on every path — control falling off the end is a compile-time error.
+- **Definite yield:** every branch of a value-position `if` must terminate; every arm of a value-position `match` must terminate unless an external `else` supplies the fall-through value, in which case the external `else` must terminate; the `else` of a value-yielding loop must terminate.
 
 #### Loop Semantics (`for` and `while`)
 
@@ -694,20 +724,20 @@ break if (cond) break a else break b
 
 ```alloy
 var x = match (subject) {
-    Pattern1 |payload_capture| { break 10 }
-    Pattern2 { break 20 }
+    Pattern1 |payload_capture| { yield 10 }
+    Pattern2 { yield 20 }
 } else {
     // External else block
-    break 30 // Required expression fallback
+    yield 30 // Required expression fallback
 }
 
 ```
 
 - **Subject Versatility:** The subject of a `match` statement can evaluate to an enum variant, a numeric primitive, a character literal, or a string literal (treated natively as an array of integral numbers). Enum arm patterns name variants either fully (`State::Idle`) or in the implied form (`::Idle`, §3.2); a bare variant name is invalid.
 - **Pattern Captures:** The pattern capture clause (`|capture|`) is **exclusively valid** when matching enum variants containing attached data payloads. Utilizing a pattern capture when matching numbers, characters, or strings results in a compile-time error. Captures follow the capture-typing rules (§2.1): deep copy by default, optionally annotated (`|a: &|` borrows the payload in place; an owning capture `|a: *|` takes a pointer payload out, leaving the match subject moved-from after the `match`).
-- **Exhaustiveness:** Every `match` must cover all possible subject values, in statement and expression position alike. An enum subject is exhaustive when every variant appears as an arm pattern, or when an internal `else` arm is present. All other subjects — numbers, characters, strings, and interface objects — have open or unbounded domains and therefore always require an internal `else` arm. A non-exhaustive `match` is a compile-time error. (The external `else` block below is not a coverage fallback: it handles an arm completing without `break`, not an unmatched subject.)
-- **Match Evaluation & Value Yielding:** Like loops, distinct match arms can yield an evaluated value from the outer `match` expression block by terminating via a `break value` statement.
-- **Expression-Only External Match `else` Block:** A `match` structure supports an optional **external `else` block** positioned after its closing bracket. This block is **only permitted when the match is evaluated as an expression**. It executes if and only if the selected match arm completes its execution path normally **without returning a value via a `break` statement**. Because it is constrained to expression contexts, the external `else` block must also provide a final value matching the expression's expected return type. Appending an external `else` block to a `match` construct used purely as a statement is a compile-time error.
+- **Exhaustiveness:** Every `match` must cover all possible subject values, in statement and expression position alike. An enum subject is exhaustive when every variant appears as an arm pattern, or when an internal `else` arm is present. All other subjects — numbers, characters, strings, and interface objects — have open or unbounded domains and therefore always require an internal `else` arm. A non-exhaustive `match` is a compile-time error. (The external `else` block below is not a coverage fallback: it handles an arm completing without `yield`, not an unmatched subject.)
+- **Match Evaluation & Value Yielding:** Distinct match arms yield an evaluated value from the outer `match` expression block by terminating via a `yield value` statement. A `break` inside a match arm targets the enclosing loop (§4.3 `break`), never the match.
+- **Expression-Only External Match `else` Block:** A `match` structure supports an optional **external `else` block** positioned after its closing bracket. This block is **only permitted when the match is evaluated as an expression**. It executes if and only if the selected match arm completes its execution path normally **without producing a value via a `yield` statement**. Because it is constrained to expression contexts, the external `else` block must also provide a final value matching the expression's expected return type. Appending an external `else` block to a `match` construct used purely as a statement is a compile-time error.
 
 ---
 
@@ -724,6 +754,8 @@ var x = match (subject) {
 - The parameter list and optional return type follow the same syntax as a regular function.
 - The type of a lambda expression is the corresponding function type `(T) -> R`.
 - A lambda with no captures may omit the capture delimiters: `(param: T) { ... }`.
+- A named, non-generic function used in value position becomes a function value of its signature's type. A generic function cannot become a function value (its type parameters are unbound), an overloaded name needs a unique function, and an extern function cannot be used as a function value.
+- Function values have no defined identity or structural equality: comparing them with `==` / `!=` is a compile-time error.
 
 ### 4.5 Extension Functions
 
@@ -736,6 +768,7 @@ fn add(self v: &Vec3, other: &Vec3) -> Vec3 { ... }
 
 - Called via dot notation: `v.add(other)`.
 - The receiver is treated as an implicit first argument for the purpose of overload resolution.
+- **Dot-call precedence:** extension resolution wins. When no extension (or interface function, §5.2) provides the name, a call `v.f(...)` where `f` is a function-typed field of `v` calls through the field's value (§4.4).
 - `self` must appear only on the **first** parameter; any other position is an error.
 - A **temporary receiver** (a call result, a literal construction) may invoke an extension whose `self` is an immutable reference (`&T`): the temporary materializes for the duration of the call. A `&var` receiver still requires a mutable place.
 - A **pointer `self`** (`*T` / `*var T`) takes ownership of the receiver, exactly like a pointer parameter (§4.2): an owning place must transfer explicitly (`(move p).consume()`), and only a fresh value (`(new T {}).consume()`, a call result) passes bare.
@@ -770,6 +803,7 @@ A small set of standard library declarations is **recognized by the compiler by 
 | `Option<T>` | `std::option::Option`   | `enum { Some: T, None }`                              | Cursor protocol: `for` over a custom iterable lowers to repeated `match` on `next()`'s `Option<T>` result (§4.3). |
 | `Iterable`  | `std::iterable::Iterable` | Interface: `.length() -> u64` plus iteration support | Drives `for` loops; arrays implement it implicitly (§5.1).                                                        |
 | `Number`    | `std::number::Number`   | Interface                                             | Satisfied by the primitive numeric types (§3.1); bounds generic constraints and the `to` conversion cast (§3.5).  |
+| `arguments` | `std::process::arguments` | `fn arguments() -> &[&[u8]]`                        | The compiler supplies the command line (first element: the program's own path). Natively the entry wrapper captures argc/argv at startup; `alloyc run` serves the arguments after the program path. Unavailable at compile time (§6.2). |
 
 ```alloy
 import std::option
@@ -868,10 +902,27 @@ extern variadicFunc(...) -> *var u8
 ### 5.4 Module System
 
 - **Strict File System Mirroring:** Qualified module pathways match physical disk positioning precisely. An instruction like `import a::b::c` commands the compiler to look explicitly for a source file located at `a/b/c.alloy`.
-- **Standard library:** The standard library ships as ordinary Alloy source files alongside the compiler (`std/vec.alloy`, `std/string.alloy`, …). It is **not** a prelude — nothing is in scope until imported. `import std::vec` makes `Vec<T>` available.
+- **Standard library:** The standard library ships as ordinary Alloy source files alongside the compiler. It is **not** a prelude — nothing is in scope until imported. The modules: `std::option` (`Option<T>`, §5.1a), `std::number` and `std::iterable` (the constraint interfaces, §5.2), `std::vector` (the growable `Vector<T>`), `std::string` (the owned `String` builder), `std::io` (console and file input/output — the library's FFI barrier, §5.3: programs call these wrappers and never touch the C functions underneath), and `std::process` (`arguments()`, §5.1a).
 - **`alloyc build` import resolution:** When compiling a single file to a native executable (`alloyc build file.alloy [-o out] [--release] [--emit-llvm]`), each `import a::b::c` is resolved to `a/b/c.alloy` searched under, in order: the current directory, the compiler-executable's directory, and `$ALLOY_STDLIB`. Every reachable module is **merged into one compilation unit**. The build is **checked** by default and `--release` selects the release semantics of §4.2; the backend emits LLVM IR and an external clang (located via `$ALLOY_CLANG`, then `PATH`) produces the executable.
+- **Debug info:** checked builds embed DWARF debug metadata — file, function, and statement-level line/column locations — so native debuggers (LLDB, GDB) set source breakpoints, step by statement, and show Alloy names in call stacks. Release builds carry none. On Windows the debug link goes through lld (`/debug:dwarf`); if lld is unavailable the build falls back to linking without debug info and says so.
 - **Program entry:** execution starts at a zero-parameter function named `main` in the entry module. An integer result becomes the process exit code (truncated to the platform's width); any other result type, or none, exits with 0.
-- **Qualified vs. unqualified access:** an imported name may be written either unqualified (`Vec`) or module-qualified (`std::vec::Vec`). Qualified access goes through the cross-module visibility check, so only `pub`/`exp` definitions are reachable that way; unqualified access sees the whole merged unit. A name that collides with an existing definition is a redeclaration error, except that functions overload (§3.6). (The merge is an implementation shortcut — true separate compilation with per-module object files and namespaces is a future step; the per-module TypeId model is the obstacle.)
+- **Qualified vs. unqualified access:** an imported name may be written either unqualified (`Vector`) or module-qualified (`std::vector::Vector`). Every import also introduces an alias for qualified use — the explicit `as` name or the import path's last segment (`import pkg::mathx` allows `mathx::twice(...)`). Qualified access goes through the cross-module visibility check, so only `pub`/`exp` definitions are reachable that way. Unqualified access sees the requester's **own library** in full (the executable's own modules and `std::` count as one library), plus the `exp` definitions of each library the module imported **without an explicit `as`** — an unaliased library import *injects* its exports into that module's unqualified namespace, while an aliased import (`import pkg::liba as la`) is reachable through the alias only (`la::Pair`, `la::Pair { ... }`).
+- **Name collisions:** within one library, a name colliding with an existing definition is a redeclaration error, except that functions overload (§3.6). Different libraries may reuse names internally. A name visible unqualified in one module from **two different libraries** (own declaration vs. an injected export, or two injected exports) is a **compile-time error at the import**, resolved by aliasing an import to take its exports out of the unqualified namespace. Nothing is resolved implicitly — no shadowing, no cross-library overload merging. Two imports whose aliases collide (implicit or explicit) are likewise an error.
+- **Merge-then-codegen:** every reachable module — including every library module — always merges into ONE compilation unit before type checking and code generation. The whole-program stages depend on it (closed-world interface dispatch, monomorphization, §3.9 layouts); only the per-module front-end stages (tokenize, parse) run in parallel. Libraries therefore recompile with each consuming program; the `.alloylib` payload exists to make that cheap, not to skip it.
+
+#### Import Namespaces
+
+- `import a::b` — a **relative** import: the file `a/b.alloy` next to the importing code. Inside a library, relative imports resolve within that library's own namespace.
+- `import std::x` — the **standard library**, shipped as Alloy source alongside the compiler.
+- `import pkg::name[::module]` — a **package**: the compiler looks for `pkg/name.alloylib` in the project first, then (future) the trusted registry. `pkg::name` imports the package's entry module; `pkg::name::module` one of its members.
+
+#### Libraries (`.alloylib`)
+
+- `alloyc lib entry.alloy [-o name.alloylib]` fully checks the unit standalone (all §3/§4 rules, flow and move analysis included) and packs the entry module plus every module of its own into a container. `std::` and `pkg::` dependencies are not packed — they stay imports the consuming program resolves, so a library's package dependencies load transitively.
+- The container embeds the **complete source** — the registry mandates open source, and the embedded source is authoritative: precompiled cache sections (future) are stamped with the producing compiler's version and silently ignored on mismatch, falling back to compiling the embedded source. A library therefore never breaks across compiler releases.
+- **Export boundary:** `exp` marks a definition as exported from a library. Within one compilation unit `exp` behaves exactly like `pub`; across a library boundary, only `exp` definitions are visible to consumers — qualified (`mathx::twice(...)`) or unqualified via an unaliased import per the injection rules above — while `pub` covers a library's internal cross-module structure without leaking it.
+- **Interface satisfaction stays closed-world:** whether a type satisfies an interface (§5.2) considers every extension in the merged unit, even library-internal ones — vtables span the whole program. Visibility governs who may *name* an extension in a direct call, not whether it backs dynamic dispatch.
+- **Comptime re-runs per program** (§6): library comptime and macros are re-evaluated in the consuming program's merged unit, so compile-time reflection can see the final closed world (every interface implementer, every type), not just the library's own.
 
 ---
 
@@ -885,10 +936,10 @@ Any **value-yielding expression** prefixed by the token `#` — an `#if`, `#whil
 
 Comptime expressions operate on a pure value-substitution model. Once a compile-time expression completes execution, its entire syntax node tree is stripped from the final runtime code layout and replaced with its final calculated literal value, struct initialization block, or nominal type signature.
 
-A value-yielding construct yields its value via `break` (§4.3), so an `#if` selecting between two values is written:
+A value-yielding construct yields its value via `yield` (§4.3), so an `#if` selecting between two values is written:
 
 ```alloy
-const a = #if (cond) break 50 else break 100
+const a = #if (cond) yield 50 else yield 100
 
 ```
 
@@ -930,7 +981,7 @@ macro readTypeFromJson(path: &[u8]) {
 
 ```alloy
 type T = #readTypeFromJson("types/T.json")
-type P = #if (DEVELOPMENT) break struct { id: u32 } else break #readTypeFromJson("types/P.json")
+type P = #if (DEVELOPMENT) yield struct { id: u32 } else yield #readTypeFromJson("types/P.json")
 
 ```
 
@@ -938,13 +989,16 @@ type P = #if (DEVELOPMENT) break struct { id: u32 } else break #readTypeFromJson
 
 The compiler provides a small set of built-in macros. Like all macros they are invoked with a leading `#`.
 
-| Macro         | Signature          | Semantics                                               |
-| ------------- | ------------------ | ------------------------------------------------------- |
-| `type_of`     | `(value) -> #Type` | The `#Type` of the argument expression's type (§3.4).   |
-| `struct_type` | `() -> #Type`      | A fresh, empty struct `#Type`, for synthesising a type. |
-| `enum_type`   | `() -> #Type`      | A fresh, empty enum `#Type`.                            |
+| Macro             | Signature               | Semantics                                                |
+| ----------------- | ----------------------- | -------------------------------------------------------- |
+| `type_of`         | `(value) -> #Type`      | The `#Type` of the argument expression's type (§3.4).    |
+| `struct_type`     | `() -> #Type`           | A fresh, empty struct `#Type`, for synthesising a type.  |
+| `enum_type`       | `() -> #Type`           | A fresh, empty enum `#Type`.                             |
+| `implementers_of` | `(interface) -> [#Type]` | Every type in the merged unit implementing the interface. |
 
 A type may also be reflected directly by prefixing its name with `#` (`#u32`, `#Packet`) — see §3.4.
+
+**`implementers_of` is whole-world** (§5.4): because every module — including every library module — merges before checking, the returned array covers the entire program regardless of declaration order or library visibility: a library-internal type implementing an exported interface is included. Elements arrive in module order, then declaration order, so results are deterministic. Generic types are excluded (they reflect only as instances, §3.4). The array is a compile-time value: consume it inside the `#` expression (`#(implementers_of(Shape).length())`, `#(implementers_of(Shape)[0].name())`) — a `#Type` itself cannot be retained into runtime (§6.2). Types synthesised by comptime (`type T : I = #...`) are enumerated like any other declaration, but their member descriptions are only complete once their own `#` initialiser has evaluated (declaration order, §6.3).
 
 ---
 

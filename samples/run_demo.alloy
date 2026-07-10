@@ -39,7 +39,7 @@ fn main() -> i32 {
         }
     }
     for ([..3]) |round| {
-        account.apply(::Deposit(round to i64 * 10));
+        account.apply( ::Deposit(round to i64 * 10));
     }
     printf("refused %d\n", refused);
     return account.balance to i32;

@@ -134,6 +134,9 @@ pub const Statement = union(enum) {
     var_def: VarDef,
     block: []const *const Statement,
     break_stmt: struct { keyword: Token, value: ?*const Expression },
+    // 'yield value' produces the value of the innermost value-position
+    // 'if' or 'match' (section 4.3)
+    yield_stmt: struct { keyword: Token, value: *const Expression },
     return_stmt: struct { keyword: Token, value: ?*const Expression },
     assign: struct {
         target: *const Expression,
@@ -177,7 +180,17 @@ pub const Expression = union(enum) {
     },
     member: struct { object: *const Expression, name: Token },
     index: struct { object: *const Expression, subscript: *const Expression },
-    struct_init: struct { name: ?Token, members: []const MemberInit },
+    // 'arr[start..end]' borrows a slice viewing the element range
+    // start..end-1 in place (section 3.2); a null start means 0
+    subslice: struct {
+        object: *const Expression,
+        operator: Token,
+        start: ?*const Expression,
+        end: *const Expression,
+    },
+    // a null path is an anonymous structural literal ('{ .x = 1 }'); a
+    // named literal may be module-qualified ('liba::Pair { ... }')
+    struct_init: struct { path: ?[]const Token, members: []const MemberInit },
     array_literal: []const *const Expression,
     array_fill: struct { value: *const Expression, count: *const Expression },
     // '[start..end]' integer range generator; a null start means 0

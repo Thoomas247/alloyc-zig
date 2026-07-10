@@ -1,0 +1,16 @@
+// The running process's environment.
+//
+// 'arguments' is a lang item (LANGUAGE_SPEC.md section 5.1a) at the
+// canonical path std::process::arguments: this declaration provides the
+// signature, and the compiler supplies the value. Natively the program's
+// entry wrapper captures argc/argv at startup; under 'alloyc run' the
+// interpreter serves the arguments following the program path. In both
+// cases the first argument is the program's own path, matching C.
+
+// The command line, one borrowed byte slice per argument, valid for the
+// whole program run. Calls are replaced by the compiler; this body never
+// executes. Unavailable at compile time (section 6.2).
+pub fn arguments() -> &[&[u8]] {
+    const empty: [&[u8] : 1] = [""];
+    return empty[..0];
+}

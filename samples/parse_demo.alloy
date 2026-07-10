@@ -52,8 +52,8 @@ fn describe(handle: &Serializable) -> bool {
         return concrete.serialize(2);
     }
     return match (handle) {
-        Packet |packet| { break packet.serialize(3); }
-        else { break handle.serialize(1); }
+        Packet |packet| { yield packet.serialize(3); }
+        else { yield handle.serialize(1); }
     };
 }
 
@@ -92,23 +92,21 @@ fn main() -> i32 {
     var compare = 3 < lengths;
 
     var classified = match (lengths) {
-        0 { break "empty"; }
-        1 { break "one"; }
-        else { break "many"; }
+        0 { yield "empty"; }
+        1 { yield "one"; }
+        else { yield "many"; }
     } else {
-        break "fell through";
+        yield "fell through";
     };
 
     const doubler = |&var compare| (x: i64) -> i64 {
         return x * 2;
     };
 
-    const base: i64 = 1 +
-        2 + (3 *
-        4);
+    const base: i64 = 1 + 2 + (3 * 4);
     var wide = base;
 
-    const choice = #if (base > 4) break 50 else break 100;
+    const choice = #if (base > 4) yield 50 else yield 100;
     while (wide < choice) {
         wide += doubler(wide);
     }

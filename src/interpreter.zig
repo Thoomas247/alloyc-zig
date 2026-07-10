@@ -31,6 +31,7 @@ pub const Interpreter = struct {
     arena: std.mem.Allocator,
     views: []const resolution.ModuleView,
     globals: *const std.StringHashMapUnmanaged(resolution.SymbolList),
+    injected: []const resolution.InjectedMap,
     expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
     call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
     call_type_bindings: *const std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding),
@@ -40,6 +41,7 @@ pub const Interpreter = struct {
     // byte shapes per non-primitive 'as' cast (section 3.5), recorded by
     // the checker from the section 3.9 layout rules
     cast_shapes: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes),
+    type_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.TypeIdentity),
     output: *std.Io.Writer,
     scopes: std.ArrayList(Frame),
     current_view: usize,
@@ -51,8 +53,19 @@ pub const Interpreter = struct {
     step_budget: ?u64,
     reflection: ?ReflectionHooks,
     call_depth: usize,
+    debug_hook: ?DebugHook = null,
+    debug_stack: std.ArrayList(DebugFrame) = .empty,
+    // host filesystem behind the std::io externs (fopen and friends);
+    // null makes file externs fault, keeping tests hermetic
+    host_io: ?std.Io = null,
+    open_files: std.ArrayList(OpenFile) = .empty,
+    // the argv tail behind std::process::arguments (section 5.1a)
+    process_arguments: []const []const u8 = &.{},
     fault_message: ?[]const u8,
     pending_return: ?Value,
+    // carried by error.Break / error.Yield across expression boundaries
+    pending_break: ?Value = null,
+    pending_yield: Value = .void_value,
 
     const Frame = struct {
         bindings: std.StringHashMapUnmanaged(*Value),
@@ -60,9 +73,39 @@ pub const Interpreter = struct {
         barrier: bool,
     };
 
+    // one fopen'd stream: reads run over the whole file buffered at open,
+    // writes buffer until fclose flushes them to disk, matching C stdio
+    // closely enough for the std::io wrappers
+    const OpenFile = struct {
+        path: []const u8,
+        writing: bool,
+        contents: []const u8,
+        cursor: usize,
+        write_buffer: std.ArrayList(u8),
+        closed: bool,
+    };
+
+    /// A debugger's view of one active call, maintained only while a
+    /// debug hook is installed; the hook updates the top frame's offset.
+    pub const DebugFrame = struct {
+        name: []const u8,
+        view_index: usize,
+        offset: usize,
+        // the scope stack height at call entry, so a debugger can slice
+        // each call's frames out of the shared stack
+        scope_floor: usize,
+    };
+
+    /// Called before every statement while installed, so a debug adapter
+    /// can pause execution, inspect scopes, and resume.
+    pub const DebugHook = struct {
+        context: *anyopaque,
+        on_statement: *const fn (context: *anyopaque, machine: *Interpreter, statement: *const ast.Statement) Error!void,
+    };
+
     // 'Return' unwinds a 'return' written inside a value-yielding construct
     // up to the enclosing function call, carrying 'pending_return'
-    pub const Error = error{ OutOfMemory, RuntimeFault, WriteFailed, Return };
+    pub const Error = error{ OutOfMemory, RuntimeFault, WriteFailed, Return, Break, Yield };
 
     pub const Value = union(enum) {
         void_value,
@@ -99,9 +142,12 @@ pub const Interpreter = struct {
 
         pub const StructInstance = struct {
             fields: []Field,
-            // the declared type's name; empty for structural values; this is
-            // the runtime identity behind interface dispatch (section 5.2)
+            // the declared type's name; empty for structural values; kept
+            // for display in faults and reflection
             type_name: []const u8,
+            // the nominal identity behind interface dispatch, downcasts,
+            // and match arms (section 5.2); null for structural values
+            identity: ?types.TypeIdentity = null,
         };
 
         pub const Field = struct {
@@ -160,34 +206,51 @@ pub const Interpreter = struct {
         context: *anyopaque,
         reflect_named: *const fn (context: *anyopaque, name: []const u8) error{OutOfMemory}!?*Value.TypeDescription,
         reflect_expression: *const fn (context: *anyopaque, expression: *const ast.Expression) error{OutOfMemory}!?*Value.TypeDescription,
+        // every type in the merged unit implementing the described
+        // interface (section 6.4); null when the description is not an
+        // interface
+        reflect_implementers: *const fn (context: *anyopaque, description: *Value.TypeDescription) error{OutOfMemory}!?[]const Value,
+        // whether the subject type implements the interface (section 3.4),
+        // by definition identity including lang items; null when the
+        // interface description carries no resolved interface
+        reflect_implements: *const fn (context: *anyopaque, subject: *Value.TypeDescription, interface: *Value.TypeDescription) error{OutOfMemory}!?bool,
     };
 
+    // statements propagate flow directly; crossing an expression boundary
+    // switches to the error channel (error.Break / error.Yield /
+    // error.Return with the pending value), so 'break' reaches the
+    // enclosing loop and 'yield' the enclosing value construct no matter
+    // how deeply they nest (section 4.3)
     const Flow = union(enum) {
         normal,
         break_value: ?Value,
+        yield_value: Value,
         return_value: Value,
     };
 
     pub fn init(
         arena: std.mem.Allocator,
         views: []const resolution.ModuleView,
-        globals: *const std.StringHashMapUnmanaged(resolution.SymbolList),
+        unit: *const resolution.MergedUnit,
         expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
         call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
         call_type_bindings: *const std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding),
         comptime_values: *const std.AutoHashMapUnmanaged(*const ast.Expression, Value),
         cast_shapes: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes),
+        type_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.TypeIdentity),
         output: *std.Io.Writer,
     ) Interpreter {
         return .{
             .arena = arena,
             .views = views,
-            .globals = globals,
+            .globals = &unit.globals,
+            .injected = unit.injected,
             .expression_types = expression_types,
             .call_targets = call_targets,
             .call_type_bindings = call_type_bindings,
             .comptime_values = comptime_values,
             .cast_shapes = cast_shapes,
+            .type_targets = type_targets,
             .output = output,
             .scopes = .empty,
             .current_view = 0,
@@ -199,6 +262,31 @@ pub const Interpreter = struct {
             .fault_message = null,
             .pending_return = null,
         };
+    }
+
+    // unqualified visibility from the executing module (section 5.4): own
+    // library plus the 'exp' symbols of libraries it imported without an
+    // alias, mirroring the checker's rule
+    fn symbolVisible(self: *const Interpreter, symbol: resolution.Symbol) bool {
+        if (resolution.sameLibrary(self.views[self.current_view].library, self.views[symbol.view_index].library)) return true;
+        if (symbol.visibility != .exported) return false;
+        const library = self.views[symbol.view_index].library orelse return false;
+        return self.injected[self.current_view].contains(library);
+    }
+
+    fn firstVisible(self: *const Interpreter, name: []const u8) ?resolution.Symbol {
+        return self.firstVisibleFrom(name, self.current_view);
+    }
+
+    fn firstVisibleFrom(self: *const Interpreter, name: []const u8, view_index: usize) ?resolution.Symbol {
+        const symbols = self.globals.get(name) orelse return null;
+        for (symbols.items) |symbol| {
+            if (resolution.sameLibrary(self.views[view_index].library, self.views[symbol.view_index].library)) return symbol;
+            if (symbol.visibility != .exported) continue;
+            const library = self.views[symbol.view_index].library orelse continue;
+            if (self.injected[view_index].contains(library)) return symbol;
+        }
+        return null;
     }
 
     /// Runs 'main' and returns its integer result (the process exit code).
@@ -290,7 +378,7 @@ pub const Interpreter = struct {
                     copy.* = .{ .name = original.name, .value = try self.deepCopy(original.value) };
                 }
                 const fresh = try self.arena.create(Value.StructInstance);
-                fresh.* = .{ .fields = fields, .type_name = instance.type_name };
+                fresh.* = .{ .fields = fields, .type_name = instance.type_name, .identity = instance.identity };
                 return .{ .struct_value = fresh };
             },
             .enum_value => |instance| {
@@ -374,6 +462,9 @@ pub const Interpreter = struct {
     }
 
     fn execStatement(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
+        if (self.debug_hook) |hook| {
+            try hook.on_statement(hook.context, self, statement);
+        }
         switch (statement.*) {
             .var_def => |var_def| {
                 const value = try self.evalExpression(var_def.value);
@@ -393,13 +484,22 @@ pub const Interpreter = struct {
                 const value: ?Value = if (break_stmt.value) |expression| try self.evalExpression(expression) else null;
                 return .{ .break_value = value };
             },
+            .yield_stmt => |yield_stmt| {
+                return .{ .yield_value = try self.evalExpression(yield_stmt.value) };
+            },
             .return_stmt => |return_stmt| {
                 const value: Value = if (return_stmt.value) |expression| try self.evalExpression(expression) else .void_value;
                 return .{ .return_value = value };
             },
             .assign => |assign| return self.execAssign(assign),
             .expression => |expression| {
-                _ = try self.evalExpression(expression);
+                // statement-position ifs and matches pass 'break' and
+                // 'yield' through to their enclosing constructs
+                _ = switch (expression.*) {
+                    .if_expr => |if_expr| try self.evalIf(if_expr, false),
+                    .match_expr => |match_expr| try self.evalMatch(match_expr, false),
+                    else => try self.evalExpression(expression),
+                };
                 return .normal;
             },
         }
@@ -465,9 +565,50 @@ pub const Interpreter = struct {
                 // reference field yields a copy of the pointee
                 return self.deepCopy((try self.pierceCell(place)).*);
             },
-            .index => {
-                const place = try self.evalPlace(expression) orelse return self.fault("cannot read this element", .{});
-                return self.deepCopy((try self.pierceCell(place)).*);
+            .index => |index| {
+                if (try self.evalPlace(expression)) |place| {
+                    return self.deepCopy((try self.pierceCell(place)).*);
+                }
+                // a temporary subject (a call result) indexes by value
+                const subject = try self.evalExpression(index.object);
+                const instance = switch (subject) {
+                    .array => |instance| instance,
+                    .slice => |instance| instance,
+                    .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+                    else => return self.fault("cannot read this element", .{}),
+                };
+                const subscript = try self.integerOf(try self.evalExpression(index.subscript));
+                if (subscript < 0 or subscript >= instance.elements.len) {
+                    return self.fault("index {d} out of bounds for length {d}", .{ subscript, instance.elements.len });
+                }
+                return self.deepCopy(instance.elements[@intCast(subscript)]);
+            },
+            .subslice => |subslice| {
+                // 'arr[start..end]' borrows a slice aliasing the subject's
+                // element range in place (section 3.2)
+                var subject: Value = undefined;
+                if (try self.evalPlace(subslice.object)) |place| {
+                    subject = (try self.pierceCell(place)).*;
+                } else {
+                    subject = try self.evalExpression(subslice.object);
+                }
+                const instance = switch (subject) {
+                    .array => |instance| instance,
+                    .slice => |instance| instance,
+                    .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+                    else => return self.fault("cannot subslice this value", .{}),
+                };
+                const start: i128 = if (subslice.start) |start_expression|
+                    try self.integerOf(try self.evalExpression(start_expression))
+                else
+                    0;
+                const end = try self.integerOf(try self.evalExpression(subslice.end));
+                if (start < 0 or end < start or end > instance.elements.len) {
+                    return self.fault("subslice {d}..{d} out of bounds for length {d}", .{ start, end, instance.elements.len });
+                }
+                const view = try self.arena.create(Value.ArrayInstance);
+                view.* = .{ .elements = instance.elements[@intCast(start)..@intCast(end)] };
+                return .{ .slice = view };
             },
             .struct_init => |struct_init| {
                 const fields = try self.arena.alloc(Value.Field, struct_init.members.len);
@@ -478,12 +619,20 @@ pub const Interpreter = struct {
                     };
                 }
                 const recorded = self.expression_types.get(expression);
-                const type_name = if (recorded) |result_type| name: {
+                var type_name: []const u8 = "";
+                var identity: ?types.TypeIdentity = null;
+                if (recorded) |result_type| {
                     const resolved = self.resolveTypeParameter(result_type);
-                    break :name if (resolved.* == .declared) resolved.declared.name else "";
-                } else "";
+                    if (resolved.* == .declared) {
+                        type_name = resolved.declared.name;
+                        identity = .{
+                            .definition = resolved.declared.definition,
+                            .view_index = resolved.declared.view_index,
+                        };
+                    }
+                }
                 const instance = try self.arena.create(Value.StructInstance);
-                instance.* = .{ .fields = fields, .type_name = type_name };
+                instance.* = .{ .fields = fields, .type_name = type_name, .identity = identity };
                 return .{ .struct_value = instance };
             },
             .array_literal => |elements| {
@@ -511,10 +660,10 @@ pub const Interpreter = struct {
                 instance.* = .{ .elements = values };
                 return .{ .array = instance };
             },
-            .if_expr => |if_expr| return self.evalIf(if_expr),
+            .if_expr => |if_expr| return self.evalIf(if_expr, true),
             .while_expr => |while_expr| return self.evalWhile(while_expr),
             .for_expr => |for_expr| return self.evalFor(for_expr),
-            .match_expr => |match_expr| return self.evalMatch(match_expr),
+            .match_expr => |match_expr| return self.evalMatch(match_expr, true),
             .lambda => |*lambda| return self.makeClosure(lambda),
         }
     }
@@ -594,8 +743,7 @@ pub const Interpreter = struct {
                 return self.deepCopy(pierced.*);
             }
             // a global function name used as a value
-            if (self.globals.get(name)) |symbols| {
-                const symbol = symbols.items[0];
+            if (self.firstVisible(name)) |symbol| {
                 switch (symbol.definition.kind) {
                     // a type name at compile time reflects ('#Packet')
                     .type_def, .interface_def => if (self.comptime_mode) {
@@ -688,6 +836,12 @@ pub const Interpreter = struct {
             },
             .ampersand => {
                 const place = try self.evalPlace(unary.operand) orelse return self.fault("'&' needs an addressable operand", .{});
+                // borrowing a heap array yields a slice aliasing its
+                // elements in place (section 4.2)
+                if (place.* == .heap_array) {
+                    const instance = place.heap_array orelse return self.fault("use of a moved-from array", .{});
+                    return .{ .slice = instance };
+                }
                 return .{ .reference = place };
             },
             .keyword_new => return self.evalNew(unary.operand),
@@ -853,8 +1007,15 @@ pub const Interpreter = struct {
                 const target_name = target_token.slice(self.source());
                 return switch (operand) {
                     .enum_value => |instance| .{ .bool_value = std.mem.eql(u8, instance.variant, target_name) },
-                    // an interface object's concrete-type test (section 3.2)
-                    .struct_value => |instance| .{ .bool_value = std.mem.eql(u8, instance.type_name, target_name) },
+                    // an interface object's concrete-type test compares the
+                    // checker-resolved identity (section 3.2)
+                    .struct_value => |instance| verdict: {
+                        if (self.type_targets.get(expression)) |target| {
+                            const identity = instance.identity orelse break :verdict .{ .bool_value = false };
+                            break :verdict .{ .bool_value = identity.definition == target.definition };
+                        }
+                        break :verdict .{ .bool_value = std.mem.eql(u8, instance.type_name, target_name) };
+                    },
                     else => self.fault("'is' needs an enum or interface-object subject", .{}),
                 };
             },
@@ -993,7 +1154,7 @@ pub const Interpreter = struct {
                     };
                 }
                 const instance = try self.arena.create(Value.StructInstance);
-                instance.* = .{ .fields = fields, .type_name = record.name };
+                instance.* = .{ .fields = fields, .type_name = record.name, .identity = record.identity };
                 return .{ .struct_value = instance };
             },
             .array => |array| {
@@ -1153,6 +1314,11 @@ pub const Interpreter = struct {
                 return self.callExtern(name, arguments);
             },
             .fn_def => |fn_def| {
+                // std::process::arguments is compiler-provided (section
+                // 5.1a): the host argv materializes as a slice of slices
+                if (self.processArgumentsLangItem(symbol)) {
+                    return self.processArgumentsValue();
+                }
                 const has_self = fn_def.function.parameters.len != 0 and fn_def.function.parameters[0].is_self;
                 if (has_self and callee.* == .member) {
                     return self.callExtension(symbol, fn_def, callee.member, call, type_bindings);
@@ -1190,14 +1356,43 @@ pub const Interpreter = struct {
             }
         }
         // a call without a static target dispatches at runtime through the
-        // receiver's concrete type (section 5.2)
+        // receiver's concrete type (section 5.2); extensions win over
+        // function-typed fields, matching the native dispatch order
         if (try self.evalPlace(member.object)) |place| {
             const pierced = try self.pierceCell(place);
-            if (pierced.* == .struct_value and pierced.struct_value.type_name.len != 0) {
-                if (self.findDispatchTarget(pierced.struct_value.type_name, name)) |symbol| {
-                    return self.callExtension(symbol, symbol.definition.kind.fn_def, member, call, &.{});
+            if (pierced.* == .struct_value) {
+                if (pierced.struct_value.identity) |identity| {
+                    if (self.findDispatchTarget(identity, name)) |symbol| {
+                        return self.callExtension(symbol, symbol.definition.kind.fn_def, member, call, &.{});
+                    }
                 }
-                return self.fault("no extension '{s}' found for '{s}' at runtime", .{ name, pierced.struct_value.type_name });
+                // a function-typed field calls through its value (section
+                // 4.4) when no extension implements the name
+                for (pierced.struct_value.fields) |*field| {
+                    if (!std.mem.eql(u8, field.name, name)) continue;
+                    switch (field.value) {
+                        .closure => |instance| return self.callClosure(instance, try self.evalArguments(call.arguments)),
+                        .function => |symbol| return self.callFunction(symbol, try self.evalArguments(call.arguments), &.{}),
+                        else => {},
+                    }
+                }
+                if (pierced.struct_value.type_name.len != 0) {
+                    return self.fault("no extension '{s}' found for '{s}' at runtime", .{ name, pierced.struct_value.type_name });
+                }
+            }
+        } else {
+            // a temporary receiver (a call result) also calls through its
+            // function-typed field (section 4.4)
+            const receiver = try self.evalExpression(member.object);
+            if (receiver == .struct_value) {
+                for (receiver.struct_value.fields) |*field| {
+                    if (!std.mem.eql(u8, field.name, name)) continue;
+                    switch (field.value) {
+                        .closure => |instance| return self.callClosure(instance, try self.evalArguments(call.arguments)),
+                        .function => |symbol| return self.callFunction(symbol, try self.evalArguments(call.arguments), &.{}),
+                        else => {},
+                    }
+                }
             }
         }
         return self.fault("no resolved target for the call to '{s}' (not yet supported by the interpreter)", .{name});
@@ -1228,6 +1423,13 @@ pub const Interpreter = struct {
         if (std.mem.eql(u8, name, "implements_interface")) {
             const other = try self.typeArgument(arguments, 0, "implements_interface");
             if (other.kind != .interface_kind) return self.fault("'implements_interface' needs an interface '#Type' (section 3.4)", .{});
+            // the checker answers by definition identity, covering lang
+            // items; marker names remain only for synthesised descriptions
+            if (self.reflection) |hooks| {
+                if (try hooks.reflect_implements(hooks.context, description, other)) |conforms| {
+                    return .{ .bool_value = conforms };
+                }
+            }
             for (description.interface_names) |marker| {
                 if (std.mem.eql(u8, marker, other.name)) return .{ .bool_value = true };
             }
@@ -1286,9 +1488,9 @@ pub const Interpreter = struct {
         return left_origin.eql(right_origin);
     }
 
-    // resolves an interface-object call: a type-specific extension wins over
-    // an interface default implementation (section 5.2)
-    fn findDispatchTarget(self: *Interpreter, type_name: []const u8, method_name: []const u8) ?resolution.Symbol {
+    // resolves an interface-object call by the receiver's nominal identity:
+    // a type-specific extension wins over an interface default (section 5.2)
+    fn findDispatchTarget(self: *Interpreter, receiver: types.TypeIdentity, method_name: []const u8) ?resolution.Symbol {
         const symbols = self.globals.get(method_name) orelse return null;
         var default_implementation: ?resolution.Symbol = null;
         for (symbols.items) |symbol| {
@@ -1298,21 +1500,28 @@ pub const Interpreter = struct {
             if (parameters.len == 0 or !parameters[0].is_self) continue;
             const view_source = self.views[symbol.view_index].source;
             const self_name = selfTypeName(parameters[0].parameter_type, view_source) orelse continue;
-            if (std.mem.eql(u8, self_name, type_name)) return symbol;
-            if (self.typeImplements(type_name, self_name)) default_implementation = symbol;
+            // the self type resolves in the extension's own view, so two
+            // libraries' same-named types never cross wires
+            const self_symbol = self.firstVisibleFrom(self_name, symbol.view_index) orelse continue;
+            switch (self_symbol.definition.kind) {
+                .type_def => if (self_symbol.definition == receiver.definition) return symbol,
+                .interface_def => if (self.typeImplements(receiver, self_symbol.definition)) {
+                    default_implementation = symbol;
+                },
+                else => {},
+            }
         }
         return default_implementation;
     }
 
-    // whether the named type marks itself with the named interface
-    fn typeImplements(self: *Interpreter, type_name: []const u8, interface_name: []const u8) bool {
-        const symbols = self.globals.get(type_name) orelse return false;
-        for (symbols.items) |symbol| {
-            if (symbol.definition.kind != .type_def) continue;
-            const view_source = self.views[symbol.view_index].source;
-            for (symbol.definition.kind.type_def.interfaces) |marker| {
-                if (std.mem.eql(u8, marker.slice(view_source), interface_name)) return true;
-            }
+    // whether the receiver's type marks itself with the interface; markers
+    // resolve in the type's declaring view
+    fn typeImplements(self: *Interpreter, receiver: types.TypeIdentity, interface_definition: *const ast.Definition) bool {
+        if (receiver.definition.kind != .type_def) return false;
+        const view_source = self.views[receiver.view_index].source;
+        for (receiver.definition.kind.type_def.interfaces) |marker| {
+            const marker_symbol = self.firstVisibleFrom(marker.slice(view_source), receiver.view_index) orelse continue;
+            if (marker_symbol.definition == interface_definition) return true;
         }
         return false;
     }
@@ -1375,6 +1584,17 @@ pub const Interpreter = struct {
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
         defer self.call_depth -= 1;
+        if (self.debug_hook != null) {
+            try self.debug_stack.append(self.arena, .{
+                .name = fn_def.name.slice(self.views[symbol.view_index].source),
+                .view_index = symbol.view_index,
+                .offset = fn_def.name.location.start,
+                .scope_floor = self.scopes.items.len,
+            });
+        }
+        defer if (self.debug_hook != null) {
+            _ = self.debug_stack.pop();
+        };
 
         const saved_view = self.current_view;
         self.current_view = symbol.view_index;
@@ -1423,6 +1643,19 @@ pub const Interpreter = struct {
                 return self.fault("the type of this expression is not known at compile time (section 6.4)", .{});
             return .{ .type_value = description };
         }
+        if (std.mem.eql(u8, name, "implementers_of")) {
+            if (call.arguments.len != 1) return self.fault("'implementers_of' expects one argument (section 6.4)", .{});
+            const hooks = self.reflection orelse return self.fault("reflection is unavailable here", .{});
+            const argument = try self.evalExpression(call.arguments[0]);
+            if (argument != .type_value) {
+                return self.fault("'implementers_of' expects an interface (section 6.4)", .{});
+            }
+            const implementers = (try hooks.reflect_implementers(hooks.context, argument.type_value)) orelse
+                return self.fault("'implementers_of' expects an interface (section 6.4)", .{});
+            const instance = try self.arena.create(Value.ArrayInstance);
+            instance.* = .{ .elements = try self.arena.dupe(Value, implementers) };
+            return .{ .array = instance };
+        }
         return null;
     }
 
@@ -1431,6 +1664,7 @@ pub const Interpreter = struct {
     fn comptimeNameCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
         const symbols = self.globals.get(name) orelse return null;
         for (symbols.items) |symbol| {
+            if (!self.symbolVisible(symbol)) continue;
             switch (symbol.definition.kind) {
                 .macro_def => |macro_def| return try self.callMacro(symbol, macro_def, call),
                 .fn_def => |fn_def| {
@@ -1525,6 +1759,35 @@ pub const Interpreter = struct {
         };
     }
 
+    // the std::process::arguments lang item (section 5.1a), recognized by
+    // its canonical module key and name
+    fn processArgumentsLangItem(self: *const Interpreter, symbol: resolution.Symbol) bool {
+        if (symbol.definition.kind != .fn_def) return false;
+        const key = self.views[symbol.view_index].key orelse return false;
+        if (!std.mem.eql(u8, key, "std::process")) return false;
+        const name = symbol.definition.kind.fn_def.name.slice(self.views[symbol.view_index].source);
+        return std.mem.eql(u8, name, "arguments");
+    }
+
+    fn processArgumentsValue(self: *Interpreter) Error!Value {
+        if (self.comptime_mode) {
+            return self.fault("process arguments are unavailable at compile time (section 6.2)", .{});
+        }
+        const outer = try self.arena.alloc(Value, self.process_arguments.len);
+        for (self.process_arguments, outer) |argument, *slot| {
+            const bytes = try self.arena.alloc(Value, argument.len);
+            for (argument, bytes) |byte, *element| {
+                element.* = .{ .integer = .{ .value = byte, .primitive = .u8 } };
+            }
+            const inner = try self.arena.create(Value.ArrayInstance);
+            inner.* = .{ .elements = bytes };
+            slot.* = .{ .slice = inner };
+        }
+        const instance = try self.arena.create(Value.ArrayInstance);
+        instance.* = .{ .elements = outer };
+        return .{ .slice = instance };
+    }
+
     fn callExtern(self: *Interpreter, name: []const u8, arguments: []const Value) Error!Value {
         if (self.comptime_mode) {
             return self.fault("extern functions cannot be called at compile time (section 6.2)", .{});
@@ -1532,7 +1795,146 @@ pub const Interpreter = struct {
         if (std.mem.eql(u8, name, "printf")) {
             return self.printfExtern(arguments);
         }
+        // the std::io externs (section 5.4): C stdio names implemented over
+        // the host filesystem, so 'alloyc run' and the debugger execute the
+        // standard library unchanged
+        if (std.mem.eql(u8, name, "__acrt_iob_func")) {
+            if (arguments.len != 1) return self.fault("__acrt_iob_func expects one argument", .{});
+            // stream ids pass through: 1 is standard output, 2 standard error
+            return .{ .integer = .{ .value = try self.integerOf(arguments[0]), .primitive = .i64 } };
+        }
+        if (std.mem.eql(u8, name, "fopen")) return self.fopenExtern(arguments);
+        if (std.mem.eql(u8, name, "fclose")) return self.fcloseExtern(arguments);
+        if (std.mem.eql(u8, name, "fread")) return self.freadExtern(arguments);
+        if (std.mem.eql(u8, name, "fwrite")) return self.fwriteExtern(arguments);
+        if (std.mem.eql(u8, name, "fseek")) return self.fseekExtern(arguments);
+        if (std.mem.eql(u8, name, "ftell")) return self.ftellExtern(arguments);
         return self.fault("extern '{s}' is not available in the interpreter", .{name});
+    }
+
+    // handles: 1 and 2 are the standard streams, files count from 3
+    const first_file_handle: i128 = 3;
+
+    fn openFileOf(self: *Interpreter, handle: i128) Error!*OpenFile {
+        const index = handle - first_file_handle;
+        if (index < 0 or index >= self.open_files.items.len) {
+            return self.fault("use of an invalid file handle", .{});
+        }
+        const file = &self.open_files.items[@intCast(index)];
+        if (file.closed) return self.fault("use of a closed file handle", .{});
+        return file;
+    }
+
+    // C strings arriving from Alloy carry an explicit NUL terminator the
+    // wrappers appended; the interpreter reads up to it
+    fn cString(self: *Interpreter, value: Value) Error![]const u8 {
+        const bytes = try self.byteSlice(value);
+        const terminator = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+        return bytes[0..terminator];
+    }
+
+    fn fopenExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 2) return self.fault("fopen expects a path and a mode", .{});
+        const io = self.host_io orelse return self.fault("file io is unavailable here", .{});
+        const path = try self.arena.dupe(u8, try self.cString(arguments[0]));
+        const mode = try self.cString(arguments[1]);
+        const writing = std.mem.indexOfScalar(u8, mode, 'w') != null;
+        const failure: Value = .{ .integer = .{ .value = 0, .primitive = .i64 } };
+        var contents: []const u8 = &.{};
+        if (!writing) {
+            const max_size = 64 * 1024 * 1024;
+            contents = std.Io.Dir.cwd().readFileAlloc(io, path, self.arena, .limited(max_size)) catch return failure;
+        }
+        try self.open_files.append(self.arena, .{
+            .path = path,
+            .writing = writing,
+            .contents = contents,
+            .cursor = 0,
+            .write_buffer = .empty,
+            .closed = false,
+        });
+        const handle = first_file_handle + @as(i128, @intCast(self.open_files.items.len - 1));
+        return .{ .integer = .{ .value = handle, .primitive = .i64 } };
+    }
+
+    fn fcloseExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 1) return self.fault("fclose expects a stream", .{});
+        const file = try self.openFileOf(try self.integerOf(arguments[0]));
+        const success: Value = .{ .integer = .{ .value = 0, .primitive = .i32 } };
+        const failure: Value = .{ .integer = .{ .value = -1, .primitive = .i32 } };
+        file.closed = true;
+        if (file.writing) {
+            const io = self.host_io orelse return failure;
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file.path, .data = file.write_buffer.items }) catch return failure;
+        }
+        return success;
+    }
+
+    fn freadExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 4) return self.fault("fread expects a buffer, sizes, and a stream", .{});
+        const zero: Value = .{ .integer = .{ .value = 0, .primitive = .u64 } };
+        const instance = switch (arguments[0]) {
+            .slice => |instance| instance,
+            .array => |instance| instance,
+            .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+            else => return self.fault("fread needs a byte buffer", .{}),
+        };
+        const size = try self.integerOf(arguments[1]);
+        const count = try self.integerOf(arguments[2]);
+        const file = try self.openFileOf(try self.integerOf(arguments[3]));
+        if (size <= 0 or count <= 0 or file.writing) return zero;
+        const requested: usize = @intCast(size * count);
+        const remaining = file.contents.len - @min(file.cursor, file.contents.len);
+        const total = @min(requested, @min(remaining, instance.elements.len));
+        for (file.contents[file.cursor..][0..total], instance.elements[0..total]) |byte, *element| {
+            element.* = .{ .integer = .{ .value = byte, .primitive = .u8 } };
+        }
+        file.cursor += total;
+        return .{ .integer = .{ .value = @intCast(total / @as(usize, @intCast(size))), .primitive = .u64 } };
+    }
+
+    fn fwriteExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 4) return self.fault("fwrite expects a buffer, sizes, and a stream", .{});
+        const zero: Value = .{ .integer = .{ .value = 0, .primitive = .u64 } };
+        const bytes = try self.byteSlice(arguments[0]);
+        const size = try self.integerOf(arguments[1]);
+        const count = try self.integerOf(arguments[2]);
+        const stream = try self.integerOf(arguments[3]);
+        if (size <= 0 or count <= 0) return zero;
+        const total = @min(@as(usize, @intCast(size * count)), bytes.len);
+        // both standard streams share the interpreter's output writer
+        if (stream == 1 or stream == 2) {
+            try self.output.writeAll(bytes[0..total]);
+        } else {
+            const file = try self.openFileOf(stream);
+            if (!file.writing) return zero;
+            try file.write_buffer.appendSlice(self.arena, bytes[0..total]);
+        }
+        return .{ .integer = .{ .value = @intCast(total / @as(usize, @intCast(size))), .primitive = .u64 } };
+    }
+
+    fn fseekExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 3) return self.fault("fseek expects a stream, an offset, and an origin", .{});
+        const file = try self.openFileOf(try self.integerOf(arguments[0]));
+        const offset = try self.integerOf(arguments[1]);
+        const origin = try self.integerOf(arguments[2]);
+        const failure: Value = .{ .integer = .{ .value = -1, .primitive = .i32 } };
+        const base: i128 = switch (origin) {
+            0 => 0,
+            1 => @intCast(file.cursor),
+            2 => @intCast(file.contents.len),
+            else => return failure,
+        };
+        const target = base + offset;
+        if (target < 0 or target > file.contents.len) return failure;
+        file.cursor = @intCast(target);
+        return .{ .integer = .{ .value = 0, .primitive = .i32 } };
+    }
+
+    fn ftellExtern(self: *Interpreter, arguments: []const Value) Error!Value {
+        if (arguments.len != 1) return self.fault("ftell expects a stream", .{});
+        const file = try self.openFileOf(try self.integerOf(arguments[0]));
+        return .{ .integer = .{ .value = @intCast(file.cursor), .primitive = .i32 } };
     }
 
     fn printfExtern(self: *Interpreter, arguments: []const Value) Error!Value {
@@ -1591,7 +1993,9 @@ pub const Interpreter = struct {
         return bytes;
     }
 
-    fn evalIf(self: *Interpreter, if_expr: ast.IfExpression) Error!Value {
+    // a statement-position if passes 'yield' through to the enclosing
+    // value construct; only a value-position if consumes it (section 4.3)
+    fn evalIf(self: *Interpreter, if_expr: ast.IfExpression, as_value: bool) Error!Value {
         var taken = false;
 
         try self.pushFrame(false);
@@ -1603,19 +2007,21 @@ pub const Interpreter = struct {
             taken = condition == .bool_value and condition.bool_value;
         }
         if (taken) {
-            const flow = try self.execStatement(if_expr.then_branch);
+            const flow = if (as_value) try self.execYieldingBody(if_expr.then_branch) else try self.execStatement(if_expr.then_branch);
             self.popFrame();
             switch (flow) {
-                .break_value => |value| return value orelse .void_value,
+                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
+                .break_value => return self.flowBreak(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
         } else {
             self.popFrame();
             if (if_expr.else_branch) |else_branch| {
-                const flow = try self.execStatement(else_branch);
+                const flow = if (as_value) try self.execYieldingBody(else_branch) else try self.execStatement(else_branch);
                 switch (flow) {
-                    .break_value => |value| return value orelse .void_value,
+                    .yield_value => |value| return if (as_value) value else self.flowYield(flow),
+                    .break_value => return self.flowBreak(flow),
                     .return_value => return self.flowReturn(flow),
                     .normal => {},
                 }
@@ -1631,6 +2037,36 @@ pub const Interpreter = struct {
         return error.Return;
     }
 
+    // a 'break' inside an if or match unwinds to the enclosing loop
+    fn flowBreak(self: *Interpreter, flow: Flow) Error!Value {
+        self.pending_break = flow.break_value;
+        return error.Break;
+    }
+
+    // a 'yield' inside a loop unwinds to the enclosing if or match
+    fn flowYield(self: *Interpreter, flow: Flow) Error!Value {
+        self.pending_yield = flow.yield_value;
+        return error.Yield;
+    }
+
+    // a loop body: a nested if or match rethrew 'break' on the error
+    // channel; the loop is where it lands (section 4.3)
+    fn execLoopBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
+        return self.execStatement(statement) catch |err| switch (err) {
+            error.Break => .{ .break_value = self.pending_break },
+            else => err,
+        };
+    }
+
+    // an if or match body: a nested loop rethrew 'yield' on the error
+    // channel; the value construct is where it lands (section 4.3)
+    fn execYieldingBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
+        return self.execStatement(statement) catch |err| switch (err) {
+            error.Yield => .{ .yield_value = self.pending_yield },
+            else => err,
+        };
+    }
+
     fn bindIsCapture(self: *Interpreter, condition: *const ast.Expression, capture: ast.Capture) Error!bool {
         const unwrapped = unwrapGrouped(condition);
         if (unwrapped.* != .cast or unwrapped.cast.operator.tag != .keyword_is) return false;
@@ -1642,7 +2078,12 @@ pub const Interpreter = struct {
         // a downcast: the capture borrows the concrete value in place,
         // mirroring the subject's indirection (section 3.2)
         if (pierced.* == .struct_value) {
-            if (!std.mem.eql(u8, pierced.struct_value.type_name, target_name)) return false;
+            if (self.type_targets.get(unwrapped)) |target| {
+                const identity = pierced.struct_value.identity orelse return false;
+                if (identity.definition != target.definition) return false;
+            } else if (!std.mem.eql(u8, pierced.struct_value.type_name, target_name)) {
+                return false;
+            }
             try self.bind(capture.name.slice(self.source()), .{ .reference = pierced });
             return true;
         }
@@ -1706,17 +2147,22 @@ pub const Interpreter = struct {
         while (true) {
             const condition = try self.evalExpression(while_expr.condition);
             if (condition != .bool_value or !condition.bool_value) break;
-            const flow = try self.execStatement(while_expr.body);
+            const flow = try self.execLoopBody(while_expr.body);
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
+                .yield_value => return self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
         }
         if (while_expr.else_branch) |else_branch| {
-            const flow = try self.execStatement(else_branch);
-            if (flow == .break_value) return flow.break_value orelse .void_value;
-            if (flow == .return_value) return self.flowReturn(flow);
+            const flow = try self.execLoopBody(else_branch);
+            switch (flow) {
+                .break_value => |value| return value orelse .void_value,
+                .yield_value => return self.flowYield(flow),
+                .return_value => return self.flowReturn(flow),
+                .normal => {},
+            }
         }
         return .void_value;
     }
@@ -1747,13 +2193,16 @@ pub const Interpreter = struct {
             };
             if (pierced.* == .struct_value) {
                 const type_name = pierced.struct_value.type_name;
-                const iterator_symbol = self.findDispatchTarget(type_name, "iterator") orelse
+                const identity = pierced.struct_value.identity orelse
+                    return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 4.3)", .{type_name});
+                const iterator_symbol = self.findDispatchTarget(identity, "iterator") orelse
                     return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 4.3)", .{type_name});
                 const cursor_value = try self.callWithSelf(iterator_symbol, pierced);
                 const cursor_cell = try self.arena.create(Value);
                 cursor_cell.* = cursor_value;
                 const cursor_name = if (cursor_value == .struct_value) cursor_value.struct_value.type_name else "";
-                const next_symbol = self.findDispatchTarget(cursor_name, "next") orelse
+                const cursor_identity = if (cursor_value == .struct_value) cursor_value.struct_value.identity else null;
+                const next_symbol = (if (cursor_identity) |alive| self.findDispatchTarget(alive, "next") else null) orelse
                     return self.fault("the cursor '{s}' has no 'next()' extension (section 4.3)", .{cursor_name});
                 try subjects.append(self.arena, .{ .cursor = .{ .next_symbol = next_symbol, .cell = cursor_cell } });
                 continue;
@@ -1812,18 +2261,23 @@ pub const Interpreter = struct {
                     },
                 }
             }
-            const flow = try self.execStatement(for_expr.body);
+            const flow = try self.execLoopBody(for_expr.body);
             self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
+                .yield_value => return self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
         }
         if (for_expr.else_branch) |else_branch| {
-            const flow = try self.execStatement(else_branch);
-            if (flow == .break_value) return flow.break_value orelse .void_value;
-            if (flow == .return_value) return self.flowReturn(flow);
+            const flow = try self.execLoopBody(else_branch);
+            switch (flow) {
+                .break_value => |value| return value orelse .void_value,
+                .yield_value => return self.flowYield(flow),
+                .return_value => return self.flowReturn(flow),
+                .normal => {},
+            }
         }
         return .void_value;
     }
@@ -1858,7 +2312,8 @@ pub const Interpreter = struct {
         return .{ .start = start, .end = end };
     }
 
-    fn evalMatch(self: *Interpreter, match_expr: ast.MatchExpression) Error!Value {
+    // a statement-position match passes 'yield' through like an if
+    fn evalMatch(self: *Interpreter, match_expr: ast.MatchExpression, as_value: bool) Error!Value {
         const subject_place = try self.evalPlace(match_expr.subject);
         var subject_storage: Value = undefined;
         const subject: *Value = if (subject_place) |place| try self.pierceCell(place) else subject: {
@@ -1880,17 +2335,22 @@ pub const Interpreter = struct {
                     try self.bind(capture.name.slice(self.source()), .{ .reference = subject });
                 }
             }
-            const flow = try self.execStatement(arm.body);
+            const flow = if (as_value) try self.execYieldingBody(arm.body) else try self.execStatement(arm.body);
             self.popFrame();
             switch (flow) {
-                .break_value => |value| return value orelse .void_value,
+                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
+                .break_value => return self.flowBreak(flow),
                 .return_value => return self.flowReturn(flow),
-                // the arm completed without 'break': the external else runs
+                // the arm completed without 'yield': the external else runs
                 .normal => {
                     if (match_expr.else_branch) |else_branch| {
-                        const else_flow = try self.execStatement(else_branch);
-                        if (else_flow == .break_value) return else_flow.break_value orelse .void_value;
-                        if (else_flow == .return_value) return self.flowReturn(else_flow);
+                        const else_flow = if (as_value) try self.execYieldingBody(else_branch) else try self.execStatement(else_branch);
+                        switch (else_flow) {
+                            .yield_value => |value| return if (as_value) value else self.flowYield(else_flow),
+                            .break_value => return self.flowBreak(else_flow),
+                            .return_value => return self.flowReturn(else_flow),
+                            .normal => {},
+                        }
                     }
                     return .void_value;
                 },
@@ -1911,6 +2371,10 @@ pub const Interpreter = struct {
         }
         // an interface-object subject matches arms naming its concrete type
         if (subject.* == .struct_value and subject.struct_value.type_name.len != 0) {
+            if (self.type_targets.get(pattern)) |target| {
+                const identity = subject.struct_value.identity orelse return false;
+                return identity.definition == target.definition;
+            }
             const type_name = switch (unwrapped.*) {
                 .path => |path| path[path.len - 1].slice(self.source()),
                 else => return false,

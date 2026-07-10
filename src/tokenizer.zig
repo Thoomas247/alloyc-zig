@@ -72,6 +72,9 @@ pub const Token = struct {
         float_literal,
         string_literal,
         character_literal,
+        // emitted only when 'emit_comments' is set (the formatter)
+        line_comment,
+        block_comment,
 
         keyword_import,
         keyword_as,
@@ -88,6 +91,7 @@ pub const Token = struct {
         keyword_for,
         keyword_match,
         keyword_break,
+        keyword_yield,
         keyword_return,
         keyword_new,
         keyword_move,
@@ -163,6 +167,8 @@ pub const Token = struct {
                 .float_literal,
                 .string_literal,
                 .character_literal,
+                .line_comment,
+                .block_comment,
                 => null,
 
                 .keyword_import => "import",
@@ -180,6 +186,7 @@ pub const Token = struct {
                 .keyword_for => "for",
                 .keyword_match => "match",
                 .keyword_break => "break",
+                .keyword_yield => "yield",
                 .keyword_return => "return",
                 .keyword_new => "new",
                 .keyword_move => "move",
@@ -273,6 +280,7 @@ pub const Token = struct {
         .{ "for", .keyword_for },
         .{ "match", .keyword_match },
         .{ "break", .keyword_break },
+        .{ "yield", .keyword_yield },
         .{ "return", .keyword_return },
         .{ "new", .keyword_new },
         .{ "move", .keyword_move },
@@ -296,6 +304,8 @@ pub const Token = struct {
 pub const Tokenizer = struct {
     buffer: []const u8,
     index: usize,
+    // the formatter lexes with comments as tokens; the compiler does not
+    emit_comments: bool = false,
 
     pub fn init(buffer: []const u8) Tokenizer {
         // skip a UTF-8 byte order mark if present
@@ -306,7 +316,7 @@ pub const Tokenizer = struct {
     /// Returns the next token. After the end of input, repeatedly returns
     /// `.end_of_file` tokens with an empty location at `buffer.len`.
     pub fn next(self: *Tokenizer) Token {
-        self.skipTrivia() catch {
+        const comment = self.skipTrivia() catch {
             // the error token spans the comment opener up to the end of input
             const token: Token = .{
                 .tag = .unterminated_block_comment,
@@ -315,6 +325,7 @@ pub const Tokenizer = struct {
             self.index = self.buffer.len;
             return token;
         };
+        if (comment) |token| return token;
 
         const start = self.index;
         if (start >= self.buffer.len) {
@@ -404,25 +415,37 @@ pub const Tokenizer = struct {
 
     const TriviaError = error{UnterminatedBlockComment};
 
-    /// Skips whitespace and comments (section 1.2). On an unterminated block
-    /// comment, leaves `index` at the offending `/*` opener and errors.
-    fn skipTrivia(self: *Tokenizer) TriviaError!void {
+    /// Skips whitespace and comments (section 1.2), returning the comment
+    /// as a token instead when 'emit_comments' is set. On an unterminated
+    /// block comment, leaves `index` at the offending `/*` opener and errors.
+    fn skipTrivia(self: *Tokenizer) TriviaError!?Token {
         while (self.index < self.buffer.len) {
             switch (self.buffer[self.index]) {
                 ' ', '\t', '\n', '\r', 0x0B, 0x0C => self.index += 1,
                 '/' => switch (self.peekAt(1) orelse 0) {
                     '/' => {
+                        const start = self.index;
                         self.index += 2;
                         while (self.index < self.buffer.len and self.buffer[self.index] != '\n') {
                             self.index += 1;
                         }
+                        if (self.emit_comments) {
+                            return .{ .tag = .line_comment, .location = .{ .start = start, .end = self.index } };
+                        }
                     },
-                    '*' => try self.skipBlockComment(),
-                    else => return,
+                    '*' => {
+                        const start = self.index;
+                        try self.skipBlockComment();
+                        if (self.emit_comments) {
+                            return .{ .tag = .block_comment, .location = .{ .start = start, .end = self.index } };
+                        }
+                    },
+                    else => return null,
                 },
-                else => return,
+                else => return null,
             }
         }
+        return null;
     }
 
     fn skipBlockComment(self: *Tokenizer) TriviaError!void {

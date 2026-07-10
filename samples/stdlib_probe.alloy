@@ -1,0 +1,56 @@
+// exercises the standard library end to end: vectors, strings, io, and
+// process arguments; run from the repository root so std/ resolves
+import std::option;
+import std::vector;
+import std::string;
+import std::io;
+import std::process;
+
+fn main() -> i64 {
+    var numbers: Vector<i64> = empty_vector<i64>();
+    numbers.push(10);
+    numbers.push(20);
+    numbers.push(30);
+    numbers.push(40);
+    numbers.pop();
+
+    var total: i64 = 0;
+    for (numbers) |value| {
+        total += value;
+    }
+
+    var report = empty_string();
+    report.append("total=");
+    report.append_integer(total);
+    report.append(" count=");
+    report.append_integer(numbers.length() to i64);
+    print_line(report.view());
+
+    const argument_count = arguments().length();
+    var argument_report = empty_string();
+    argument_report.append("arguments=");
+    argument_report.append_integer(argument_count to i64);
+    print_line(argument_report.view());
+
+    write_file("stdlib_probe_scratch.txt", report.view());
+    const loaded = read_file("stdlib_probe_scratch.txt");
+    if (loaded is ::Some) |contents: &| {
+        if (text_equals(&contents, report.view())) {
+            print_line("round trip ok");
+        } else {
+            print_error_line("round trip mismatch");
+            return 1;
+        }
+    } else {
+        print_error_line("round trip failed to read");
+        return 1;
+    }
+
+    const missing = read_file("no_such_file_here.txt");
+    if (missing.is_some()) {
+        print_error_line("missing file unexpectedly opened");
+        return 1;
+    }
+
+    return total % 100;
+}
