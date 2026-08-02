@@ -437,7 +437,11 @@ pub const Server = struct {
             unit.deinit();
             self.gpa.destroy(unit);
         }
-        _ = try unit.addModule(path, document.text);
+        // the unit outlives this message and the document buffer it came
+        // from (an edit frees the old text), so it owns its entry module
+        const owned_path = try unit.arena.allocator().dupe(u8, path);
+        const owned_source = try unit.arena.allocator().dupe(u8, document.text);
+        _ = try unit.addModule(owned_path, owned_source);
 
         var loader_context: LoaderContext = .{
             .server = self,
@@ -1663,6 +1667,56 @@ test "the server answers references, rename, symbols, tokens, help, and hover" {
     try std.testing.expect(std.mem.indexOf(u8, transcript, "total: i64") != null);
     // the incremental change re-ran the pipeline and found the new error
     try std.testing.expect(std.mem.indexOf(u8, transcript, "use of undeclared identifier 'missing'") != null);
+}
+
+test "the outline survives an edit that fails to parse" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/outline.alloy";
+    const source = "fn helper() -> i64 { return 1; }\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = source } },
+        }, .{}),
+        // typing a half-written definition: the parse never reaches the
+        // merge, so the previous analysis stays in service
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri, .version = 2 },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = source ++ "fn probe(" }},
+            },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/documentSymbol",
+            .params = .{ .textDocument = .{ .uri = uri } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    // the stale analysis must still own its source: a borrowed document
+    // buffer is freed by the edit and the name comes back as garbage
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"id\":2,\"result\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"name\":\"helper\"") != null);
 }
 
 test "words extract around a cursor" {
