@@ -90,9 +90,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // the standard library ships next to the compiler (section 5.4): the
-    // executable-directory search base finds it from any working directory
+    // executable-directory search base finds it from any working directory.
+    // its sources live in the spec submodule, shared with the self-hosted
+    // implementation
     b.installDirectory(.{
-        .source_dir = b.path("std"),
+        .source_dir = b.path("spec/std"),
         .install_dir = .bin,
         .install_subdir = "std",
     });
