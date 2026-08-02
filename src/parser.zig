@@ -720,7 +720,8 @@ pub const Parser = struct {
                 _ = try self.expect(.parenthesis_right, "')'");
                 return self.create(ast.Expression, .{ .grouped = inner });
             },
-            .pipe, .pipe_pipe => {
+            .pipe_pipe => return self.fail(token, "a lambda with no captures omits the capture list entirely: drop the '||'", .{}),
+            .pipe => {
                 const captures = try self.parseCaptureList();
                 const function = try self.parseFunction();
                 return self.create(ast.Expression, .{ .lambda = .{ .captures = captures, .function = function } });
@@ -896,7 +897,6 @@ pub const Parser = struct {
     }
 
     fn parseCaptureList(self: *Parser) Error![]const ast.Capture {
-        if (self.match(.pipe_pipe) != null) return &.{};
         _ = try self.expect(.pipe, "'|'");
         var captures: std.ArrayList(ast.Capture) = .empty;
         while (true) {
@@ -1232,7 +1232,7 @@ test "lambda forms and capture annotations" {
         \\fn f() {
         \\    const doubler = |x: &var, y: &u32, z: *var| (a: i64) -> i64 { return a; };
         \\    const plain = (b: i64) { use(b); };
-        \\    const empty = || () { run(); };
+        \\    const empty = () { run(); };
         \\    var grouped = (a + b);
         \\}
     ;
@@ -1313,6 +1313,18 @@ test "missing semicolon fails with a clear message" {
     var parser = Parser.init(arena.allocator(), source, tokens.items);
     try testing.expectError(error.ParseError, parser.parseModule());
     try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "expected ';'") != null);
+}
+
+test "an empty capture list fails with the omitted form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = "fn f() { const empty = || () { run(); }; }";
+    var tokenizer = tokenizer_module.Tokenizer.init(source);
+    var tokens: std.ArrayList(Token) = .empty;
+    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+    var parser = Parser.init(arena.allocator(), source, tokens.items);
+    try testing.expectError(error.ParseError, parser.parseModule());
+    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "drop the '||'") != null);
 }
 
 test "a modifier before a capture name fails with the annotated form" {
