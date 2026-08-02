@@ -1,0 +1,3 @@
+[submodule "spec"]
+	path = spec
+	url = C:/Dev/zig/alloy-spec
