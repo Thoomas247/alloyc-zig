@@ -908,11 +908,16 @@ pub const Parser = struct {
     }
 
     fn parseCapture(self: *Parser) Error!ast.Capture {
-        // prefix-modifier form: '|&var x|'
+        // a modifier ahead of the name is the retired prefix form: captures
+        // annotate after the name, like every other binding (section 2.1)
         if (self.current().tag == .asterisk or self.current().tag == .ampersand) {
+            const token = self.current();
             const modifier = self.parseTypeModifier().?;
-            const name = try self.expect(.identifier, "a capture name");
-            return .{ .modifier = modifier, .name = name, .annotation = null };
+            if (self.current().tag == .identifier) {
+                const name = self.current().slice(self.source);
+                return self.fail(token, "a capture is annotated after its name: write '|{s}: {s}|'", .{ name, modifier.lexeme() });
+            }
+            return self.fail(token, "expected a capture name, found {s}", .{try self.describe(token)});
         }
         const name = try self.expect(.identifier, "a capture name");
         if (self.match(.colon) == null) {
@@ -1225,7 +1230,7 @@ test "lambda forms and capture annotations" {
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    const doubler = |&var x, y: &u32, *var z| (a: i64) -> i64 { return a; };
+        \\    const doubler = |x: &var, y: &u32, z: *var| (a: i64) -> i64 { return a; };
         \\    const plain = (b: i64) { use(b); };
         \\    const empty = || () { run(); };
         \\    var grouped = (a + b);
@@ -1308,6 +1313,18 @@ test "missing semicolon fails with a clear message" {
     var parser = Parser.init(arena.allocator(), source, tokens.items);
     try testing.expectError(error.ParseError, parser.parseModule());
     try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "expected ';'") != null);
+}
+
+test "a modifier before a capture name fails with the annotated form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = "fn f() { const doubler = |&var x| (a: i64) -> i64 { return a; }; }";
+    var tokenizer = tokenizer_module.Tokenizer.init(source);
+    var tokens: std.ArrayList(Token) = .empty;
+    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+    var parser = Parser.init(arena.allocator(), source, tokens.items);
+    try testing.expectError(error.ParseError, parser.parseModule());
+    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "'|x: &var|'") != null);
 }
 
 test "extern, interface, and macro definitions" {

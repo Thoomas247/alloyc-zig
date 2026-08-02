@@ -101,7 +101,22 @@ pub const MacroDef = struct {
     body: *const Statement,
 };
 
-pub const TypeModifier = enum { pointer, pointer_var, reference, reference_var };
+pub const TypeModifier = enum {
+    pointer,
+    pointer_var,
+    reference,
+    reference_var,
+
+    // the source spelling, for diagnostics
+    pub fn lexeme(modifier: TypeModifier) []const u8 {
+        return switch (modifier) {
+            .pointer => "*",
+            .pointer_var => "*var",
+            .reference => "&",
+            .reference_var => "&var",
+        };
+    }
+};
 
 pub const TypeExpression = union(enum) {
     modified: struct { modifier: TypeModifier, child: *const TypeExpression },

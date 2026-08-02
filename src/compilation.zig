@@ -731,7 +731,7 @@ test "the interpreter runs lambdas with captured environments" {
         \\    var base = 10;
         \\    const add_base = |base| (x: i32) -> i32 { return base + x; };
         \\    var counter = 0;
-        \\    const bump = |&var counter| (amount: i32) { counter += amount; };
+        \\    const bump = |counter: &var| (amount: i32) { counter += amount; };
         \\    bump(3);
         \\    bump(4);
         \\    base = 100;
@@ -742,7 +742,7 @@ test "the interpreter runs lambdas with captured environments" {
         \\type Box = struct { value: i32 };
         \\fn main() -> i32 {
         \\    var p: *var Box = new Box { .value = 5 };
-        \\    const get = |*p| () -> i32 { return p.value; };
+        \\    const get = |p: *| () -> i32 { return p.value; };
         \\    return get() + p.value;
         \\}
     , &.{"use of 'p' after 'move' (section 4.2)"});
@@ -2900,10 +2900,10 @@ test "native executables run closures and function values" {
         \\    box.p = new 1;
         \\    total += peek();
         \\    var owned: *var i64 = new 9;
-        \\    const eat = |*owned| () -> i64 { return owned; };
+        \\    const eat = |owned: *| () -> i64 { return owned; };
         \\    total += eat();
         \\    total += eat();
-        \\    const counter = Counter { .step = |&total| (n: i64) -> i64 { return total + n; } };
+        \\    const counter = Counter { .step = |total: &| (n: i64) -> i64 { return total + n; } };
         \\    total += counter.step(1);
         \\    total += ((x: i64) -> i64 { return x + 100; })(0);
         \\    var f: (i64) -> i64 = (x: i64) -> i64 { return x + 1; };
@@ -2960,7 +2960,7 @@ test "native executables monomorphize lambdas inside generics" {
         \\    var index = 0;
         \\    while (index < 3) {
         \\        var boxed: *var i64 = new (index to i64);
-        \\        const grab = |*boxed| () -> i64 { return boxed; };
+        \\        const grab = |boxed: *| () -> i64 { return boxed; };
         \\        total += grab();
         \\        index += 1;
         \\    }
@@ -3226,7 +3226,7 @@ test "native executables fill, move, and receive closures soundly" {
         \\    var second: *Critter = move pet;
         \\    total += second.legs();
         \\    var third: *Critter = new Spider { .hairs = new 7 };
-        \\    const kill = |*third| () -> i64 { return third.legs(); };
+        \\    const kill = |third: *| () -> i64 { return third.legs(); };
         \\    total += kill();
         \\    var holders = [Holder { .callback = (x: i64) -> i64 { return x + 1; } }];
         \\    total += holders[pick()].callback(4);
