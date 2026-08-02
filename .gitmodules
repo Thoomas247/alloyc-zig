@@ -1,3 +1,3 @@
 [submodule "spec"]
 	path = spec
-	url = C:/Dev/zig/alloy-spec
+	url = https://github.com/Thoomas247/alloy-spec
