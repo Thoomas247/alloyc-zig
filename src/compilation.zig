@@ -1352,6 +1352,17 @@ test "macro bodies never surface checker diagnostics" {
     );
 }
 
+test "a same-named associated function hints at the extension form" {
+    try expectCheckErrors(
+        \\interface Serializable {
+        \\    fn to_string() -> &[u8];
+        \\}
+        \\type Token : Serializable = struct { value: i64 };
+        \\pub fn Token::to_string() -> &[u8] { return ""; }
+        \\fn main() -> i32 { return 0; }
+    , &.{"'Token::to_string' is an associated function, not an extension"});
+}
+
 test "a faulting type initializer is diagnosed even when unused" {
     // the macro yields void, not a '#Type'; the type is never used, but
     // the declaration still evaluates and reports

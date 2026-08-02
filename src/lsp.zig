@@ -688,6 +688,26 @@ pub const Server = struct {
         const receiver = wordAt(location.text, dot_offset -| 1) orelse return;
         const view = unit.views[view_index];
 
+        // '#TypeName.' reflects the type (section 3.4): the receiver needs
+        // no prior typed use, the name and the leading '#' are enough
+        var word_start = dot_offset;
+        while (word_start > 0 and isIdentifierByte(location.text[word_start - 1])) word_start -= 1;
+        if (word_start > 0 and location.text[word_start - 1] == '#') {
+            const names_type = for (self.symbols.items) |symbol| {
+                if (!std.mem.eql(u8, symbol.name, receiver)) continue;
+                switch (symbol.definition.kind) {
+                    .type_def, .interface_def => break true,
+                    else => {},
+                }
+            } else false;
+            if (names_type) {
+                for (type_description_completions) |method| {
+                    try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
+                }
+                return;
+            }
+        }
+
         var paths: std.ArrayList(*const ast.Expression) = .empty;
         try collectPathExpressions(arena, view.module, &paths);
         var best: ?*const ast.Expression = null;
@@ -1920,6 +1940,62 @@ test "declaration sites hover and locals classify as semantic tokens" {
     // 'helper' classifies as function (0), 'value' as parameter (5), then
     // 'total' and the following uses as variable (4) / parameter (5)
     try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,3,6,0,0,0,7,5,5,0,1,8,5,4,0,0,13,5,5,0,1,11,5,4,0]") != null);
+}
+
+test "a '#TypeName.' receiver completes the reflection methods" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/reflect_completion.alloy";
+    const good =
+        "type Point = struct { x: i32 };\n" ++
+        "fn main() -> i32 { return 0; }\n";
+    // typing '#Point.' mid-edit: no prior typed use of 'Point' exists,
+    // the '#' plus the type name alone must be enough
+    const typing =
+        "type Point = struct { x: i32 };\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const t = #Point.\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = good } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri, .version = 2 },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = typing }},
+            },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/completion",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 2, .character = 21 } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"label\":\"member_names\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"label\":\"add_member\"") != null);
 }
 
 test "hover on a call resolves the checked target, not the first name" {

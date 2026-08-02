@@ -406,11 +406,32 @@ pub const Checker = struct {
         for (interface_def.functions) |function| {
             switch (try self.findSatisfyingExtension(concrete, interface, function)) {
                 .satisfied => {},
-                .missing => try self.report(span, "'{s}' does not implement '{s}': no extension function '{s}' is visible (section 5.2)", .{
-                    concrete.declared.name,
-                    interface.name,
-                    function.name.slice(interface_source),
-                }),
+                .missing => {
+                    const function_name = function.name.slice(interface_source);
+                    // a same-named ASSOCIATED function is the classic slip:
+                    // 'fn Token::to_string()' has no receiver, so it cannot
+                    // back interface dispatch - name the fix
+                    const associated = for (self.unit.associated) |entry| {
+                        if (entry.type_definition == concrete.declared.definition and
+                            std.mem.eql(u8, entry.name, function_name)) break true;
+                    } else false;
+                    if (associated) {
+                        try self.report(span, "'{s}' does not implement '{s}': '{s}::{s}' is an associated function, not an extension; an interface function takes a 'self' receiver ('fn {s}(self value: &{s}, ...)', section 4.5)", .{
+                            concrete.declared.name,
+                            interface.name,
+                            concrete.declared.name,
+                            function_name,
+                            function_name,
+                            concrete.declared.name,
+                        });
+                    } else {
+                        try self.report(span, "'{s}' does not implement '{s}': no extension function '{s}' is visible (section 5.2)", .{
+                            concrete.declared.name,
+                            interface.name,
+                            function_name,
+                        });
+                    }
+                },
                 .mismatched => try self.report(span, "the extension '{s}' for '{s}' does not match the signature declared by '{s}' (section 5.2)", .{
                     function.name.slice(interface_source),
                     concrete.declared.name,
@@ -1632,9 +1653,11 @@ pub const Checker = struct {
                 // a copy of the pointee (section 4.2)
                 return self.pierce(binding.binding_type);
             }
-            // '#T' reflects a type (section 3.4): typed for the tooling
-            // pass so '#Point.' completes the '#Type' methods
-            if (self.tooling_only and self.comptime_depth > 0) {
+            // '#T' reflects a type (section 3.4): typed as '#Type' inside
+            // any comptime context so hover and '#Point.' completion work;
+            // evaluation substitutes the outer expression, so the recorded
+            // inner type never reaches codegen
+            if (self.comptime_depth > 0) {
                 if (primitiveByName(name) != null) return self.makeType(.type_description);
                 if (self.firstVisible(name, self.current_view)) |symbol| {
                     switch (symbol.definition.kind) {
