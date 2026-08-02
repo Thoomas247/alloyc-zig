@@ -2702,7 +2702,7 @@ pub const Checker = struct {
             if (symbol.definition.kind != .fn_def) continue;
             const fn_def = symbol.definition.kind.fn_def;
             if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
-            if (try self.tryCandidate(symbol, empty_call, &.{}, receiver)) |candidate| {
+            if (try self.tryCandidate(symbol, empty_call, &.{}, receiver, null)) |candidate| {
                 result = .{
                     .symbol = symbol,
                     .return_type = candidate.return_type,
@@ -2948,6 +2948,32 @@ pub const Checker = struct {
         }
     }
 
+    // the functions of a type's namespace matching 'prefix::Type::name':
+    // null when the path names no visible type or the type has no such
+    // function, letting ordinary path resolution continue
+    fn associatedSymbols(self: *Checker, path: []const Token) Error!?resolution.SymbolList {
+        const type_name = path[path.len - 2].slice(self.source());
+        const qualifier: Qualifier = if (path.len == 2)
+            .unqualified
+        else
+            try self.qualifierOf(path[0 .. path.len - 2], self.current_view);
+        const type_symbols = try self.visibleSymbols(type_name, qualifier, self.current_view);
+        const type_symbol = for (type_symbols.items) |candidate| {
+            if (candidate.definition.kind == .type_def) break candidate;
+        } else return null;
+        const fn_name = path[path.len - 1].slice(self.source());
+        var result: resolution.SymbolList = .empty;
+        for (self.unit.associated) |entry| {
+            if (entry.type_definition != type_symbol.definition) continue;
+            if (!std.mem.eql(u8, entry.name, fn_name)) continue;
+            // callable when unqualified-visible or exported (section 5.4)
+            if (!self.visibleFrom(self.current_view, entry.symbol) and entry.symbol.visibility != .exported) continue;
+            try result.append(self.arena, entry.symbol);
+        }
+        if (result.items.len == 0) return null;
+        return result;
+    }
+
     fn checkCall(self: *Checker, expression: *const ast.Expression, expected: ?*const Type) Error!*const Type {
         const call = expression.call;
         const callee = unwrapGrouped(call.callee);
@@ -2977,6 +3003,15 @@ pub const Checker = struct {
                     return &unknown_type;
                 }
             }
+            // 'Type::name(...)': a function living in the type's namespace
+            // (section 5.4); checked before variant construction because
+            // the resolver forbids a name shared with a variant, and the
+            // variant path reports on any unknown name
+            if (path.len >= 2) {
+                if (try self.associatedSymbols(path)) |associated| {
+                    return self.callOverloads(name, associated, call, expression, path[0].location, expected);
+                }
+            }
             // enum variant construction: 'Holder::Boxed(value)'
             if (try self.variantOfPath(path)) |variant| {
                 return self.callVariantConstructor(variant, call, expected, path[path.len - 1].location);
@@ -2984,7 +3019,7 @@ pub const Checker = struct {
             const qualifier = try self.qualifierOf(path[0 .. path.len - 1], self.current_view);
             const symbols = try self.visibleSymbols(name, qualifier, self.current_view);
             if (symbols.items.len != 0) {
-                return self.callOverloads(name, symbols, call, expression, path[0].location);
+                return self.callOverloads(name, symbols, call, expression, path[0].location, expected);
             }
             return &unknown_type;
         }
@@ -3808,7 +3843,7 @@ pub const Checker = struct {
         }
     }
 
-    fn callOverloads(self: *Checker, name: []const u8, symbols: resolution.SymbolList, call: anytype, target_key: ?*const ast.Expression, span: Token.Location) Error!*const Type {
+    fn callOverloads(self: *Checker, name: []const u8, symbols: resolution.SymbolList, call: anytype, target_key: ?*const ast.Expression, span: Token.Location, expected: ?*const Type) Error!*const Type {
         const Candidate = struct {
             symbol: resolution.Symbol,
             return_type: *const Type,
@@ -3857,7 +3892,7 @@ pub const Checker = struct {
                     return &unknown_type;
                 },
             }
-            if (try self.tryCandidate(symbol, call, argument_types.items, null)) |result| {
+            if (try self.tryCandidate(symbol, call, argument_types.items, null, expected)) |result| {
                 try viable.append(self.arena, .{
                     .symbol = symbol,
                     .return_type = result.return_type,
@@ -3934,7 +3969,7 @@ pub const Checker = struct {
             const fn_def = symbol.definition.kind.fn_def;
             if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
             extension_count += 1;
-            if (try self.tryCandidate(symbol, call, argument_types.items, receiver)) |result| {
+            if (try self.tryCandidate(symbol, call, argument_types.items, receiver, null)) |result| {
                 try viable.append(self.arena, .{
                     .symbol = symbol,
                     .return_type = result.return_type,
@@ -4046,7 +4081,7 @@ pub const Checker = struct {
     // checks one overload candidate: arity, generic inference by unification
     // (section 3.7), then per-argument compatibility (section 3.3); a
     // non-null receiver consumes the leading 'self' parameter (section 4.5)
-    fn tryCandidate(self: *Checker, symbol: resolution.Symbol, call: anytype, argument_types: []const *const Type, receiver: ?MethodReceiver) Error!?CandidateResult {
+    fn tryCandidate(self: *Checker, symbol: resolution.Symbol, call: anytype, argument_types: []const *const Type, receiver: ?MethodReceiver, expected: ?*const Type) Error!?CandidateResult {
         var parameters: []const ast.Parameter = undefined;
         var variadic = false;
         var type_parameters: []const ast.TypeParameter = &.{};
@@ -4098,6 +4133,15 @@ pub const Checker = struct {
             }
             const constraint = self.interfaceOfConstraint(type_parameter.constraint, symbol.view_index);
             try placeholders.put(self.arena, parameter_name, try self.makeType(.{ .type_parameter = .{ .name = parameter_name, .constraint = constraint } }));
+        }
+
+        // the contextual expected type binds type parameters through the
+        // declared return type first ('var v: Vector<u8> = Vector::empty()'),
+        // exactly like generic variant construction; arguments then unify
+        // against (and may coerce to) those bindings (section 3.7)
+        if (expected != null and return_expression != null) {
+            const declared_return = try self.typeFromExpressionIn(return_expression.?, &placeholders, symbol.view_index);
+            _ = try self.unifyParameter(declared_return, expected.?, environment);
         }
 
         var exact = true;

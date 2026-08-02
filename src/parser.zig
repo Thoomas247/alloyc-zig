@@ -122,10 +122,16 @@ pub const Parser = struct {
 
     fn parseFnDef(self: *Parser) Error!ast.FnDef {
         _ = try self.expect(.keyword_fn, "'fn'");
-        const name = try self.expect(.identifier, "a function name");
+        var qualifier: ?Token = null;
+        var name = try self.expect(.identifier, "a function name");
+        // 'fn Vector::empty(...)' defines into the type's namespace
+        if (self.match(.colon_colon) != null) {
+            qualifier = name;
+            name = try self.expect(.identifier, "a function name");
+        }
         const type_parameters = try self.parseTypeParameters();
         const function = try self.parseFunction();
-        return .{ .name = name, .type_parameters = type_parameters, .function = function };
+        return .{ .qualifier = qualifier, .name = name, .type_parameters = type_parameters, .function = function };
     }
 
     fn parseExternDef(self: *Parser) Error!ast.ExternDef {

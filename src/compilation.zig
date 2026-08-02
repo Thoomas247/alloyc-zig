@@ -3358,3 +3358,39 @@ test "the interpreter serves process arguments through the lang item" {
     try std.testing.expectEqualStrings("program.alloy\nalpha\nbeta\n", output.writer.buffered());
     try std.testing.expectEqual(@as(i64, 3), exit_code);
 }
+
+test "qualified functions live in their type's namespace" {
+    var sources = TestSources.initComptime(.{
+        .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+    });
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy",
+        \\import std::option;
+        \\type Point = struct { x: i64, y: i64 };
+        \\fn Point::at(x: i64, y: i64) -> Point {
+        \\    return Point { .x = x, .y = y };
+        \\}
+        \\fn Option::flag<T>(condition: bool, value: T) -> Option<T> {
+        \\    if (condition) {
+        \\        return ::Some(value);
+        \\    }
+        \\    return ::None;
+        \\}
+        \\fn main() -> i64 {
+        \\    const moved = Point::at(3, 4);
+        \\    var chosen: Option<i64> = Option::flag(true, 5);
+        \\    var fallback: i64 = 0;
+        \\    if (chosen is ::Some) |value| {
+        \\        fallback = value;
+        \\    }
+        \\    return moved.x + moved.y + fallback;
+        \\}
+    );
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 12), exit_code);
+}

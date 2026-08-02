@@ -45,6 +45,12 @@ pub const Server = struct {
     analysis_arena: std.heap.ArenaAllocator,
     message_arena: std.heap.ArenaAllocator,
     shutdown_requested: bool = false,
+    // extra directories searched for std/ imports (the executable's
+    // directory, $ALLOY_STDLIB) after the document's own tree
+    search_bases: []const []const u8 = &.{},
+    // import-relative view paths to the absolute file the loader found,
+    // so navigation targets open the real file; reset per analysis
+    resolved_paths: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     const Document = struct {
         uri: []const u8,
@@ -85,6 +91,12 @@ pub const Server = struct {
         while (published.next()) |key| self.gpa.free(key.*);
         self.published.deinit(self.gpa);
         self.symbols.deinit(self.gpa);
+        var resolved = self.resolved_paths.iterator();
+        while (resolved.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
+        }
+        self.resolved_paths.deinit(self.gpa);
         self.dropAnalysis();
         self.analysis_arena.deinit();
         self.message_arena.deinit();
@@ -344,20 +356,65 @@ pub const Server = struct {
     const LoaderContext = struct {
         server: *Server,
         base_directory: []const u8,
+
+        // one probe of base/relative: open buffers shadow the disk; a hit
+        // records where the import-relative path actually lives
+        fn readFromBase(loader: *LoaderContext, allocator: std.mem.Allocator, base: []const u8, relative: []const u8) anyerror!?[]const u8 {
+            const absolute = try joinNormalized(allocator, base, relative);
+            const source: ?[]const u8 = if (loader.server.documents.get(absolute)) |open_document|
+                try allocator.dupe(u8, open_document.text)
+            else
+                Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(10 * 1024 * 1024)) catch null;
+            if (source != null) try loader.server.recordResolvedPath(relative, absolute);
+            return source;
+        }
     };
 
+    fn recordResolvedPath(self: *Server, relative: []const u8, absolute: []const u8) !void {
+        const entry = try self.resolved_paths.getOrPut(self.gpa, relative);
+        if (entry.found_existing) {
+            self.gpa.free(entry.value_ptr.*);
+        } else {
+            entry.key_ptr.* = try self.gpa.dupe(u8, relative);
+        }
+        entry.value_ptr.* = try self.gpa.dupe(u8, absolute);
+    }
+
+    // view paths of imported modules are import-relative; navigation and
+    // diagnostics point at the absolute file the loader found
+    fn uriOfViewPath(self: *Server, allocator: std.mem.Allocator, view_path: []const u8) ![]const u8 {
+        const resolved = self.resolved_paths.get(view_path) orelse view_path;
+        return uriFromPath(allocator, resolved);
+    }
+
+    // the parent of a normalized directory path, null at a root
+    fn parentDirectory(directory: []const u8) ?[]const u8 {
+        if (directory.len == 0) return null;
+        const separator = std.mem.lastIndexOfScalar(u8, directory, '/') orelse return null;
+        if (separator == 0) return null;
+        // stop at a drive root ('c:')
+        if (separator == 2 and directory[1] == ':') return null;
+        return directory[0..separator];
+    }
+
     // imports resolve next to the entry document; open editor buffers
-    // shadow the file system
+    // shadow the file system. std/ imports additionally search the
+    // document's ancestor directories (finding a project's std/ from any
+    // subfolder), then the configured search bases (section 5.4)
     fn loadModuleSource(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
         const loader: *LoaderContext = @ptrCast(@alignCast(context.?));
-        const absolute = try joinNormalized(allocator, loader.base_directory, file_path);
-        if (loader.server.documents.get(absolute)) |open_document| {
-            return try allocator.dupe(u8, open_document.text);
+        if (try loader.readFromBase(allocator, loader.base_directory, file_path)) |source| return source;
+        if (!std.mem.startsWith(u8, file_path, "std/")) return null;
+        var ancestor = loader.base_directory;
+        var levels: usize = 0;
+        while (levels < 12) : (levels += 1) {
+            ancestor = parentDirectory(ancestor) orelse break;
+            if (try loader.readFromBase(allocator, ancestor, file_path)) |source| return source;
         }
-        return Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => null,
-        };
+        for (loader.server.search_bases) |base| {
+            if (try loader.readFromBase(allocator, base, file_path)) |source| return source;
+        }
+        return null;
     }
 
     fn loadPackageBytes(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
@@ -444,7 +501,7 @@ pub const Server = struct {
             const uri = if (std.mem.eql(u8, entry.key_ptr.*, self.pathOfUri(entry_document.uri) orelse ""))
                 entry_document.uri
             else
-                try uriFromPath(arena, entry.key_ptr.*);
+                try self.uriOfViewPath(arena, entry.key_ptr.*);
             try self.notify("textDocument/publishDiagnostics", .{
                 .uri = uri,
                 .diagnostics = entry.value_ptr.items,
@@ -491,7 +548,7 @@ pub const Server = struct {
                 const name_token = definitionName(module_definition);
                 try self.symbols.append(self.gpa, .{
                     .name = try arena.dupe(u8, name_token.slice(view.source)),
-                    .detail = try arena.dupe(u8, declarationLine(view.source, name_token.location.start)),
+                    .detail = try arena.dupe(u8, definitionDetail(view.source, name_token.location.start, module_definition)),
                     .completion_kind = switch (module_definition.kind) {
                         .fn_def, .extern_def => 3,
                         .type_def => 7,
@@ -500,7 +557,7 @@ pub const Server = struct {
                     },
                     .definition = module_definition,
                     .view_index = view_index,
-                    .uri = try uriFromPath(arena, view.path),
+                    .uri = try self.uriOfViewPath(arena, view.path),
                     .range = .{
                         .start = positionOf(view.source, name_token.location.start),
                         .end = positionOf(view.source, name_token.location.end),
@@ -739,6 +796,10 @@ pub const Server = struct {
         if (try self.collectLocalOccurrences(arena, params)) |locations| {
             if (locations.len != 0) return self.respond(id, locations[0]);
         }
+        // a '::'-qualified or implied enum variant navigates to the member
+        if (try self.enumMemberDefinition(arena, params)) |member_location| {
+            return self.respond(id, member_location);
+        }
         const word = self.wordAtRequestPosition(params) orelse return self.respond(id, null);
         for (self.symbols.items) |symbol| {
             if (!std.mem.eql(u8, symbol.name, word)) continue;
@@ -748,6 +809,56 @@ pub const Server = struct {
             });
         }
         try self.respond(id, null);
+    }
+
+    // the cursor sits on a variant name written '::Variant' (implied) or
+    // 'Enum::Variant'; the target is the enum member's declaration. A
+    // module-qualified path ('option::Option') finds no type named by its
+    // qualifier and falls through to the global symbol lookup
+    fn enumMemberDefinition(self: *Server, arena: std.mem.Allocator, params: std.json.Value) !?LspLocation {
+        const location = self.requestLocation(params) orelse return null;
+        _ = (self.viewIndexOfPath(location.path) catch null) orelse return null;
+        const unit = self.analysis orelse return null;
+        const word = wordAt(location.text, location.offset) orelse return null;
+        const word_start = @intFromPtr(word.ptr) - @intFromPtr(location.text.ptr);
+        if (word_start < 2 or location.text[word_start - 1] != ':' or location.text[word_start - 2] != ':') return null;
+        // a qualifier must touch the '::' directly; an implied variant
+        // ('is ::Some') has none
+        var qualifier: ?[]const u8 = null;
+        if (word_start >= 3 and isIdentifierByte(location.text[word_start - 3])) {
+            qualifier = wordAt(location.text, word_start - 3);
+        }
+        var found: ?LspLocation = null;
+        var matches: usize = 0;
+        for (unit.views) |view| {
+            for (view.module.definitions) |*module_definition| {
+                const type_def = switch (module_definition.kind) {
+                    .type_def => |*type_def| type_def,
+                    else => continue,
+                };
+                if (qualifier) |name| {
+                    if (!std.mem.eql(u8, type_def.name.slice(view.source), name)) continue;
+                }
+                const members = switch (type_def.base.*) {
+                    .enum_type => |members| members,
+                    else => continue,
+                };
+                for (members) |member| {
+                    if (!std.mem.eql(u8, member.name.slice(view.source), word)) continue;
+                    matches += 1;
+                    found = .{
+                        .uri = try self.uriOfViewPath(arena, view.path),
+                        .range = .{
+                            .start = positionOf(view.source, member.name.location.start),
+                            .end = positionOf(view.source, member.name.location.end),
+                        },
+                    };
+                }
+            }
+        }
+        // an implied '::Variant' must be unambiguous, mirroring the checker
+        if (qualifier == null and matches != 1) return null;
+        return found;
     }
 
     // every declaration and recorded use of the word's definitions; all
@@ -770,7 +881,7 @@ pub const Server = struct {
             if (!matches) continue;
             const view = unit.views[reference.view_index];
             try locations.append(arena, .{
-                .uri = try uriFromPath(arena, view.path),
+                .uri = try self.uriOfViewPath(arena, view.path),
                 .range = .{
                     .start = positionOf(view.source, reference.span.start),
                     .end = positionOf(view.source, reference.span.end),
@@ -814,7 +925,7 @@ pub const Server = struct {
             } else false;
             if (duplicate) continue;
             try locations.append(arena, .{
-                .uri = try uriFromPath(arena, view.path),
+                .uri = try self.uriOfViewPath(arena, view.path),
                 .range = range,
             });
         }
@@ -1212,6 +1323,42 @@ fn collectFromExpression(arena: std.mem.Allocator, expression: *const ast.Expres
         .comptime_expr => |inner| try collectFromExpression(arena, inner, into),
         .grouped => |inner| try collectFromExpression(arena, inner, into),
     }
+}
+
+// the full definition text for hover: types and interfaces show their
+// whole multi-line body, functions and macros their signature up to the
+// body brace, externs their declaration line
+fn definitionDetail(source: []const u8, name_offset: usize, definition: *const ast.Definition) []const u8 {
+    var start = name_offset;
+    while (start > 0 and source[start - 1] != '\n') start -= 1;
+    const full_body = switch (definition.kind) {
+        .type_def, .interface_def => true,
+        .fn_def, .macro_def, .extern_def => false,
+    };
+    var depth: usize = 0;
+    var index = name_offset;
+    while (index < source.len) : (index += 1) {
+        switch (source[index]) {
+            '{' => {
+                // a signature stops before the body it would otherwise drag in
+                if (!full_body and depth == 0) {
+                    return std.mem.trimEnd(u8, source[start..index], " \t\r\n");
+                }
+                depth += 1;
+            },
+            '}' => {
+                depth -|= 1;
+                if (full_body and depth == 0) {
+                    var end = index + 1;
+                    if (end < source.len and source[end] == ';') end += 1;
+                    return source[start..end];
+                }
+            },
+            ';' => if (depth == 0) return source[start..index],
+            else => {},
+        }
+    }
+    return declarationLine(source, name_offset);
 }
 
 // the whole source line containing the offset, trimmed, as a signature

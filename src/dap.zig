@@ -28,6 +28,9 @@ pub const Server = struct {
     sequence: usize = 1,
     // normalized source path to requested breakpoints
     breakpoints: std.StringHashMapUnmanaged([]const Breakpoint) = .empty,
+    // extra directories searched for std/ imports (the executable's
+    // directory, $ALLOY_STDLIB) after the program's own tree
+    search_bases: []const []const u8 = &.{},
     // compound-value handles live for one pause; ids start at handle_base
     pause_arena: std.heap.ArenaAllocator,
     variable_handles: std.ArrayList(*Interpreter.Value) = .empty,
@@ -283,13 +286,28 @@ pub const Server = struct {
 
     const DiskLoader = struct {
         io: Io,
+        program_directory: []const u8,
+        search_bases: []const []const u8,
 
+        fn readRelative(loader: *DiskLoader, allocator: std.mem.Allocator, base: []const u8, relative: []const u8) ?[]const u8 {
+            const joined = std.fs.path.join(allocator, &.{ base, relative }) catch return null;
+            defer allocator.free(joined);
+            return Io.Dir.cwd().readFileAlloc(loader.io, joined, allocator, .limited(10 * 1024 * 1024)) catch null;
+        }
+
+        // the working directory first, then the program's directory, then
+        // - for std/ imports - the configured search bases (section 5.4)
         fn loadModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
             const loader: *DiskLoader = @ptrCast(@alignCast(context.?));
-            return Io.Dir.cwd().readFileAlloc(loader.io, file_path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => null,
-            };
+            if (Io.Dir.cwd().readFileAlloc(loader.io, file_path, allocator, .limited(10 * 1024 * 1024))) |source| {
+                return source;
+            } else |err| if (err != error.FileNotFound) return null;
+            if (loader.readRelative(allocator, loader.program_directory, file_path)) |source| return source;
+            if (!std.mem.startsWith(u8, file_path, "std/")) return null;
+            for (loader.search_bases) |base| {
+                if (loader.readRelative(allocator, base, file_path)) |source| return source;
+            }
+            return null;
         }
 
         fn loadPackage(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
@@ -313,7 +331,11 @@ pub const Server = struct {
         unit.* = Compilation.init(self.gpa);
         self.unit = unit;
         _ = try unit.addModule(try session.dupe(u8, program), source);
-        var disk_loader: DiskLoader = .{ .io = self.io };
+        var disk_loader: DiskLoader = .{
+            .io = self.io,
+            .program_directory = std.fs.path.dirname(program) orelse ".",
+            .search_bases = self.search_bases,
+        };
         const loader: ModuleLoader = .{
             .context = @ptrCast(&disk_loader),
             .function = DiskLoader.loadModule,

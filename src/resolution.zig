@@ -65,6 +65,15 @@ pub const MergedUnit = struct {
     injected: []const InjectedMap,
     references: []const NameReference,
     locals: []const LocalReference,
+    // qualified functions ('fn Vector::empty'), living in their type's
+    // namespace keyed by the type's definition identity (section 5.4)
+    associated: []const AssociatedFunction,
+};
+
+pub const AssociatedFunction = struct {
+    type_definition: *const ast.Definition,
+    name: []const u8,
+    symbol: Symbol,
 };
 
 /// Whether two modules belong to the same library; null marks the
@@ -105,6 +114,7 @@ pub const Resolver = struct {
     injected_maps: []InjectedMap,
     // every resolved use of a global definition, for tooling
     references: std.ArrayList(NameReference),
+    associated: std.ArrayList(AssociatedFunction),
     // every declaration and use of a local binding, for tooling
     local_references: std.ArrayList(LocalReference),
     next_binding_id: usize,
@@ -140,6 +150,7 @@ pub const Resolver = struct {
             .alias_maps = &.{},
             .injected_maps = &.{},
             .references = .empty,
+            .associated = .empty,
             .local_references = .empty,
             .next_binding_id = 0,
             .scopes = .empty,
@@ -160,6 +171,7 @@ pub const Resolver = struct {
             try self.registerImports(view);
         }
         try self.checkInjectedCollisions();
+        try self.collectAssociated();
         for (self.views, 0..) |view, view_index| {
             self.current_view = view_index;
             try self.resolveModule(view);
@@ -171,7 +183,53 @@ pub const Resolver = struct {
             .injected = self.injected_maps,
             .references = self.references.items,
             .locals = self.local_references.items,
+            .associated = self.associated.items,
         };
+    }
+
+    // qualified functions ('fn Vector::empty') attach to any type visible
+    // to the defining module, like extension functions; the qualifier
+    // resolves through normal unqualified visibility (section 5.4)
+    fn collectAssociated(self: *Resolver) Error!void {
+        for (self.views, 0..) |view, view_index| {
+            self.current_view = view_index;
+            for (view.module.definitions) |*definition| {
+                if (definition.kind != .fn_def) continue;
+                const fn_def = &definition.kind.fn_def;
+                const qualifier = fn_def.qualifier orelse continue;
+                const type_name = qualifier.slice(view.source);
+                const symbols = self.globals.get(type_name) orelse SymbolList.empty;
+                const type_symbol = for (symbols.items) |candidate| {
+                    if (candidate.definition.kind != .type_def) continue;
+                    if (!self.visibleUnqualified(candidate)) continue;
+                    break candidate;
+                } else {
+                    try self.report(qualifier.location, "'{s}' does not name a visible type here (section 5.4)", .{type_name});
+                    continue;
+                };
+                const fn_name = fn_def.name.slice(view.source);
+                // an enum's variant names stay unambiguous constructors
+                const base = type_symbol.definition.kind.type_def.base;
+                if (base.* == .enum_type) {
+                    const enum_source = self.views[type_symbol.view_index].source;
+                    for (base.enum_type) |member| {
+                        if (std.mem.eql(u8, member.name.slice(enum_source), fn_name)) {
+                            try self.report(fn_def.name.location, "'{s}::{s}' collides with the enum's variant '{s}' (section 5.4)", .{ type_name, fn_name, fn_name });
+                        }
+                    }
+                }
+                try self.recordReference(qualifier.location, type_symbol.definition);
+                try self.associated.append(self.arena, .{
+                    .type_definition = type_symbol.definition,
+                    .name = fn_name,
+                    .symbol = .{
+                        .visibility = definition.visibility,
+                        .view_index = view_index,
+                        .definition = definition,
+                    },
+                });
+            }
+        }
     }
 
     fn recordLocal(self: *Resolver, span: Token.Location, binding_id: usize) Error!void {
@@ -255,6 +313,9 @@ pub const Resolver = struct {
                 try self.module_keys.put(self.arena, key, view_index);
             }
             for (view.module.definitions) |*definition| {
+                // qualified functions live in their type's namespace, not
+                // the flat map; collectAssociated registers them
+                if (definition.kind == .fn_def and definition.kind.fn_def.qualifier != null) continue;
                 const name_token = definitionName(definition);
                 const name = name_token.slice(view.source);
                 const symbol: Symbol = .{
@@ -759,6 +820,10 @@ pub const Resolver = struct {
         const definition_source = self.views[symbol.view_index].source;
         for (members) |member| {
             if (std.mem.eql(u8, member.name.slice(definition_source), variant_name)) return;
+        }
+        // a qualified function in the type's namespace is not a variant
+        for (self.associated.items) |entry| {
+            if (entry.type_definition == symbol.definition and std.mem.eql(u8, entry.name, variant_name)) return;
         }
         const type_name = definitionName(symbol.definition).slice(definition_source);
         try self.report(span, "enum '{s}' has no variant '{s}'", .{ type_name, variant_name });

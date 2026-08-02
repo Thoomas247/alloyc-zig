@@ -57,6 +57,9 @@ pub const TypeParameter = struct {
 };
 
 pub const FnDef = struct {
+    // 'fn Vector::empty(...)' associates the function with the named
+    // type's namespace instead of the module's flat namespace
+    qualifier: ?Token = null,
     name: Token,
     type_parameters: []const TypeParameter,
     function: Function,

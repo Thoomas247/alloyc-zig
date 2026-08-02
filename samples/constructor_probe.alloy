@@ -1,0 +1,32 @@
+// exercises qualified constructors (fn Type::name) with explicit and
+// contextual generic inference, cross-engine
+import std::option;
+extern printf(format: &[u8], ...) -> i32;
+
+type Point = struct { x: i64, y: i64 };
+
+fn Point::origin() -> Point {
+    return Point { .x = 0, .y = 0 };
+}
+
+fn Point::at(x: i64, y: i64) -> Point {
+    return Point { .x = x, .y = y };
+}
+
+fn Option::flag<T>(condition: bool, value: T) -> Option<T> {
+    if (condition) {
+        return ::Some(value);
+    }
+    return ::None;
+}
+
+fn main() -> i64 {
+    const origin = Point::origin();
+    const moved = Point::at(3, 4);
+    var chosen: Option<i64> = Option::flag(true, 5);
+    var skipped = Option::flag<i64>(false, 9);
+    var total = origin.x + moved.x + moved.y;
+    total += chosen.unwrap_or(0) + skipped.unwrap_or(100);
+    printf("total=%d\n", total to i32);
+    return total;
+}

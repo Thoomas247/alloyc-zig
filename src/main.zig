@@ -78,9 +78,12 @@ pub fn main(init: std.process.Init) !void {
 
     _ = try compilation.addModule(entrypoint_file_path, source);
 
-    var loader_io = init.io;
+    var loader_context: DiskLoaderContext = .{
+        .io = init.io,
+        .search_bases = standardLibrarySearchBases(init),
+    };
     const loader: alloyc.ModuleLoader = .{
-        .context = @ptrCast(&loader_io),
+        .context = @ptrCast(&loader_context),
         .function = loadImportedModule,
         .library = loadPackageContainer,
     };
@@ -211,6 +214,7 @@ fn serveLanguageServer(init: std.process.Init) !void {
     var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
     var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
     var server = alloyc.LanguageServer.init(init.gpa, init.io, &input.interface, &output.interface);
+    server.search_bases = standardLibrarySearchBases(init);
     defer server.deinit();
     try server.run();
 }
@@ -222,6 +226,7 @@ fn serveDebugAdapter(init: std.process.Init) !void {
     var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
     var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
     var server = alloyc.DebugAdapter.init(init.gpa, init.io, &input.interface, &output.interface);
+    server.search_bases = standardLibrarySearchBases(init);
     defer server.deinit();
     try server.run();
 }
@@ -322,23 +327,61 @@ fn readFile(io: Io, allocator: std.mem.Allocator, file_path: []const u8) ![]cons
     return try Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_size));
 }
 
-// import loader searching the current directory; the compiler-executable
-// directory and $ALLOY_STDLIB search paths (section 5.4) are still to come
+// standard library search bases beyond the current directory (section
+// 5.4): the compiler-executable's directory, then $ALLOY_STDLIB (the
+// directory CONTAINING the std/ folder)
+fn standardLibrarySearchBases(init: std.process.Init) []const []const u8 {
+    const arena = init.arena.allocator();
+    var bases: std.ArrayList([]const u8) = .empty;
+    if (executableDirectory(arena)) |directory| {
+        bases.append(arena, directory) catch return &.{};
+    }
+    if (init.environ_map.get("ALLOY_STDLIB")) |configured| {
+        if (configured.len != 0) bases.append(arena, configured) catch return &.{};
+    }
+    return bases.toOwnedSlice(arena) catch &.{};
+}
+
+// the running executable's directory, read from the process image path
+fn executableDirectory(arena: std.mem.Allocator) ?[]const u8 {
+    if (@import("builtin").os.tag != .windows) return null;
+    const image = std.os.windows.peb().ProcessParameters.ImagePathName;
+    const buffer = image.Buffer orelse return null;
+    const wide = buffer[0 .. image.Length / 2];
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(arena, wide) catch return null;
+    return std.fs.path.dirname(utf8);
+}
+
+const DiskLoaderContext = struct {
+    io: Io,
+    search_bases: []const []const u8,
+};
+
+// import loader: the current directory first, then - for std:: modules -
+// the standard search bases (section 5.4)
 fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
-    const io: *Io = @ptrCast(@alignCast(context.?));
-    return readFile(io.*, allocator, file_path) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => err,
-    };
+    const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
+    if (readFile(loader.io, allocator, file_path)) |source| {
+        return source;
+    } else |err| if (err != error.FileNotFound) return err;
+    if (!std.mem.startsWith(u8, file_path, "std/")) return null;
+    for (loader.search_bases) |base| {
+        const joined = try std.fs.path.join(allocator, &.{ base, file_path });
+        defer allocator.free(joined);
+        if (readFile(loader.io, allocator, joined)) |source| {
+            return source;
+        } else |err| if (err != error.FileNotFound) return err;
+    }
+    return null;
 }
 
 // 'pkg::name' resolves to the local 'pkg' folder first; the trusted
 // registry download (section 5.4) is still to come
 fn loadPackageContainer(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
-    const io: *Io = @ptrCast(@alignCast(context.?));
+    const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
     var buffer: [512]u8 = undefined;
     const container_path = std.fmt.bufPrint(&buffer, "pkg/{s}.alloylib", .{package_name}) catch return null;
-    return readFile(io.*, allocator, container_path) catch |err| switch (err) {
+    return readFile(loader.io, allocator, container_path) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };

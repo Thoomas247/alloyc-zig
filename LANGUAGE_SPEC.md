@@ -140,7 +140,7 @@ definition      = [ "pub" | "exp" ] ( type_def | fn_def | extern_def | interface
 type_def        = "type" ident [ "<" type_param { "," type_param } ">" ] [ ":" ident { "," ident } ] "=" base_type terminator ;
 interface_def   = "interface" ident "{" { interface_fn } "}" ;
 interface_fn    = "fn" ident "(" [ param { "," param } ] ")" [ "->" type ] terminator ;
-fn_def          = "fn" ident [ "<" type_param { "," type_param } ">" ] function ;
+fn_def          = "fn" [ ident "::" ] ident [ "<" type_param { "," type_param } ">" ] function ;
 macro_def       = "macro" ident "(" [ param { "," param } ] ")" stmt_block ;
 extern_def      = "extern" ident "(" extern_params ")" [ "->" type ] terminator ;
 extern_params   = /* empty */
@@ -555,7 +555,12 @@ A generic function's type parameters are bound at each call site:
    occurrence of an unbound type parameter binds to the type found in its
    position. `vector.push(x)` with `fn push<T>(self v: &var Vector<T>, item: T)`
    binds `T` from the receiver and checks `x` against it.
-3. A type parameter still unbound after unification is a compile-time error;
+3. When a contextual expected type is available, the declared return type
+   unifies against it **before** the arguments, binding type parameters the
+   same way generic variant construction does
+   (`var v: Vector<u8> = Vector::empty();`); arguments then unify against
+   (and may coerce to) those bindings.
+4. A type parameter still unbound after unification is a compile-time error;
    conflicting bindings (`T` unified with both `u32` and `f32`) are too.
 
 A bound type parameter must satisfy its constraint (`<T: Number>`, §5.2).
@@ -907,6 +912,7 @@ extern variadicFunc(...) -> *var u8
 - **Debug info:** checked builds embed DWARF debug metadata — file, function, and statement-level line/column locations — so native debuggers (LLDB, GDB) set source breakpoints, step by statement, and show Alloy names in call stacks. Release builds carry none. On Windows the debug link goes through lld (`/debug:dwarf`); if lld is unavailable the build falls back to linking without debug info and says so.
 - **Program entry:** execution starts at a zero-parameter function named `main` in the entry module. An integer result becomes the process exit code (truncated to the platform's width); any other result type, or none, exits with 0.
 - **Qualified vs. unqualified access:** an imported name may be written either unqualified (`Vector`) or module-qualified (`std::vector::Vector`). Every import also introduces an alias for qualified use — the explicit `as` name or the import path's last segment (`import pkg::mathx` allows `mathx::twice(...)`). Qualified access goes through the cross-module visibility check, so only `pub`/`exp` definitions are reachable that way. Unqualified access sees the requester's **own library** in full (the executable's own modules and `std::` count as one library), plus the `exp` definitions of each library the module imported **without an explicit `as`** — an unaliased library import *injects* its exports into that module's unqualified namespace, while an aliased import (`import pkg::liba as la`) is reachable through the alias only (`la::Pair`, `la::Pair { ... }`).
+- **Qualified functions (constructors):** `fn Vector::empty<T>() -> Vector<T> { ... }` defines a plain free function living in the **type's namespace** instead of the module's flat namespace, called as `Vector::empty()` (or `alias::Vector::empty()` across an aliased import). The qualifier must name a type visible to the defining module - like extension functions, any accessible type qualifies, not only locally declared ones. Qualified functions of one type overload among themselves; the same name may freely exist as a free function or under other types. On an enum, a qualified name colliding with a variant is a compile-time error, so `Type::Name(...)` stays unambiguous and variant construction is unchanged. No `self`, no dot-call, no dispatch - the association is purely a namespace.
 - **Name collisions:** within one library, a name colliding with an existing definition is a redeclaration error, except that functions overload (§3.6). Different libraries may reuse names internally. A name visible unqualified in one module from **two different libraries** (own declaration vs. an injected export, or two injected exports) is a **compile-time error at the import**, resolved by aliasing an import to take its exports out of the unqualified namespace. Nothing is resolved implicitly — no shadowing, no cross-library overload merging. Two imports whose aliases collide (implicit or explicit) are likewise an error.
 - **Merge-then-codegen:** every reachable module — including every library module — always merges into ONE compilation unit before type checking and code generation. The whole-program stages depend on it (closed-world interface dispatch, monomorphization, §3.9 layouts); only the per-module front-end stages (tokenize, parse) run in parallel. Libraries therefore recompile with each consuming program; the `.alloylib` payload exists to make that cheap, not to skip it.
 

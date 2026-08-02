@@ -7,7 +7,7 @@ import std::io;
 import std::process;
 
 fn main() -> i64 {
-    var numbers: Vector<i64> = empty_vector<i64>();
+    var numbers: Vector<i64> = Vector::empty<i64>();
     numbers.push(10);
     numbers.push(20);
     numbers.push(30);
@@ -19,7 +19,7 @@ fn main() -> i64 {
         total += value;
     }
 
-    var report = empty_string();
+    var report = String::empty();
     report.append("total=");
     report.append_integer(total);
     report.append(" count=");
@@ -27,7 +27,7 @@ fn main() -> i64 {
     print_line(report.view());
 
     const argument_count = arguments().length();
-    var argument_report = empty_string();
+    var argument_report = String::empty();
     argument_report.append("arguments=");
     argument_report.append_integer(argument_count to i64);
     print_line(argument_report.view());

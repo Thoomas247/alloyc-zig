@@ -20,7 +20,7 @@ pub type Vector<T> : Iterable = struct {
 };
 
 // A vector with no elements and no allocation.
-pub fn empty_vector<T>() -> Vector<T> {
+pub fn Vector::empty<T>() -> Vector<T> {
     return Vector { .storage = ::None, .count = 0 };
 }
 
@@ -53,13 +53,16 @@ pub fn push<T>(self vector: &var Vector<T>, item: T) {
     vector.count = in_use + 1;
 }
 
-// A copy of the element at the index, or 'None' past the end.
-pub fn get<T>(self vector: &Vector<T>, index: u64) -> Option<T> {
+// A reference to the element in place, or 'None' past the end. Reading
+// the reference copies the element; keeping it as '&T' borrows without
+// a copy. Like any reference, it is invalidated when a later push grows
+// the buffer.
+pub fn get<T>(self vector: &Vector<T>, index: u64) -> Option<&T> {
     if (index >= vector.count) {
         return ::None;
     }
     if (vector.storage is ::Some) |buffer: &| {
-        return ::Some(buffer[index]);
+        return ::Some(&buffer[index]);
     }
     return ::None;
 }
@@ -96,7 +99,7 @@ fn capacity<T>(self vector: &Vector<T>) -> u64 {
 }
 
 // The cursor behind 'for (vector) |element|' (section 4.3): it borrows
-// the vector and hands out element copies in order.
+// the vector and hands out references to the elements in place.
 pub type VectorCursor<T> = struct {
     subject: &Vector<T>,
     index: u64,
@@ -106,7 +109,7 @@ pub fn iterator<T>(self vector: &Vector<T>) -> VectorCursor<T> {
     return VectorCursor { .subject = &vector, .index = 0 };
 }
 
-pub fn next<T>(self cursor: &var VectorCursor<T>) -> Option<T> {
+pub fn next<T>(self cursor: &var VectorCursor<T>) -> Option<&T> {
     const result = cursor.subject.get(cursor.index);
     if (result is ::Some) {
         cursor.index += 1;

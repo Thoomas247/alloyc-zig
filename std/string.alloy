@@ -15,13 +15,13 @@ pub type String : Iterable = struct {
 };
 
 // A string with no bytes and no allocation.
-pub fn empty_string() -> String {
+pub fn String::empty() -> String {
     return String { .storage = ::None, .count = 0 };
 }
 
 // An owned copy of the given text.
-pub fn string_from(text: &[u8]) -> String {
-    var result = empty_string();
+pub fn String::from(text: &[u8]) -> String {
+    var result = String::empty();
     result.append(text);
     return result;
 }
