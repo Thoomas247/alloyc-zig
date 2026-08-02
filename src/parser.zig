@@ -180,9 +180,33 @@ pub const Parser = struct {
     fn parseMacroDef(self: *Parser) Error!ast.MacroDef {
         _ = try self.expect(.keyword_macro, "'macro'");
         const name = try self.expect(.identifier, "a macro name");
-        const parameter_list = try self.parseParameterList(false);
+        _ = try self.expect(.parenthesis_left, "'('");
+        var parameters: std.ArrayList(ast.MacroParameter) = .empty;
+        if (self.current().tag != .parenthesis_right) {
+            while (true) {
+                const parameter_name = try self.expect(.identifier, "a parameter name");
+                var parameter_type: ?*const ast.TypeExpression = null;
+                if (self.match(.colon) != null) {
+                    parameter_type = try self.parseType();
+                }
+                try parameters.append(self.arena, .{ .name = parameter_name, .parameter_type = parameter_type });
+                if (self.match(.comma) == null) break;
+            }
+        }
+        _ = try self.expect(.parenthesis_right, "')'");
+        // a body makes an ordinary macro; a terminator makes a
+        // declaration-only macro, implemented by the compiler
+        if (self.current().tag != .brace_left) {
+            try self.expectTerminator();
+            return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .body = null };
+        }
+        for (parameters.items) |parameter| {
+            if (parameter.parameter_type == null) {
+                return self.fail(parameter.name, "a macro with a body types its parameters ('{s}: ...')", .{parameter.name.slice(self.source)});
+            }
+        }
         const body = try self.parseBlock();
-        return .{ .name = name, .parameters = parameter_list.parameters, .body = body };
+        return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .body = body };
     }
 
     fn parseTypeParameters(self: *Parser) Error![]const ast.TypeParameter {
@@ -1313,6 +1337,35 @@ test "missing semicolon fails with a clear message" {
     var parser = Parser.init(arena.allocator(), source, tokens.items);
     try testing.expectError(error.ParseError, parser.parseModule());
     try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "expected ';'") != null);
+}
+
+test "declaration-only macros parse without a body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source =
+        \\pub macro type_of(value);
+        \\macro pair(left, right);
+        \\macro doubled(x: i64) { return x; }
+    ;
+    const module = try parseForTest(&arena, source);
+    try testing.expectEqual(@as(usize, 3), module.definitions.len);
+    try testing.expect(module.definitions[0].kind.macro_def.body == null);
+    try testing.expect(module.definitions[0].kind.macro_def.parameters[0].parameter_type == null);
+    try testing.expectEqual(@as(usize, 2), module.definitions[1].kind.macro_def.parameters.len);
+    try testing.expect(module.definitions[2].kind.macro_def.body != null);
+    try testing.expect(module.definitions[2].kind.macro_def.parameters[0].parameter_type != null);
+}
+
+test "a macro body requires typed parameters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = "macro bad(x) { return x; }";
+    var tokenizer = tokenizer_module.Tokenizer.init(source);
+    var tokens: std.ArrayList(Token) = .empty;
+    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+    var parser = Parser.init(arena.allocator(), source, tokens.items);
+    try testing.expectError(error.ParseError, parser.parseModule());
+    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "types its parameters") != null);
 }
 
 test "an empty capture list fails with the omitted form" {

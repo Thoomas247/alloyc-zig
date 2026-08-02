@@ -96,11 +96,6 @@ const primitive_types = std.StaticStringMap(void).initComptime(.{
     .{"f32"}, .{"f64"}, .{"bool"}, .{"void"},
 });
 
-// built-in macros (section 6.4), callable without any declaration
-const builtin_macros = std.StaticStringMap(void).initComptime(.{
-    .{"type_of"}, .{"struct_type"}, .{"enum_type"}, .{"implementers_of"},
-});
-
 pub const Resolver = struct {
     // long-lived allocations (table, messages) come from the compilation arena
     arena: std.mem.Allocator,
@@ -407,10 +402,12 @@ pub const Resolver = struct {
             .macro_def => |macro_def| {
                 try self.pushFrame(false);
                 for (macro_def.parameters) |parameter| {
-                    try self.resolveTypeExpression(parameter.parameter_type, false);
+                    if (parameter.parameter_type) |parameter_type| {
+                        try self.resolveTypeExpression(parameter_type, false);
+                    }
                     try self.bind(parameter.name, .parameter);
                 }
-                try self.resolveStatement(macro_def.body);
+                if (macro_def.body) |body| try self.resolveStatement(body);
                 self.popFrame();
             },
         }
@@ -680,7 +677,6 @@ pub const Resolver = struct {
             }
             // primitives appear in type positions and as '#u32' reflection
             if (primitive_types.has(first)) return;
-            if (context == .value and builtin_macros.has(first)) return;
             if (self.lookupLocal(first, true)) |binding_id| {
                 // capture lists are value-only: a type name (a scope type
                 // parameter) stays visible inside a lambda without capture

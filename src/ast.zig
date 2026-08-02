@@ -97,8 +97,16 @@ pub const InterfaceFn = struct {
 
 pub const MacroDef = struct {
     name: Token,
-    parameters: []const Parameter,
-    body: *const Statement,
+    parameters: []const MacroParameter,
+    // null marks a declaration-only macro ('macro type_of(value);'):
+    // implemented by the compiler, like an interface's functions
+    body: ?*const Statement,
+};
+
+// a macro parameter's type is optional on declaration-only macros
+pub const MacroParameter = struct {
+    name: Token,
+    parameter_type: ?*const TypeExpression,
 };
 
 pub const TypeModifier = enum {

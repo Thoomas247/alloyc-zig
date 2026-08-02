@@ -3003,13 +3003,6 @@ pub const Checker = struct {
                 if (self.lookup(path[0].slice(self.source()))) |binding| {
                     return self.callFunctionValue(binding.binding_type, call, path[0].location);
                 }
-                if (builtinMacro(name)) {
-                    if (self.comptime_depth == 0) {
-                        try self.report(path[0].location, "a macro call must be invoked with '#' (section 6.3)", .{});
-                    }
-                    for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
-                    return &unknown_type;
-                }
             }
             // 'Type::name(...)': a function living in the type's namespace
             // (section 5.4); checked before variant construction because
@@ -3420,7 +3413,7 @@ pub const Checker = struct {
             },
         };
         if (violatesPointerBarrier(value)) {
-            try self.report(self.expressionSpan(outer), "a compile-time result cannot carry a '&T' or '*T' indirection into runtime (section 6.2)", .{});
+            try self.report(self.expressionSpan(outer), "a compile-time result is a value or a slice, never a '&T', '*T', or '*[T]' (section 6.2)", .{});
             return null;
         }
         try self.comptime_values.put(self.arena, outer, value);
@@ -3452,7 +3445,6 @@ pub const Checker = struct {
                 if (callee.* == .path and callee.path.len == 1) {
                     const name = callee.path[0].slice(self.source());
                     if (self.lookup(name) == null) {
-                        if (builtinMacro(name)) return true;
                         if (self.firstVisible(name, self.current_view)) |symbol| {
                             if (symbol.definition.kind == .macro_def) return true;
                         }
@@ -3556,11 +3548,12 @@ pub const Checker = struct {
         return &unknown_type;
     }
 
-    // the pointer barrier (section 6.2): references, pointers, and closures
-    // cannot escape compile time; slices and heap arrays materialize
+    // the pointer barrier (section 6.2): references, pointers, closures,
+    // and heap arrays cannot escape compile time; a comptime result is a
+    // value or a slice ('&[T]' materializes), never a '*[T]'
     fn violatesPointerBarrier(value: Interpreter.Value) bool {
         switch (value) {
-            .pointer, .reference, .closure => return true,
+            .pointer, .reference, .closure, .heap_array => return true,
             .struct_value => |instance| {
                 for (instance.fields) |field| {
                     if (violatesPointerBarrier(field.value)) return true;
@@ -3573,10 +3566,6 @@ pub const Checker = struct {
             },
             .array => |instance| return arrayViolatesPointerBarrier(instance),
             .slice => |instance| return arrayViolatesPointerBarrier(instance),
-            .heap_array => |instance| {
-                const alive = instance orelse return true;
-                return arrayViolatesPointerBarrier(alive);
-            },
             else => return false,
         }
     }
@@ -3884,9 +3873,11 @@ pub const Checker = struct {
                     if (call.arguments.len != macro_def.parameters.len) {
                         try self.report(span, "macro '{s}' expects {d} argument(s), found {d}", .{ name, macro_def.parameters.len, call.arguments.len });
                     } else {
-                        // macro parameters are strictly typed (section 6.3)
+                        // macro parameters are strictly typed (section 6.3);
+                        // declaration-only macros leave them open
                         for (macro_def.parameters, argument_types.items, 0..) |parameter, argument_type, index| {
-                            const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, &empty_type_environment, symbol.view_index);
+                            const parameter_expression = parameter.parameter_type orelse continue;
+                            const parameter_type = try self.typeFromExpressionIn(parameter_expression, &empty_type_environment, symbol.view_index);
                             if (!try self.coerce(argument_type, parameter_type)) {
                                 try self.typeMismatch(self.expressionSpan(call.arguments[index]), argument_type, parameter_type);
                             }
@@ -4645,13 +4636,6 @@ fn unwrapGrouped(expression: *const ast.Expression) *const ast.Expression {
 
 fn primitiveByName(name: []const u8) ?types.Primitive {
     return std.meta.stringToEnum(types.Primitive, name);
-}
-
-fn builtinMacro(name: []const u8) bool {
-    return std.mem.eql(u8, name, "type_of") or
-        std.mem.eql(u8, name, "struct_type") or
-        std.mem.eql(u8, name, "enum_type") or
-        std.mem.eql(u8, name, "implementers_of");
 }
 
 fn parseIntegerLiteral(text: []const u8) !u64 {

@@ -1150,18 +1150,128 @@ pub const Codegen = struct {
             },
             .float => |float| return .{ .scalar = try self.floatConstant(float.value, float.primitive orelse .f64) },
             .bool_value => |truth| return .{ .scalar = .{ .text = if (truth) "true" else "false", .llvm = "i1" } },
-            .slice, .array => {
-                const instance = if (value == .slice) value.slice else value.array;
-                var bytes: std.ArrayList(u8) = .empty;
-                for (instance.elements) |element| {
-                    if (element != .integer) return self.report(self.spanOf(expression), "this compile-time value cannot be lowered to native code yet", .{});
-                    try bytes.append(self.arena, @intCast(@as(u8, @truncate(@as(u128, @bitCast(element.integer.value))))));
-                }
-                const slice_global = try self.sliceGlobal(bytes.items);
-                return .{ .memory = .{ .pointer = slice_global, .layout = .{ .size = 16, .alignment = 8 } } };
+            .slice, .array, .heap_array => {
+                // materialization (section 6.2): the value becomes typed
+                // static program data shaped by the checker's recorded type
+                const resolved = try self.resolvedOf(try self.typeOf(expression));
+                const rendered = (try self.staticConstant(value, resolved)) orelse
+                    return self.report(self.spanOf(expression), "this compile-time value cannot be lowered to native code yet", .{});
+                const layout = (try self.layoutQuery(resolved, 0)) orelse
+                    return self.report(self.spanOf(expression), "this compile-time value has no native layout", .{});
+                const name = try std.fmt.allocPrint(self.arena, "@\"comptime.{d}\"", .{self.global_counter});
+                self.global_counter += 1;
+                self.constants.writer.print(
+                    "{s} = private unnamed_addr constant {s} {s}, align {d}\n",
+                    .{ name, rendered.type_text, rendered.value_text, layout.alignment },
+                ) catch return error.OutOfMemory;
+                return .{ .memory = .{ .pointer = name, .layout = layout } };
             },
             else => return self.report(self.spanOf(expression), "this compile-time value cannot be lowered to native code yet", .{}),
         }
+    }
+
+    const RenderedConstant = struct {
+        type_text: []const u8,
+        value_text: []const u8,
+    };
+
+    // renders a comptime value as a typed LLVM constant matching the
+    // checker's layout for the given resolved type; null when the shape
+    // has no static lowering yet (structs, enums, pointers)
+    fn staticConstant(self: *Codegen, value: Interpreter.Value, resolved: *const Type) Error!?RenderedConstant {
+        switch (resolved.*) {
+            .primitive => |primitive| {
+                switch (value) {
+                    .integer => |integer| {
+                        if (primitive.isFloat()) {
+                            const scalar = try self.floatConstant(@floatFromInt(integer.value), primitive);
+                            return .{ .type_text = scalar.llvm, .value_text = scalar.text };
+                        }
+                        return .{
+                            .type_text = scalarTypeText(primitive),
+                            .value_text = try std.fmt.allocPrint(self.arena, "{d}", .{integer.value}),
+                        };
+                    },
+                    .float => |float| {
+                        const scalar = try self.floatConstant(float.value, primitive);
+                        return .{ .type_text = scalar.llvm, .value_text = scalar.text };
+                    },
+                    .bool_value => |truth| return .{ .type_text = "i1", .value_text = if (truth) "true" else "false" },
+                    else => return null,
+                }
+            },
+            .slice => |slice| {
+                const instance = staticElements(value) orelse return null;
+                const element_type = try self.resolvedOf(slice.child);
+                // strings dedupe through the byte-global cache
+                if (element_type.* == .primitive and (element_type.primitive == .u8 or element_type.primitive == .i8)) {
+                    var bytes: std.ArrayList(u8) = .empty;
+                    for (instance) |element| {
+                        if (element != .integer) return null;
+                        try bytes.append(self.arena, @truncate(@as(u128, @bitCast(element.integer.value))));
+                    }
+                    const data = try self.byteGlobal(bytes.items);
+                    return .{
+                        .type_text = "{ ptr, i64 }",
+                        .value_text = try std.fmt.allocPrint(self.arena, "{{ ptr @\"{s}\", i64 {d} }}", .{ data.name, data.length }),
+                    };
+                }
+                const data = (try self.staticArrayConstant(instance, element_type)) orelse return null;
+                const name = try std.fmt.allocPrint(self.arena, "@\"comptime.data.{d}\"", .{self.global_counter});
+                self.global_counter += 1;
+                const element_layout = (try self.layoutQuery(element_type, 0)) orelse return null;
+                self.constants.writer.print(
+                    "{s} = private unnamed_addr constant {s} {s}, align {d}\n",
+                    .{ name, data.type_text, data.value_text, element_layout.alignment },
+                ) catch return error.OutOfMemory;
+                return .{
+                    .type_text = "{ ptr, i64 }",
+                    .value_text = try std.fmt.allocPrint(self.arena, "{{ ptr {s}, i64 {d} }}", .{ name, instance.len }),
+                };
+            },
+            .fixed_array => |array| {
+                const instance = staticElements(value) orelse return null;
+                return self.staticArrayConstant(instance, try self.resolvedOf(array.element));
+            },
+            else => return null,
+        }
+    }
+
+    fn staticArrayConstant(self: *Codegen, elements: []const Interpreter.Value, element_type: *const Type) Error!?RenderedConstant {
+        var values: std.ArrayList(u8) = .empty;
+        var type_text: ?[]const u8 = null;
+        try values.appendSlice(self.arena, "[");
+        for (elements, 0..) |element, index| {
+            const rendered = (try self.staticConstant(element, element_type)) orelse return null;
+            type_text = rendered.type_text;
+            if (index != 0) try values.appendSlice(self.arena, ", ");
+            try values.appendSlice(self.arena, rendered.type_text);
+            try values.appendSlice(self.arena, " ");
+            try values.appendSlice(self.arena, rendered.value_text);
+        }
+        try values.appendSlice(self.arena, "]");
+        // an empty array still needs its element type in the array type
+        const element_text = type_text orelse text: {
+            const rendered = (try self.staticConstant(.void_value, element_type)) orelse {
+                if (element_type.* == .slice) break :text "{ ptr, i64 }";
+                if (element_type.* == .primitive) break :text scalarTypeText(element_type.primitive);
+                return null;
+            };
+            break :text rendered.type_text;
+        };
+        return .{
+            .type_text = try std.fmt.allocPrint(self.arena, "[{d} x {s}]", .{ elements.len, element_text }),
+            .value_text = try values.toOwnedSlice(self.arena),
+        };
+    }
+
+    fn staticElements(value: Interpreter.Value) ?[]const Interpreter.Value {
+        return switch (value) {
+            .slice => |instance| instance.elements,
+            .array => |instance| instance.elements,
+            .heap_array => |instance| if (instance) |live| live.elements else null,
+            else => null,
+        };
     }
 
     fn evalUnary(self: *Codegen, expression: *const ast.Expression) Error!Operand {

@@ -1274,7 +1274,6 @@ pub const Interpreter = struct {
             }
             if (self.comptime_mode) {
                 const name = path[0].slice(self.source());
-                if (try self.builtinMacroCall(name, call)) |value| return value;
                 if (try self.comptimeNameCall(name, call)) |value| return value;
             }
             return self.fault("cannot call '{s}' here (not yet supported by the interpreter)", .{path[path.len - 1].slice(self.source())});
@@ -1656,6 +1655,22 @@ pub const Interpreter = struct {
             instance.* = .{ .elements = try self.arena.dupe(Value, implementers) };
             return .{ .array = instance };
         }
+        if (std.mem.eql(u8, name, "name_of")) {
+            if (call.arguments.len != 1) return self.fault("'name_of' expects one argument (section 6.4)", .{});
+            var argument = try self.evalExpression(call.arguments[0]);
+            // a borrowed or owned enum reads as its pointee
+            while (true) {
+                switch (argument) {
+                    .reference => |target| argument = target.*,
+                    .pointer => |target| argument = (target orelse return self.fault("'name_of' read a moved-from pointer", .{})).*,
+                    else => break,
+                }
+            }
+            if (argument != .enum_value) {
+                return self.fault("'name_of' expects an enum value (section 6.4)", .{});
+            }
+            return try self.bytesValue(argument.enum_value.variant);
+        }
         return null;
     }
 
@@ -1686,6 +1701,12 @@ pub const Interpreter = struct {
         if (call.arguments.len != macro_def.parameters.len) {
             return self.fault("this macro expects {d} argument(s), found {d}", .{ macro_def.parameters.len, call.arguments.len });
         }
+        // a declaration-only macro is implemented by the compiler
+        if (macro_def.body == null) {
+            const name = macro_def.name.slice(self.views[symbol.view_index].source);
+            return (try self.builtinMacroCall(name, call)) orelse
+                self.fault("macro '{s}' is declared but not implemented (section 6.4)", .{name});
+        }
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
         defer self.call_depth -= 1;
@@ -1703,7 +1724,7 @@ pub const Interpreter = struct {
             const value: Value = if (index < arguments.len) arguments[index] else .void_value;
             try self.bind(parameter.name.slice(view_source), value);
         }
-        const flow = self.execStatement(macro_def.body) catch |err| switch (err) {
+        const flow = self.execStatement(macro_def.body.?) catch |err| switch (err) {
             error.Return => return self.pending_return orelse .void_value,
             else => return err,
         };

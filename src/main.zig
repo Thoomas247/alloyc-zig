@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
 
     var loader_context: DiskLoaderContext = .{
         .io = init.io,
+        .base_directory = std.fs.path.dirname(entrypoint_file_path) orelse "",
         .search_bases = standardLibrarySearchBases(init),
     };
     const loader: alloyc.ModuleLoader = .{
@@ -354,14 +355,24 @@ fn executableDirectory(arena: std.mem.Allocator) ?[]const u8 {
 
 const DiskLoaderContext = struct {
     io: Io,
+    // the entry module's directory: imports resolve relative to the program,
+    // not the shell's location (section 5.4)
+    base_directory: []const u8,
     search_bases: []const []const u8,
+
+    fn resolve(loader: *const DiskLoaderContext, allocator: std.mem.Allocator, file_path: []const u8) ![]const u8 {
+        if (loader.base_directory.len == 0) return allocator.dupe(u8, file_path);
+        return std.fs.path.join(allocator, &.{ loader.base_directory, file_path });
+    }
 };
 
-// import loader: the current directory first, then - for std:: modules -
-// the standard search bases (section 5.4)
+// import loader: the entry module's directory first, then - for std::
+// modules - the standard search bases (section 5.4)
 fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
     const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
-    if (readFile(loader.io, allocator, file_path)) |source| {
+    const local_path = try loader.resolve(allocator, file_path);
+    defer allocator.free(local_path);
+    if (readFile(loader.io, allocator, local_path)) |source| {
         return source;
     } else |err| if (err != error.FileNotFound) return err;
     if (!std.mem.startsWith(u8, file_path, "std/")) return null;
@@ -375,13 +386,15 @@ fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_p
     return null;
 }
 
-// 'pkg::name' resolves to the local 'pkg' folder first; the trusted
-// registry download (section 5.4) is still to come
+// 'pkg::name' resolves to the entry module's 'pkg' folder first; the
+// trusted registry download (section 5.4) is still to come
 fn loadPackageContainer(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
     const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
     var buffer: [512]u8 = undefined;
     const container_path = std.fmt.bufPrint(&buffer, "pkg/{s}.alloylib", .{package_name}) catch return null;
-    return readFile(loader.io, allocator, container_path) catch |err| switch (err) {
+    const local_path = try loader.resolve(allocator, container_path);
+    defer allocator.free(local_path);
+    return readFile(loader.io, allocator, local_path) catch |err| switch (err) {
         error.FileNotFound => null,
         else => err,
     };

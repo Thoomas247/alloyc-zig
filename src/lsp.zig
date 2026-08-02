@@ -17,6 +17,16 @@ const Token = tokenizer_module.Token;
 const ast = @import("ast.zig");
 const formatter = @import("formatter.zig");
 
+// the declaration-only macros of std::macros (section 6.4), offered after
+// '#' even when the import is not written yet
+const builtin_macro_completions = [_]struct { name: []const u8, detail: []const u8 }{
+    .{ .name = "type_of", .detail = "macro type_of(value) - std::macros" },
+    .{ .name = "struct_type", .detail = "macro struct_type() - std::macros" },
+    .{ .name = "enum_type", .detail = "macro enum_type() - std::macros" },
+    .{ .name = "implementers_of", .detail = "macro implementers_of(target) - std::macros" },
+    .{ .name = "name_of", .detail = "macro name_of(value) - std::macros" },
+};
+
 const keyword_completions = [_][]const u8{
     "import", "as",    "extern", "type",  "enum",   "struct",    "const", "var",
     "fn",     "if",    "else",   "while", "for",    "match",     "break", "yield",
@@ -614,6 +624,29 @@ pub const Server = struct {
                 try self.qualifiedCompletion(arena, &items, location, prefix_start - 2);
                 return self.respond(id, items.items);
             }
+            // '#' invokes a macro: offer every visible macro, and the
+            // built-ins from std::macros even before the import is written
+            if (prefix_start >= 1 and location.text[prefix_start - 1] == '#') {
+                var offered: std.StringHashMapUnmanaged(void) = .empty;
+                for (self.symbols.items) |symbol| {
+                    if (symbol.definition.kind != .macro_def) continue;
+                    try offered.put(arena, symbol.name, {});
+                    try items.append(arena, .{
+                        .label = symbol.name,
+                        .kind = symbol.completion_kind,
+                        .detail = symbol.detail,
+                    });
+                }
+                for (builtin_macro_completions) |builtin| {
+                    if (offered.contains(builtin.name)) continue;
+                    try items.append(arena, .{
+                        .label = builtin.name,
+                        .kind = 3,
+                        .detail = builtin.detail,
+                    });
+                }
+                return self.respond(id, items.items);
+            }
         }
 
         for (keyword_completions) |keyword| {
@@ -1139,17 +1172,20 @@ pub const Server = struct {
         var active_signature: u32 = 0;
         for (self.symbols.items) |symbol| {
             if (!std.mem.eql(u8, symbol.name, call.name)) continue;
-            const parameters: []const ast.Parameter = switch (symbol.definition.kind) {
-                .fn_def => |def| def.function.parameters,
-                .extern_def => |def| def.parameters,
-                .macro_def => |def| def.parameters,
-                else => continue,
-            };
             const source = if (self.analysis) |unit| unit.views[symbol.view_index].source else "";
             var labels: std.ArrayList(ParameterInformation) = .empty;
-            for (parameters) |parameter| {
-                if (parameter.is_self) continue;
-                try labels.append(arena, .{ .label = parameter.name.slice(source) });
+            switch (symbol.definition.kind) {
+                .fn_def => |def| for (def.function.parameters) |parameter| {
+                    if (parameter.is_self) continue;
+                    try labels.append(arena, .{ .label = parameter.name.slice(source) });
+                },
+                .extern_def => |def| for (def.parameters) |parameter| {
+                    try labels.append(arena, .{ .label = parameter.name.slice(source) });
+                },
+                .macro_def => |def| for (def.parameters) |parameter| {
+                    try labels.append(arena, .{ .label = parameter.name.slice(source) });
+                },
+                else => continue,
             }
             // prefer the overload that still has room for the argument
             // being typed
@@ -1288,7 +1324,7 @@ fn collectPathExpressions(arena: std.mem.Allocator, module: *const ast.Module, i
     for (module.definitions) |definition| {
         switch (definition.kind) {
             .fn_def => |fn_def| try collectFromStatement(arena, fn_def.function.body, into),
-            .macro_def => |macro_def| try collectFromStatement(arena, macro_def.body, into),
+            .macro_def => |macro_def| if (macro_def.body) |body| try collectFromStatement(arena, body, into),
             else => {},
         }
     }

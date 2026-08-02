@@ -837,11 +837,13 @@ test "comptime expressions reject runtime state externs and indirections" {
         \\    const p = #boxed();
         \\    return p.value;
         \\}
-    , &.{"cannot carry a '&T' or '*T' indirection"});
+    , &.{"is a value or a slice, never"});
 }
 
 test "macros synthesise types and reflect at compile time" {
     try expectRuns(
+        \\macro struct_type();
+        \\macro type_of(value);
         \\macro vector2() {
         \\    var t = #struct_type();
         \\    t.add_member("x", #f32);
@@ -876,6 +878,7 @@ test "macros synthesise types and reflect at compile time" {
 test "macros synthesise enum types" {
     try expectRuns(
         \\extern printf(format: &[u8], ...) -> i32;
+        \\macro enum_type();
         \\macro signal() {
         \\    var t = #enum_type();
         \\    t.add_member("Idle", #void);
@@ -906,6 +909,7 @@ test "macros synthesise enum types" {
     // a synthesised enum compares structurally with a matching inline enum
     // (section 3.3 rule 7)
     try expectChecks(
+        \\macro enum_type();
         \\macro signal() {
         \\    var t = #enum_type();
         \\    t.add_member("Idle", #void);
@@ -932,6 +936,7 @@ test "macro misuse is reported" {
         \\fn main() -> i32 { return answer(); }
     , &.{"a macro call must be invoked with '#'"});
     try expectCheckErrors(
+        \\macro struct_type();
         \\fn main() -> i32 {
         \\    const t = #struct_type();
         \\    return 0;
@@ -1257,6 +1262,27 @@ test "a bare unsized array type is reported" {
         \\    const path: [u8] = "spec";
         \\}
     , &.{"a bare '[T]' has no size"});
+}
+
+test "name_of yields an enum value's variant name" {
+    try expectRuns(
+        \\macro name_of(value);
+        \\type State = enum { Idle, Busy: i32 };
+        \\fn main() -> i32 {
+        \\    const label = #name_of(State::Busy(4));
+        \\    return label.length() to i32;
+        \\}
+    , 4, "");
+}
+
+test "an unimplemented declared macro faults at the invocation" {
+    try expectCheckErrors(
+        \\macro mystery(value);
+        \\fn main() -> i32 {
+        \\    const v = #mystery(1);
+        \\    return 0;
+        \\}
+    , &.{"declared but not implemented"});
 }
 
 test "numeric widening follows sign classes" {
@@ -2506,6 +2532,7 @@ test "implementers_of reflects the whole merged unit" {
     const source =
         \\import pkg::libshape;
         \\import pkg::libcircle;
+        \\macro implementers_of(target);
         \\type Square : Shape = struct { side: i64 };
         \\type Plain = struct { value: i64 };
         \\fn area(self s: &Square) -> i64 { return 4; }
@@ -2950,6 +2977,30 @@ test "native executables drop owning interface objects" {
         \\    return (count - 1000) to i32;
         \\}
     , 58, "count 1058\n");
+}
+
+test "native executables materialize comptime aggregate values" {
+    try expectBuildsAndRuns("comptime_materialize",
+        \\macro symbols() {
+        \\    return ["+", "-=", "::", "..."];
+        \\}
+        \\macro numbers() {
+        \\    return [3, 5, 7];
+        \\}
+        \\fn main() -> i32 {
+        \\    const symbols = #symbols();
+        \\    const counts = #numbers();
+        \\    var total: u64 = 0;
+        \\    for (symbols) |symbol: &| {
+        \\        total += symbol.length();
+        \\    }
+        \\    var sum: i32 = 0;
+        \\    for (counts) |n| {
+        \\        sum += n;
+        \\    }
+        \\    return total to i32 * 10 + sum;
+        \\}
+    , 95, "");
 }
 
 test "native executables monomorphize lambdas inside generics" {
