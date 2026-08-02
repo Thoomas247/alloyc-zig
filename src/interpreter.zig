@@ -1394,6 +1394,23 @@ pub const Interpreter = struct {
                 }
             }
         }
+        // compile-time code may run before the extension's module is
+        // checked (eager macros evaluate mid-check), so no call target or
+        // struct identity exists yet: extensions resolve by name and
+        // arity, like every other comptime call (section 6.3)
+        if (self.comptime_mode) {
+            if (self.globals.get(name)) |symbols| {
+                for (symbols.items) |symbol| {
+                    if (!self.symbolVisible(symbol)) continue;
+                    if (symbol.definition.kind != .fn_def) continue;
+                    const fn_def = symbol.definition.kind.fn_def;
+                    const parameters = fn_def.function.parameters;
+                    if (parameters.len == 0 or !parameters[0].is_self) continue;
+                    if (parameters.len != call.arguments.len + 1) continue;
+                    return self.callExtension(symbol, fn_def, member, call, &.{});
+                }
+            }
+        }
         return self.fault("no resolved target for the call to '{s}' (not yet supported by the interpreter)", .{name});
     }
 

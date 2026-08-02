@@ -309,6 +309,10 @@ pub const Compilation = struct {
 
         const Request = struct {
             key: []const u8,
+            // the key qualified by the importing module's directory; tried
+            // first, so 'import token_kind' inside tokenizer/ finds
+            // tokenizer/token_kind.alloy before token_kind.alloy (5.4)
+            relative_key: ?[]const u8,
             span: Token.Location,
             importer_path: []const u8,
             importer_source: []const u8,
@@ -338,10 +342,25 @@ pub const Compilation = struct {
                     try key.appendSlice(arena, segment.slice(module.source));
                 }
                 const owned_key = try key.toOwnedSlice(arena);
-                if (compilation.loaded_keys.contains(owned_key)) continue;
+                var relative_key: ?[]const u8 = null;
+                if (module.library == null and
+                    !std.mem.startsWith(u8, owned_key, "std::") and
+                    !std.mem.startsWith(u8, owned_key, "pkg::"))
+                {
+                    if (module.key) |module_key| {
+                        if (std.mem.lastIndexOf(u8, module_key, "::")) |prefix_end| {
+                            relative_key = try std.fmt.allocPrint(arena, "{s}::{s}", .{ module_key[0..prefix_end], owned_key });
+                        }
+                    }
+                }
+                if (relative_key == null and compilation.loaded_keys.contains(owned_key)) continue;
                 var already_requested = false;
                 for (requests.items) |request| {
-                    if (std.mem.eql(u8, request.key, owned_key)) {
+                    const same_relative = if (request.relative_key) |left|
+                        if (relative_key) |right| std.mem.eql(u8, left, right) else false
+                    else
+                        relative_key == null;
+                    if (same_relative and std.mem.eql(u8, request.key, owned_key)) {
                         already_requested = true;
                         break;
                     }
@@ -349,6 +368,7 @@ pub const Compilation = struct {
                 if (already_requested) continue;
                 try requests.append(compilation.allocator, .{
                     .key = owned_key,
+                    .relative_key = relative_key,
                     .span = .{
                         .start = import.path[0].location.start,
                         .end = import.path[import.path.len - 1].location.end,
@@ -364,6 +384,22 @@ pub const Compilation = struct {
                 try compilation.loadPackage(request.key, request.span, request.importer_path, request.importer_source, loader);
                 continue;
             }
+            // the importing module's directory is searched first (5.4)
+            var relative_path: ?[]const u8 = null;
+            if (request.relative_key) |relative_key| {
+                if (compilation.loaded_keys.contains(relative_key)) continue;
+                const candidate_path = try importFilePath(arena, relative_key);
+                relative_path = candidate_path;
+                const relative_source: ?[]const u8 = if (loader) |active_loader|
+                    try active_loader.function(active_loader.context, arena, candidate_path)
+                else
+                    null;
+                if (relative_source) |loaded_source| {
+                    _ = try compilation.addImportedModule(relative_key, candidate_path, loaded_source);
+                    continue;
+                }
+            }
+            if (compilation.loaded_keys.contains(request.key)) continue;
             const file_path = try importFilePath(arena, request.key);
             const source: ?[]const u8 = if (loader) |active_loader|
                 try active_loader.function(active_loader.context, arena, file_path)
@@ -372,11 +408,15 @@ pub const Compilation = struct {
             if (source) |loaded_source| {
                 _ = try compilation.addImportedModule(request.key, file_path, loaded_source);
             } else {
+                const message = if (relative_path) |candidate|
+                    try std.fmt.allocPrint(arena, "module '{s}' not found (expected file '{s}' or '{s}')", .{ request.key, candidate, file_path })
+                else
+                    try std.fmt.allocPrint(arena, "module '{s}' not found (expected file '{s}')", .{ request.key, file_path });
                 try compilation.diagnostics.append(compilation.allocator, .{
                     .path = request.importer_path,
                     .source = request.importer_source,
                     .span = request.span,
-                    .message = try std.fmt.allocPrint(arena, "module '{s}' not found (expected file '{s}')", .{ request.key, file_path }),
+                    .message = message,
                 });
             }
         }
@@ -783,6 +823,27 @@ test "the interpreter drives custom iterables through the cursor protocol" {
     defer output.deinit();
     const exit_code = try compilation.interpret(&output.writer);
     try std.testing.expectEqual(@as(i64, 10), exit_code);
+}
+
+test "imports resolve relative to the importing module first" {
+    // nested/helper imports 'sibling': the nested/ copy must win over the
+    // entry-root copy; 'lonely' has no nested copy and falls back
+    var sources = TestSources.initComptime(.{
+        .{ "nested/helper.alloy", "import sibling;\nimport lonely;\npub fn combined() -> i64 { return near() + far(); }" },
+        .{ "nested/sibling.alloy", "pub fn near() -> i64 { return 10; }" },
+        .{ "sibling.alloy", "pub fn near() -> i64 { return 999; }" },
+        .{ "lonely.alloy", "pub fn far() -> i64 { return 3; }" },
+    });
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy",
+        "import nested::helper;\nfn main() -> i64 { return combined(); }");
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 13), exit_code);
 }
 
 test "the interpreter resolves generic type parameters at runtime" {
@@ -1273,6 +1334,35 @@ test "name_of yields an enum value's variant name" {
         \\    return label.length() to i32;
         \\}
     , 4, "");
+}
+
+test "macro bodies never surface checker diagnostics" {
+    // section 6.3: bodies are not statically checked - the tooling pass
+    // that types them for the editor must swallow every complaint
+    try expectChecks(
+        \\macro struct_type();
+        \\type Point = struct { x: i32 };
+        \\macro helper(width: i64) {
+        \\    var t = #struct_type();
+        \\    t.add_member(1, 2, 3, 4);
+        \\    const wrong: bool = width + Point { .x = true };
+        \\    return wrong + t.no_such_method();
+        \\}
+        \\fn main() -> i32 { return 0; }
+    );
+}
+
+test "a faulting type initializer is diagnosed even when unused" {
+    // the macro yields void, not a '#Type'; the type is never used, but
+    // the declaration still evaluates and reports
+    try expectCheckErrors(
+        \\macro enum_type();
+        \\macro broken() {
+        \\    var t = #enum_type();
+        \\}
+        \\type Never = #broken();
+        \\fn main() -> i32 { return 0; }
+    , &.{"must yield a '#Type'"});
 }
 
 test "an unimplemented declared macro faults at the invocation" {

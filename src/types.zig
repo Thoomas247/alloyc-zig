@@ -147,6 +147,9 @@ pub const Type = union(enum) {
     // a synthesised enum ('type T = #...', section 3.4): a resolved variant
     // list with no syntax behind it
     structural_enum: []const EnumVariant,
+    // the '#Type' reflection value (section 3.4): compile-time only, typed
+    // for tooling so macro bodies get hover and method completion
+    type_description,
 
     pub const Indirection = struct {
         mutable: bool,
@@ -209,7 +212,7 @@ pub const Type = union(enum) {
         if (left == right) return true;
         if (std.meta.activeTag(left.*) != std.meta.activeTag(right.*)) return false;
         return switch (left.*) {
-            .unknown, .void_type, .untyped_integer, .untyped_float => true,
+            .unknown, .void_type, .untyped_integer, .untyped_float, .type_description => true,
             .primitive => |primitive| primitive == right.primitive,
             .pointer => |indirection| indirection.mutable == right.pointer.mutable and indirection.child.eql(right.pointer.child),
             .reference => |indirection| indirection.mutable == right.reference.mutable and indirection.child.eql(right.reference.child),
@@ -289,6 +292,7 @@ pub const Type = union(enum) {
     fn write(self: *const Type, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.*) {
             .unknown => try writer.writeAll("<error>"),
+            .type_description => try writer.writeAll("#Type"),
             .void_type => try writer.writeAll("void"),
             .untyped_integer => try writer.writeAll("<integer literal>"),
             .untyped_float => try writer.writeAll("<float literal>"),

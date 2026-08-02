@@ -782,6 +782,20 @@ pub const Resolver = struct {
                 return std.fmt.allocPrint(self.arena, "pkg::{s}::{s}", .{ package_name, joined });
             }
         }
+        // an import resolves relative to the importing module first (5.4):
+        // when the loader found the file there, the module is registered
+        // under the directory-qualified key, which this must mirror
+        if (view.library == null and
+            !std.mem.startsWith(u8, joined, "std::") and
+            !std.mem.startsWith(u8, joined, "pkg::"))
+        {
+            if (view.key) |module_key| {
+                if (std.mem.lastIndexOf(u8, module_key, "::")) |prefix_end| {
+                    const relative = try std.fmt.allocPrint(self.arena, "{s}::{s}", .{ module_key[0..prefix_end], joined });
+                    if (self.module_keys.contains(relative)) return relative;
+                }
+            }
+        }
         return joined;
     }
 

@@ -86,16 +86,31 @@ pub const Checker = struct {
     // site answers from here. A rebind of the same span appends again, so
     // consumers scanning from the end see the most refined entry first.
     declaration_types: std.ArrayList(DeclaredLocal) = .empty,
+    // the resolved target of every checked call, by the callee's NAME token
+    // span; tooling only - hover and go-to-definition on a call resolve
+    // here first, never by bare name (overloads and associated functions
+    // share names across types)
+    call_name_targets: std.ArrayList(CallNameTarget) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
     // synthesised types per 'type T = #...' expression (section 3.4)
     comptime_type_cache: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
     // nonzero while checking inside a '#' expression: macro calls are only
     // legal there (section 6.3)
     comptime_depth: usize = 0,
+    // set during the best-effort pass over macro bodies (section 6.3:
+    // bodies are not statically checked): diagnostics are suppressed and
+    // comptime evaluation never scheduled - only the tooling tables fill
+    tooling_only: bool = false,
 
     const Frame = struct {
         bindings: std.ArrayList(Binding),
         barrier: bool,
+    };
+
+    pub const CallNameTarget = struct {
+        view_index: usize,
+        span: Token.Location,
+        symbol: resolution.Symbol,
     };
 
     pub const DeclaredLocal = struct {
@@ -175,9 +190,17 @@ pub const Checker = struct {
     }
 
     pub fn run(self: *Checker) Error!void {
-        for (self.views, 0..) |view, view_index| {
+        // views load breadth-first from the entry module, so reverse order
+        // checks dependencies before their importers. Eager macros evaluate
+        // MID-CHECK (section 6.3), and their bodies call imported code -
+        // which must already carry its side tables by then. Imports are
+        // also textually earlier in program order, matching the
+        // declaration-order rule.
+        var view_index = self.views.len;
+        while (view_index > 0) {
+            view_index -= 1;
             self.current_view = view_index;
-            for (view.module.definitions) |*definition| {
+            for (self.views[view_index].module.definitions) |*definition| {
                 try self.checkDefinition(definition);
             }
         }
@@ -213,17 +236,52 @@ pub const Checker = struct {
                     try self.report(fn_def.name.location, "control can fall off the end of '{s}', which must return {s} on every path (section 4.3)", .{ fn_def.name.slice(self.source()), rendered });
                 }
             },
-            .macro_def => |macro_def| {
-                // macro bodies run in the compile-time interpreter (section
-                // 6.3); they are name-resolved but not yet type checked
-                _ = macro_def;
+            .macro_def => |macro_def| try self.checkMacroBody(macro_def),
+            .type_def => |type_def| {
+                // a '#' type initializer evaluates here even when the type
+                // is never used: a faulting macro is diagnosed at the
+                // declaration, not silently deferred until first use.
+                // Generic types are excluded - they only reflect as
+                // instances (section 3.4)
+                if (type_def.base.* == .comptime_type and type_def.type_parameters.len == 0) {
+                    _ = try self.comptimeType(type_def.base.comptime_type, self.current_view);
+                }
+                try self.verifyInterfaces(definition, type_def);
             },
-            .type_def => |type_def| try self.verifyInterfaces(definition, type_def),
             // extern and interface declarations carry no bodies; their type
             // expressions were validated during name resolution and are
             // materialized on use
             .extern_def, .interface_def => {},
         }
+    }
+
+    // best-effort typing over a macro body, purely for tooling: macro
+    // bodies are not statically checked (section 6.3), so every diagnostic
+    // is suppressed and no comptime evaluation is scheduled - but the
+    // recorded expression, place, and declaration types give macro bodies
+    // hover and member completion in the editor
+    fn checkMacroBody(self: *Checker, macro_def: ast.MacroDef) Error!void {
+        const body = macro_def.body orelse return;
+        self.tooling_only = true;
+        defer self.tooling_only = false;
+        try self.pushFrame(false);
+        defer self.popFrame();
+        for (macro_def.parameters) |parameter| {
+            const parameter_type: *const Type = if (parameter.parameter_type) |annotation|
+                try self.typeFromExpression(annotation, &empty_type_environment)
+            else
+                &unknown_type;
+            try self.bind(parameter.name, parameter_type, false);
+        }
+        const saved_return = self.return_type;
+        const saved_inferred = self.inferred_return;
+        self.return_type = null;
+        self.inferred_return = null;
+        defer {
+            self.return_type = saved_return;
+            self.inferred_return = saved_inferred;
+        }
+        try self.checkStatement(body);
     }
 
     // static verification that a marked type satisfies its interfaces
@@ -664,6 +722,18 @@ pub const Checker = struct {
             .environment = try self.declaredEnvironment(resolved.declared),
             .view_index = resolved.declared.view_index,
         };
+    }
+
+    // the declared type of a type definition with no arguments, for
+    // tooling that starts from a symbol rather than an expression
+    pub fn declaredTypeOf(self: *Checker, definition: *const ast.Definition, view_index: usize) Error!*const Type {
+        const type_def = definition.kind.type_def;
+        return self.makeType(.{ .declared = .{
+            .definition = definition,
+            .view_index = view_index,
+            .name = type_def.name.slice(self.views[view_index].source),
+            .arguments = &.{},
+        } });
     }
 
     pub const EnumBody = struct {
@@ -1502,6 +1572,7 @@ pub const Checker = struct {
                 // a '#' nested inside another '#' evaluates as part of the
                 // outer expression, never on its own
                 if (self.comptime_depth > 0) return result;
+                if (self.tooling_only) return result;
                 if (self.needsEagerComptime(inner)) {
                     const environment = try self.snapshotComptimeEnvironment();
                     if (try self.runValueComptime(expression, inner, self.current_view, environment)) |value| {
@@ -1560,6 +1631,17 @@ pub const Checker = struct {
                 // pointee transparency: reading a pointer or reference yields
                 // a copy of the pointee (section 4.2)
                 return self.pierce(binding.binding_type);
+            }
+            // '#T' reflects a type (section 3.4): typed for the tooling
+            // pass so '#Point.' completes the '#Type' methods
+            if (self.tooling_only and self.comptime_depth > 0) {
+                if (primitiveByName(name) != null) return self.makeType(.type_description);
+                if (self.firstVisible(name, self.current_view)) |symbol| {
+                    switch (symbol.definition.kind) {
+                        .type_def, .interface_def => return self.makeType(.type_description),
+                        else => {},
+                    }
+                }
             }
             const symbols = try self.visibleSymbols(name, .unqualified, self.current_view);
             if (symbols.items.len != 0) {
@@ -3045,6 +3127,11 @@ pub const Checker = struct {
                 for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
                 return &unknown_type;
             }
+            // the '#Type' reflection methods (section 3.4)
+            if (receiver.pierced.* == .type_description) {
+                for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
+                return self.typeDescriptionMethodResult(name, member.name.location);
+            }
             // calls through an interface object dispatch at runtime via the
             // vtable; the interface declaration is the signature (section 5.2)
             if (receiver.pierced.* == .interface) {
@@ -3828,6 +3915,20 @@ pub const Checker = struct {
         if (type_bindings.len != 0) {
             try self.call_type_bindings.put(self.arena, key, type_bindings);
         }
+        if (key.* == .call) {
+            const name_token: ?Token = switch (key.call.callee.*) {
+                .path => |path| path[path.len - 1],
+                .member => |member| member.name,
+                else => null,
+            };
+            if (name_token) |token| {
+                try self.call_name_targets.append(self.arena, .{
+                    .view_index = self.current_view,
+                    .span = token.location,
+                    .symbol = symbol,
+                });
+            }
+        }
     }
 
     // the reporting pass for contextual arguments, run once the overload
@@ -3882,6 +3983,10 @@ pub const Checker = struct {
                                 try self.typeMismatch(self.expressionSpan(call.arguments[index]), argument_type, parameter_type);
                             }
                         }
+                    }
+                    // the std::macros built-ins have known result types
+                    if (macro_def.body == null) {
+                        if (try self.builtinMacroResultType(name)) |known| return known;
                     }
                     return &unknown_type;
                 },
@@ -4563,6 +4668,54 @@ pub const Checker = struct {
         };
     }
 
+    // the known result types of the std::macros built-ins (section 6.4)
+    fn builtinMacroResultType(self: *Checker, name: []const u8) Error!?*const Type {
+        if (std.mem.eql(u8, name, "struct_type") or
+            std.mem.eql(u8, name, "enum_type") or
+            std.mem.eql(u8, name, "type_of"))
+        {
+            return try self.makeType(.type_description);
+        }
+        if (std.mem.eql(u8, name, "name_of")) {
+            return try self.stringSliceType();
+        }
+        if (std.mem.eql(u8, name, "implementers_of")) {
+            return try self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.type_description) } });
+        }
+        return null;
+    }
+
+    // the '#Type' method surface of section 3.4, by name
+    fn typeDescriptionMethodResult(self: *Checker, name: []const u8, span: Token.Location) Error!*const Type {
+        if (std.mem.eql(u8, name, "is_struct") or
+            std.mem.eql(u8, name, "is_enum") or
+            std.mem.eql(u8, name, "is_primitive") or
+            std.mem.eql(u8, name, "is_interface") or
+            std.mem.eql(u8, name, "implements_interface") or
+            std.mem.eql(u8, name, "equals"))
+        {
+            return self.makeType(.{ .primitive = .bool });
+        }
+        if (std.mem.eql(u8, name, "name")) {
+            return self.stringSliceType();
+        }
+        if (std.mem.eql(u8, name, "member_names")) {
+            return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.stringSliceType() } });
+        }
+        if (std.mem.eql(u8, name, "member_types")) {
+            return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.type_description) } });
+        }
+        if (std.mem.eql(u8, name, "add_member") or std.mem.eql(u8, name, "remove_member")) {
+            return &void_type;
+        }
+        try self.report(span, "'{s}' is not a '#Type' method (section 3.4)", .{name});
+        return &unknown_type;
+    }
+
+    fn stringSliceType(self: *Checker) Error!*const Type {
+        return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.{ .primitive = .u8 }) } });
+    }
+
     fn makeType(self: *Checker, value: Type) Error!*const Type {
         const node = try self.arena.create(Type);
         node.* = value;
@@ -4574,6 +4727,7 @@ pub const Checker = struct {
     }
 
     fn report(self: *Checker, span: Token.Location, comptime format: []const u8, arguments: anytype) Error!void {
+        if (self.tooling_only) return;
         const view = self.views[self.current_view];
         try self.diagnostics.append(self.diagnostics_allocator, .{
             .path = view.path,

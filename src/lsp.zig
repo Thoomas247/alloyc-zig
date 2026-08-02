@@ -17,6 +17,22 @@ const Token = tokenizer_module.Token;
 const ast = @import("ast.zig");
 const formatter = @import("formatter.zig");
 
+// the '#Type' reflection methods (section 3.4), offered after '.' on a
+// value the tooling pass typed as a '#Type'
+const type_description_completions = [_]struct { name: []const u8, detail: []const u8 }{
+    .{ .name = "name", .detail = "() -> &[u8]" },
+    .{ .name = "is_struct", .detail = "() -> bool" },
+    .{ .name = "is_enum", .detail = "() -> bool" },
+    .{ .name = "is_primitive", .detail = "() -> bool" },
+    .{ .name = "is_interface", .detail = "() -> bool" },
+    .{ .name = "implements_interface", .detail = "(other: #Type) -> bool" },
+    .{ .name = "equals", .detail = "(other: #Type) -> bool" },
+    .{ .name = "add_member", .detail = "(name: &[u8], type: #Type)" },
+    .{ .name = "remove_member", .detail = "(name: &[u8])" },
+    .{ .name = "member_names", .detail = "() -> &[&[u8]]" },
+    .{ .name = "member_types", .detail = "() -> &[#Type]" },
+};
+
 // the declaration-only macros of std::macros (section 6.4), offered after
 // '#' even when the import is not written yet
 const builtin_macro_completions = [_]struct { name: []const u8, detail: []const u8 }{
@@ -692,6 +708,13 @@ pub const Server = struct {
         const pierced = checker.pierce(recorded) catch return;
         const resolved = checker.resolveAlias(pierced) catch return;
 
+        // a '#Type' value exposes the reflection methods (section 3.4)
+        if (resolved.* == .type_description) {
+            for (type_description_completions) |method| {
+                try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
+            }
+            return;
+        }
         if (checker.structuralFieldsOf(resolved) catch null) |fields| {
             for (fields) |field| {
                 try items.append(arena, .{
@@ -730,10 +753,24 @@ pub const Server = struct {
             if (!std.mem.eql(u8, symbol.name, prefix)) continue;
             if (symbol.definition.kind != .type_def) continue;
             const type_def = symbol.definition.kind.type_def;
-            if (type_def.base.* != .enum_type) continue;
-            const enum_source = unit.views[symbol.view_index].source;
-            for (type_def.base.enum_type) |member| {
-                try items.append(arena, .{ .label = member.name.slice(enum_source), .kind = 20 });
+            if (type_def.base.* == .enum_type) {
+                const enum_source = unit.views[symbol.view_index].source;
+                for (type_def.base.enum_type) |member| {
+                    try items.append(arena, .{ .label = member.name.slice(enum_source), .kind = 20 });
+                }
+                return;
+            }
+            // an aliased or synthesised enum ('type T = #...') has no
+            // syntactic members; the checker resolved its variants
+            const checker = unit.checker orelse continue;
+            const declared = checker.declaredTypeOf(symbol.definition, symbol.view_index) catch continue;
+            const body = (checker.enumBody(declared) catch continue) orelse continue;
+            for (body.variants) |variant| {
+                const detail: ?[]const u8 = if (variant.payload) |payload|
+                    payload.render(arena) catch null
+                else
+                    null;
+                try items.append(arena, .{ .label = variant.name, .kind = 20, .detail = detail });
             }
             return;
         }
@@ -775,6 +812,18 @@ pub const Server = struct {
                 });
             }
         }
+        // a call's checked target resolves overloads and associated
+        // functions exactly (String::empty vs Vector::empty), so it wins
+        // over matching globals by bare name
+        if (self.callTargetAtPosition(params)) |target| {
+            for (self.symbols.items) |symbol| {
+                if (symbol.definition != target.definition) continue;
+                const rendered = try std.fmt.allocPrint(arena, "```alloy\n{s}\n```", .{symbol.detail});
+                return self.respond(id, .{
+                    .contents = .{ .kind = "markdown", .value = rendered },
+                });
+            }
+        }
         const word = self.wordAtRequestPosition(params) orelse return self.respond(id, null);
         for (self.symbols.items) |symbol| {
             if (!std.mem.eql(u8, symbol.name, word)) continue;
@@ -784,6 +833,25 @@ pub const Server = struct {
             });
         }
         try self.respond(id, null);
+    }
+
+    // the checked target of the call whose callee name token covers the
+    // cursor. Scanned backwards: a re-analysis appends fresh records last
+    fn callTargetAtPosition(self: *Server, params: std.json.Value) ?resolution.Symbol {
+        const location = self.requestLocation(params) orelse return null;
+        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return null;
+        const unit = self.analysis orelse return null;
+        const checker = unit.checker orelse return null;
+        const targets = checker.call_name_targets.items;
+        var index = targets.len;
+        while (index > 0) {
+            index -= 1;
+            const target = targets[index];
+            if (target.view_index != view_index) continue;
+            if (location.offset < target.span.start or location.offset > target.span.end) continue;
+            return target.symbol;
+        }
+        return null;
     }
 
     const TypedNode = struct {
@@ -854,6 +922,16 @@ pub const Server = struct {
         // a '::'-qualified or implied enum variant navigates to the member
         if (try self.enumMemberDefinition(arena, params)) |member_location| {
             return self.respond(id, member_location);
+        }
+        // a call's checked target beats matching globals by bare name
+        if (self.callTargetAtPosition(params)) |target| {
+            for (self.symbols.items) |symbol| {
+                if (symbol.definition != target.definition) continue;
+                return self.respond(id, LspLocation{
+                    .uri = symbol.uri,
+                    .range = symbol.range,
+                });
+            }
         }
         const word = self.wordAtRequestPosition(params) orelse return self.respond(id, null);
         for (self.symbols.items) |symbol| {
@@ -1102,27 +1180,21 @@ pub const Server = struct {
         const open_document = self.documents.get(path) orelse return self.respond(id, null);
         const text = open_document.text;
 
-        var classes: std.StringHashMapUnmanaged(u32) = .empty;
-        for (self.symbols.items) |symbol| {
-            const class: u32 = switch (symbol.definition.kind) {
-                .fn_def, .extern_def => 0,
-                .type_def => 1,
-                .interface_def => 2,
-                .macro_def => 3,
-            };
-            const entry = try classes.getOrPut(arena, symbol.name);
-            if (!entry.found_existing) entry.value_ptr.* = class;
-        }
-
-        // local occurrences classify by span; only current analyses line up
-        // with the open text (a stale one kept past a failed parse has
-        // shifted offsets, so its spans would color the wrong tokens)
-        var local_classes: std.AutoHashMapUnmanaged(usize, u32) = .empty;
+        // resolution-exact classification: every occurrence colors by what
+        // the resolver actually bound it to, never by name coincidence (a
+        // module or member sharing a macro's name stays uncolored). Only a
+        // current analysis lines up with the open text; a stale one kept
+        // past a failed parse falls back to name-based global classes so
+        // colors stay stable while typing.
+        const SpanClass = struct { end: usize, class: u32 };
+        var span_classes: std.AutoHashMapUnmanaged(usize, SpanClass) = .empty;
+        var fresh = false;
         if (self.viewIndexOfPath(path) catch null) |view_index| {
             if (self.analysis) |unit| {
                 if (unit.merged) |merged| {
                     const view = unit.views[view_index];
                     if (std.mem.eql(u8, view.source, text)) {
+                        fresh = true;
                         for (merged.locals) |local| {
                             if (local.view_index != view_index) continue;
                             const class: u32 = switch (local.kind) {
@@ -1130,10 +1202,35 @@ pub const Server = struct {
                                 .parameter => 5,
                                 .type_parameter => 6,
                             };
-                            try local_classes.put(arena, local.span.start, class);
+                            try span_classes.put(arena, local.span.start, .{ .end = local.span.end, .class = class });
+                        }
+                        // resolved uses of globals; multi-token qualified
+                        // paths are left to the grammar
+                        for (merged.references) |reference| {
+                            if (reference.view_index != view_index) continue;
+                            try span_classes.put(arena, reference.span.start, .{
+                                .end = reference.span.end,
+                                .class = definitionClass(reference.definition),
+                            });
+                        }
+                        // the definitions' own name tokens
+                        for (view.module.definitions) |*module_definition| {
+                            const name_token = definitionName(module_definition);
+                            try span_classes.put(arena, name_token.location.start, .{
+                                .end = name_token.location.end,
+                                .class = definitionClass(module_definition),
+                            });
                         }
                     }
                 }
+            }
+        }
+
+        var name_classes: std.StringHashMapUnmanaged(u32) = .empty;
+        if (!fresh) {
+            for (self.symbols.items) |symbol| {
+                const entry = try name_classes.getOrPut(arena, symbol.name);
+                if (!entry.found_existing) entry.value_ptr.* = definitionClass(symbol.definition);
             }
         }
 
@@ -1145,9 +1242,16 @@ pub const Server = struct {
             const token = scanner.next();
             if (token.tag == .end_of_file) break;
             if (token.tag != .identifier) continue;
-            // a local wins over a same-named global: shadowing is legal
-            const class = local_classes.get(token.location.start) orelse
-                classes.get(token.slice(text)) orelse continue;
+            const class = class: {
+                if (fresh) {
+                    const found = span_classes.get(token.location.start) orelse continue;
+                    // a single-token match only: a qualified path's span
+                    // covers several tokens and stays grammar-colored
+                    if (found.end != token.location.end) continue;
+                    break :class found.class;
+                }
+                break :class name_classes.get(token.slice(text)) orelse continue;
+            };
             const position = positionOf(text, token.location.start);
             const length = utf16Length(text[token.location.start..token.location.end]);
             const delta_line = position.line - previous_line;
@@ -1258,6 +1362,16 @@ fn definitionName(definition: *const ast.Definition) Token {
         .extern_def => |def| def.name,
         .interface_def => |def| def.name,
         .macro_def => |def| def.name,
+    };
+}
+
+// the semantic token class of a definition's kind (legend order)
+fn definitionClass(definition: *const ast.Definition) u32 {
+    return switch (definition.kind) {
+        .fn_def, .extern_def => 0,
+        .type_def => 1,
+        .interface_def => 2,
+        .macro_def => 3,
     };
 }
 
@@ -1806,6 +1920,97 @@ test "declaration sites hover and locals classify as semantic tokens" {
     // 'helper' classifies as function (0), 'value' as parameter (5), then
     // 'total' and the following uses as variable (4) / parameter (5)
     try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,3,6,0,0,0,7,5,5,0,1,8,5,4,0,0,13,5,5,0,1,11,5,4,0]") != null);
+}
+
+test "hover on a call resolves the checked target, not the first name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/associated.alloy";
+    // Left::make and Right::make share a bare name; the call target
+    // decides, never declaration order
+    const source =
+        "type Left = struct { value: i64 };\n" ++
+        "type Right = struct { value: i64 };\n" ++
+        "fn Left::make() -> Left { return Left { .value = 1 }; }\n" ++
+        "fn Right::make() -> Right { return Right { .value = 2 }; }\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const r = Right::make();\n" ++
+        "    return r.value to i32;\n" ++
+        "}\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = source } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/hover",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 5, .character = 23 } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "fn Right::make") != null);
+}
+
+test "semantic tokens color by resolution, not by name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/resolution_colors.alloy";
+    // the struct member shares the macro's name: it must stay uncolored
+    const source =
+        "macro build(x: i64) { return x; }\n" ++
+        "type Pair = struct { build: i64 };\n" ++
+        "fn main() -> i32 { return 0; }\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = source } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/semanticTokens/full",
+            .params = .{ .textDocument = .{ .uri = uri } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    // 'build' macro name (3), 'x' parameter declaration and use (5),
+    // 'Pair' type name (1), 'main' function name (0) - and NO token for
+    // the 'build' struct member, which only shares the macro's name
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,6,5,3,0,0,6,1,5,0,0,17,1,5,0,1,5,4,1,0,1,3,4,0,0]") != null);
 }
 
 test "the outline survives an edit that fails to parse" {
