@@ -25,7 +25,7 @@ const keyword_completions = [_][]const u8{
 };
 
 // the semantic token legend registered at initialize; indexes match
-const semantic_token_types = [_][]const u8{ "function", "type", "interface", "macro" };
+const semantic_token_types = [_][]const u8{ "function", "type", "interface", "macro", "variable", "parameter", "typeParameter" };
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -785,6 +785,24 @@ pub const Server = struct {
             } orelse continue;
             return .{ .word = segments[0].slice(view.source), .recorded = recorded };
         }
+        // declaration sites are not expressions; the checker records them
+        // separately. Scanned backwards so a rebind (a capture bound as a
+        // placeholder first, then with its real type) answers with the
+        // refined entry.
+        if (unit.checker) |checker| {
+            const declarations = checker.declaration_types.items;
+            var index = declarations.len;
+            while (index > 0) {
+                index -= 1;
+                const declaration = declarations[index];
+                if (declaration.view_index != view_index) continue;
+                if (location.offset < declaration.span.start or location.offset > declaration.span.end) continue;
+                return .{
+                    .word = view.source[declaration.span.start..declaration.span.end],
+                    .recorded = declaration.binding_type,
+                };
+            }
+        }
         return null;
     }
 
@@ -1063,6 +1081,29 @@ pub const Server = struct {
             if (!entry.found_existing) entry.value_ptr.* = class;
         }
 
+        // local occurrences classify by span; only current analyses line up
+        // with the open text (a stale one kept past a failed parse has
+        // shifted offsets, so its spans would color the wrong tokens)
+        var local_classes: std.AutoHashMapUnmanaged(usize, u32) = .empty;
+        if (self.viewIndexOfPath(path) catch null) |view_index| {
+            if (self.analysis) |unit| {
+                if (unit.merged) |merged| {
+                    const view = unit.views[view_index];
+                    if (std.mem.eql(u8, view.source, text)) {
+                        for (merged.locals) |local| {
+                            if (local.view_index != view_index) continue;
+                            const class: u32 = switch (local.kind) {
+                                .variable => 4,
+                                .parameter => 5,
+                                .type_parameter => 6,
+                            };
+                            try local_classes.put(arena, local.span.start, class);
+                        }
+                    }
+                }
+            }
+        }
+
         var data: std.ArrayList(u32) = .empty;
         var scanner = tokenizer_module.Tokenizer.init(text);
         var previous_line: u32 = 0;
@@ -1071,7 +1112,9 @@ pub const Server = struct {
             const token = scanner.next();
             if (token.tag == .end_of_file) break;
             if (token.tag != .identifier) continue;
-            const class = classes.get(token.slice(text)) orelse continue;
+            // a local wins over a same-named global: shadowing is legal
+            const class = local_classes.get(token.location.start) orelse
+                classes.get(token.slice(text)) orelse continue;
             const position = positionOf(text, token.location.start);
             const length = utf16Length(text[token.location.start..token.location.end]);
             const delta_line = position.line - previous_line;
@@ -1667,6 +1710,66 @@ test "the server answers references, rename, symbols, tokens, help, and hover" {
     try std.testing.expect(std.mem.indexOf(u8, transcript, "total: i64") != null);
     // the incremental change re-ran the pipeline and found the new error
     try std.testing.expect(std.mem.indexOf(u8, transcript, "use of undeclared identifier 'missing'") != null);
+}
+
+test "declaration sites hover and locals classify as semantic tokens" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/locals.alloy";
+    const source =
+        "fn helper(value: i64) -> i64 {\n" ++
+        "    var total: i64 = value;\n" ++
+        "    return total;\n" ++
+        "}\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = source } },
+        }, .{}),
+        // hover the parameter's declaration name, not a use
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/hover",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 11 } },
+        }, .{}),
+        // hover the variable's declaration name
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 3,
+            .method = "textDocument/hover",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 1, .character = 9 } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 4,
+            .method = "textDocument/semanticTokens/full",
+            .params = .{ .textDocument = .{ .uri = uri } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    // both declaration names hover with their checked types
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "value: i64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "total: i64") != null);
+    // 'helper' classifies as function (0), 'value' as parameter (5), then
+    // 'total' and the following uses as variable (4) / parameter (5)
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,3,6,0,0,0,7,5,5,0,1,8,5,4,0,0,13,5,5,0,1,11,5,4,0]") != null);
 }
 
 test "the outline survives an edit that fails to parse" {

@@ -81,6 +81,11 @@ pub const Checker = struct {
     // binding types of path expressions resolved as PLACES (receivers,
     // assignment targets), which bypass checkExpression; tooling only
     place_types: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
+    // every local declaration (parameter, variable, capture) with its name
+    // token span and binding type; tooling only - hover on a declaration
+    // site answers from here. A rebind of the same span appends again, so
+    // consumers scanning from the end see the most refined entry first.
+    declaration_types: std.ArrayList(DeclaredLocal) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
     // synthesised types per 'type T = #...' expression (section 3.4)
     comptime_type_cache: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
@@ -91,6 +96,12 @@ pub const Checker = struct {
     const Frame = struct {
         bindings: std.ArrayList(Binding),
         barrier: bool,
+    };
+
+    pub const DeclaredLocal = struct {
+        view_index: usize,
+        span: Token.Location,
+        binding_type: *const Type,
     };
 
     pub const Binding = struct {
@@ -530,6 +541,9 @@ pub const Checker = struct {
                 const element = try self.typeFromExpressionIn(array.element, environment, view_index);
                 const length_token = array.length orelse {
                     // a bare unsized array only exists behind & or * above
+                    if (typeExpressionToken(expression)) |token| {
+                        try self.report(token.location, "a bare '[T]' has no size; write '&[T]' for a slice, '*[T]' for a heap array, or '[T : N]' for a fixed array (section 3.2)", .{});
+                    }
                     return &unknown_type;
                 };
                 const length = parseIntegerLiteral(length_token.slice(view_source)) catch 0;
@@ -2320,9 +2334,8 @@ pub const Checker = struct {
 
         try self.pushFrame(true);
         defer self.popFrame();
-        for (capture_bindings.items) |binding| {
-            const frame = &self.scopes.items[self.scopes.items.len - 1];
-            try frame.bindings.append(self.arena, binding);
+        for (lambda.captures, capture_bindings.items) |capture, binding| {
+            try self.bindComputed(capture.name, binding);
         }
 
         var parameter_types: std.ArrayList(*const Type) = .empty;
@@ -2522,8 +2535,7 @@ pub const Checker = struct {
             const place = try self.lvalueOf(cast.operand);
             const raw = if (place) |info| info.raw else subject_type;
             const binding = try self.downcastBinding(capture, raw, target);
-            const frame = &self.scopes.items[self.scopes.items.len - 1];
-            try frame.bindings.append(self.arena, binding);
+            try self.bindComputed(capture.name, binding);
             return;
         }
         const body = try self.enumBody(subject_type) orelse {
@@ -2543,8 +2555,7 @@ pub const Checker = struct {
         const place = try self.lvalueOf(cast.operand);
         const subject_mutable = if (place) |info| info.mutable else false;
         const binding = try self.captureBinding(capture, payload_type, subject_mutable, try self.pierce(payload_type));
-        const frame = &self.scopes.items[self.scopes.items.len - 1];
-        try frame.bindings.append(self.arena, binding);
+        try self.bindComputed(capture.name, binding);
     }
 
     fn checkWhile(self: *Checker, while_expr: ast.WhileExpression, expression: *const ast.Expression, as_value: bool) Error!*const Type {
@@ -2631,8 +2642,7 @@ pub const Checker = struct {
             const element = if (capture_index < element_types.items.len) element_types.items[capture_index] else &unknown_type;
             const mutable = if (capture_index < element_mutability.items.len) element_mutability.items[capture_index] else false;
             const binding = try self.captureBinding(capture, element, mutable, try self.pierce(element));
-            const frame = &self.scopes.items[self.scopes.items.len - 1];
-            try frame.bindings.append(self.arena, binding);
+            try self.bindComputed(capture.name, binding);
         }
         if (for_expr.captures.len != for_expr.subjects.len and for_expr.captures.len != 0) {
             try self.report(self.expressionSpan(expression), "{d} subject(s) but {d} capture(s)", .{ for_expr.subjects.len, for_expr.captures.len });
@@ -2903,8 +2913,7 @@ pub const Checker = struct {
                 return;
             };
             const binding = try self.captureBinding(arm_capture, payload_type, subject_mutable, try self.pierce(payload_type));
-            const frame = &self.scopes.items[self.scopes.items.len - 1];
-            try frame.bindings.append(self.arena, binding);
+            try self.bindComputed(arm_capture.name, binding);
         }
     }
 
@@ -2943,8 +2952,7 @@ pub const Checker = struct {
         }
         if (capture) |arm_capture| {
             const binding = try self.downcastBinding(arm_capture, subject_raw, target);
-            const frame = &self.scopes.items[self.scopes.items.len - 1];
-            try frame.bindings.append(self.arena, binding);
+            try self.bindComputed(arm_capture.name, binding);
         }
     }
 
@@ -4444,6 +4452,23 @@ pub const Checker = struct {
             .binding_type = binding_type,
             .mutable = mutable,
         });
+        try self.declaration_types.append(self.arena, .{
+            .view_index = self.current_view,
+            .span = name_token.location,
+            .binding_type = binding_type,
+        });
+    }
+
+    // appends a pre-computed binding (captures carry their own mutability
+    // and type) and records its declaration span for tooling
+    fn bindComputed(self: *Checker, name_token: Token, binding: Binding) Error!void {
+        const frame = &self.scopes.items[self.scopes.items.len - 1];
+        try frame.bindings.append(self.arena, binding);
+        try self.declaration_types.append(self.arena, .{
+            .view_index = self.current_view,
+            .span = name_token.location,
+            .binding_type = binding.binding_type,
+        });
     }
 
     fn lookup(self: *const Checker, name: []const u8) ?Binding {
@@ -4526,6 +4551,25 @@ pub const Checker = struct {
                 index += 1;
             }
         }
+    }
+
+    // the first source token inside a type expression, for diagnostics
+    fn typeExpressionToken(expression: *const ast.TypeExpression) ?Token {
+        return switch (expression.*) {
+            .modified => |modified| typeExpressionToken(modified.child),
+            .named => |named| named.path[0],
+            .struct_type => |members| if (members.len != 0) members[0].name else null,
+            .enum_type => |members| if (members.len != 0) members[0].name else null,
+            .array => |array| typeExpressionToken(array.element),
+            .function => |function| {
+                for (function.parameter_types) |parameter_type| {
+                    if (typeExpressionToken(parameter_type)) |token| return token;
+                }
+                if (function.return_type) |return_type| return typeExpressionToken(return_type);
+                return null;
+            },
+            .comptime_type => null,
+        };
     }
 
     fn makeType(self: *Checker, value: Type) Error!*const Type {

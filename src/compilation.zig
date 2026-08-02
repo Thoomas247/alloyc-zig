@@ -1251,6 +1251,14 @@ test "type mismatches are reported" {
     , &.{ "expected u32, found bool", "expected bool", "expected u8, found u32" });
 }
 
+test "a bare unsized array type is reported" {
+    try expectCheckErrors(
+        \\fn f() {
+        \\    const path: [u8] = "spec";
+        \\}
+    , &.{"a bare '[T]' has no size"});
+}
+
 test "numeric widening follows sign classes" {
     try expectChecks(
         \\fn f() {

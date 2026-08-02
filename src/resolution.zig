@@ -47,12 +47,16 @@ pub const NameReference = struct {
     definition: *const ast.Definition,
 };
 
+/// What a local binding declares; captures count as variables.
+pub const LocalKind = enum { variable, parameter, type_parameter };
+
 /// One declaration or use of a local binding (parameter, variable,
 /// capture, or type parameter), identified by a per-run binding id.
 pub const LocalReference = struct {
     view_index: usize,
     span: Token.Location,
     binding_id: usize,
+    kind: LocalKind,
 };
 
 /// The merged compilation unit: every definition of every module by name,
@@ -130,6 +134,7 @@ pub const Resolver = struct {
     const Binding = struct {
         name: []const u8,
         id: usize,
+        kind: LocalKind,
     };
 
     pub const Error = error{OutOfMemory};
@@ -239,11 +244,12 @@ pub const Resolver = struct {
         }
     }
 
-    fn recordLocal(self: *Resolver, span: Token.Location, binding_id: usize) Error!void {
+    fn recordLocal(self: *Resolver, span: Token.Location, binding: Binding) Error!void {
         try self.local_references.append(self.arena, .{
             .view_index = self.current_view,
             .span = span,
-            .binding_id = binding_id,
+            .binding_id = binding.id,
+            .kind = binding.kind,
         });
     }
 
@@ -402,7 +408,7 @@ pub const Resolver = struct {
                 try self.pushFrame(false);
                 for (macro_def.parameters) |parameter| {
                     try self.resolveTypeExpression(parameter.parameter_type, false);
-                    try self.bind(parameter.name);
+                    try self.bind(parameter.name, .parameter);
                 }
                 try self.resolveStatement(macro_def.body);
                 self.popFrame();
@@ -414,7 +420,7 @@ pub const Resolver = struct {
     fn resolveFunction(self: *Resolver, function: ast.Function) Error!void {
         for (function.parameters) |parameter| {
             try self.resolveTypeExpression(parameter.parameter_type, false);
-            try self.bind(parameter.name);
+            try self.bind(parameter.name, .parameter);
         }
         if (function.return_type) |return_type| {
             try self.resolveTypeExpression(return_type, false);
@@ -427,7 +433,7 @@ pub const Resolver = struct {
             if (type_parameter.constraint) |constraint| {
                 try self.resolveInterfaceName(constraint);
             }
-            try self.bind(type_parameter.name);
+            try self.bind(type_parameter.name, .type_parameter);
         }
     }
 
@@ -461,7 +467,7 @@ pub const Resolver = struct {
                 if (var_def.declared_type) |declared_type| {
                     try self.resolveTypeExpression(declared_type, false);
                 }
-                try self.bind(var_def.name);
+                try self.bind(var_def.name, .variable);
             },
             .assign => |assign| {
                 try self.resolveExpression(assign.target);
@@ -590,7 +596,7 @@ pub const Resolver = struct {
                 }
                 try self.pushFrame(true);
                 for (lambda.captures) |capture| {
-                    try self.bind(capture.name);
+                    try self.bind(capture.name, .variable);
                 }
                 try self.resolveFunction(lambda.function);
                 self.popFrame();
@@ -602,7 +608,7 @@ pub const Resolver = struct {
         if (capture.annotation) |annotation| {
             try self.resolveTypeExpression(annotation, false);
         }
-        try self.bind(capture.name);
+        try self.bind(capture.name, .variable);
     }
 
     // a lambda capture must name something visible where the lambda is written
@@ -846,7 +852,7 @@ pub const Resolver = struct {
 
     // binds a name in the innermost frame; same-frame duplicates are errors,
     // shadowing an outer frame is allowed
-    fn bind(self: *Resolver, name_token: Token) Error!void {
+    fn bind(self: *Resolver, name_token: Token, kind: LocalKind) Error!void {
         const name = name_token.slice(self.source());
         const frame = &self.scopes.items[self.scopes.items.len - 1];
         for (frame.bindings.items) |binding| {
@@ -854,22 +860,22 @@ pub const Resolver = struct {
                 return self.report(name_token.location, "'{s}' is already declared in this scope", .{name});
             }
         }
-        const id = self.next_binding_id;
+        const binding: Binding = .{ .name = name, .id = self.next_binding_id, .kind = kind };
         self.next_binding_id += 1;
-        try frame.bindings.append(self.arena, .{ .name = name, .id = id });
-        try self.recordLocal(name_token.location, id);
+        try frame.bindings.append(self.arena, binding);
+        try self.recordLocal(name_token.location, binding);
     }
 
     // searches scope frames innermost-first, yielding the binding's id;
     // without 'past_barriers' the search stops at a lambda boundary so
     // uncaptured locals stay invisible
-    fn lookupLocal(self: *const Resolver, name: []const u8, past_barriers: bool) ?usize {
+    fn lookupLocal(self: *const Resolver, name: []const u8, past_barriers: bool) ?Binding {
         var frame_index = self.scopes.items.len;
         while (frame_index > 0) {
             frame_index -= 1;
             const frame = self.scopes.items[frame_index];
             for (frame.bindings.items) |binding| {
-                if (std.mem.eql(u8, binding.name, name)) return binding.id;
+                if (std.mem.eql(u8, binding.name, name)) return binding;
             }
             if (frame.barrier and !past_barriers) return null;
         }

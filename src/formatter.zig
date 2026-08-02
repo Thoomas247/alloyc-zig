@@ -56,9 +56,13 @@ pub fn format(allocator: std.mem.Allocator, source: []const u8) FormatError![]u8
         } else {
             try out.append(allocator, '\n');
             if (newlines >= 2) try out.append(allocator, '\n');
-            // a line broken mid-statement continues one level deeper
-            const continuation: usize = switch (previous.?.tag) {
-                .semicolon, .comma, .brace_left, .brace_right, .line_comment, .block_comment => 0,
+            // a line broken mid-statement continues one level deeper; a
+            // closing token never does - it aligns with its own group,
+            // whatever ended the line above it ('Busy: i32' + newline + '}')
+            const continuation: usize = if (closesGroup(token.tag)) 0 else switch (previous.?.tag) {
+                // an opener already deepened the indent, so the line after
+                // it starts the new level, not a continuation of the old
+                .semicolon, .comma, .brace_left, .parenthesis_left, .bracket_left, .brace_right, .line_comment, .block_comment => 0,
                 else => 1,
             };
             try emitIndent(allocator, &out, depth + continuation);
@@ -246,6 +250,24 @@ test "formatting is idempotent and keeps ambiguous adjacency" {
     try std.testing.expect(std.mem.indexOf(u8, once, ".left = -4") != null);
     try std.testing.expect(std.mem.indexOf(u8, once, "/* keep me */") != null);
     try std.testing.expect(std.mem.indexOf(u8, once, "[..4]) |i|") != null);
+}
+
+test "closing tokens never take continuation indent" {
+    const source =
+        "type State = enum {\n" ++
+        "    Idle,\n" ++
+        "    Busy: i32\n" ++
+        "};\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const total = add(\n" ++
+        "        1,\n" ++
+        "        2\n" ++
+        "    );\n" ++
+        "    return total;\n" ++
+        "}\n";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings(source, formatted);
 }
 
 test "formatting refuses sources with lexical errors" {
