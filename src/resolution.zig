@@ -207,6 +207,13 @@ pub const Resolver = struct {
                     try self.report(qualifier.location, "'{s}' does not name a visible type here (section 5.4)", .{type_name});
                     continue;
                 };
+                // a qualified function is a plain free function: 'self'
+                // receivers belong to extension functions, which already
+                // reach the type through dot dispatch (section 4.5)
+                if (fn_def.function.parameters.len != 0 and fn_def.function.parameters[0].is_self) {
+                    try self.report(fn_def.name.location, "'{s}::{s}' cannot take 'self': a qualified function is not an extension (section 5.4)", .{ type_name, fn_def.name.slice(view.source) });
+                    continue;
+                }
                 const fn_name = fn_def.name.slice(view.source);
                 // an enum's variant names stay unambiguous constructors
                 const base = type_symbol.definition.kind.type_def.base;

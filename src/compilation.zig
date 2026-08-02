@@ -3359,6 +3359,16 @@ test "the interpreter serves process arguments through the lang item" {
     try std.testing.expectEqual(@as(i64, 3), exit_code);
 }
 
+test "qualified functions reject a self receiver" {
+    try expectCheckErrors(
+        \\type Point = struct { x: i64 };
+        \\fn Point::shift(self p: &var Point, amount: i64) {
+        \\    p.x += amount;
+        \\}
+        \\fn main() -> i64 { return 0; }
+    , &.{"'Point::shift' cannot take 'self': a qualified function is not an extension (section 5.4)"});
+}
+
 test "qualified functions live in their type's namespace" {
     var sources = TestSources.initComptime(.{
         .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
