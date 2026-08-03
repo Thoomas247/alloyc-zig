@@ -366,6 +366,7 @@ pub const Server = struct {
             &output.writer,
         );
         machine.host_io = self.io;
+        machine.pierced_results = if (unit.checker) |checked| &checked.pierced_results else null;
         machine.debug_hook = .{ .context = @ptrCast(self), .on_statement = onStatementHook };
         self.machine = machine;
         // stop on the first statement so the client can inspect entry

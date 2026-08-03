@@ -58,6 +58,9 @@ pub const Interpreter = struct {
     // host filesystem behind the std::io externs (fopen and friends);
     // null makes file externs fault, keeping tests hermetic
     host_io: ?std.Io = null,
+    // call nodes whose bare reference result pierces to a copy at the use
+    // site (section 4.2 reference-binding explicitness), from the checker
+    pierced_results: ?*const std.AutoHashMapUnmanaged(*const ast.Expression, void) = null,
     open_files: std.ArrayList(OpenFile) = .empty,
     // the argv tail behind std::process::arguments (section 5.1a)
     process_arguments: []const []const u8 = &.{},
@@ -558,7 +561,19 @@ pub const Interpreter = struct {
             .unary => return self.evalUnary(expression),
             .binary => return self.evalBinary(expression),
             .cast => return self.evalCast(expression),
-            .call => return self.evalCall(expression),
+            .call => {
+                const value = try self.evalCall(expression);
+                // a bare '&T' result at a use site is a deep copy of the
+                // pointee, never an alias (section 4.2)
+                if (self.pierced_results) |pierced| {
+                    if (value == .reference and pierced.contains(expression)) {
+                        // the reference may point at another reference cell
+                        // (a reborrowed parameter): chase like any read
+                        return self.deepCopy((try self.pierceCell(value.reference)).*);
+                    }
+                }
+                return value;
+            },
             .member => {
                 const place = try self.evalPlace(expression) orelse return self.fault("cannot read this member", .{});
                 // pointee transparency (section 4.2): reading a pointer or
@@ -835,7 +850,13 @@ pub const Interpreter = struct {
                 return .{ .bool_value = !operand.bool_value };
             },
             .ampersand => {
-                const place = try self.evalPlace(unary.operand) orelse return self.fault("'&' needs an addressable operand", .{});
+                const place = try self.evalPlace(unary.operand) orelse {
+                    // '&' on a reference-typed call result keeps the borrow
+                    // (section 4.2); the checker gated everything else
+                    const value = try self.evalExpression(unary.operand);
+                    if (value == .reference or value == .slice) return value;
+                    return self.fault("'&' needs an addressable operand", .{});
+                };
                 // borrowing a heap array yields a slice aliasing its
                 // elements in place (section 4.2)
                 if (place.* == .heap_array) {

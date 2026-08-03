@@ -91,6 +91,10 @@ pub const Checker = struct {
     // here first, never by bare name (overloads and associated functions
     // share names across types)
     call_name_targets: std.ArrayList(CallNameTarget) = .empty,
+    // call expressions whose bare '&T' result pierces to a deep copy at
+    // its use site (section 4.2 reference-binding explicitness); both
+    // engines copy the pointee when the node is marked here
+    pierced_results: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
     // synthesised types per 'type T = #...' expression (section 3.4)
     comptime_type_cache: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
@@ -1229,11 +1233,11 @@ pub const Checker = struct {
                 var binding_type: *const Type = undefined;
                 if (var_def.declared_type) |declared_expression| {
                     const declared_type = try self.typeFromExpression(declared_expression, self.scope_types);
-                    const value_type = try self.checkExpression(var_def.value, declared_type);
+                    const value_type = try self.consumedValueType(var_def.value, try self.checkExpression(var_def.value, declared_type));
                     try self.expectAssignable(value_type, declared_type, var_def.value, var_def.name.location);
                     binding_type = declared_type;
                 } else {
-                    const value_type = try self.checkExpression(var_def.value, null);
+                    const value_type = try self.consumedValueType(var_def.value, try self.checkExpression(var_def.value, null));
                     binding_type = try self.defaulted(value_type);
                 }
                 try self.bind(var_def.name, binding_type, var_def.mutable);
@@ -1278,7 +1282,7 @@ pub const Checker = struct {
                         }
                     }
                 }
-                const value_type = try self.checkExpression(assign.value, target_type);
+                const value_type = try self.consumedValueType(assign.value, try self.checkExpression(assign.value, target_type));
                 if (bare_rebind) {
                     if (rootPathToken(assign.target)) |root_token| {
                         if (self.lookupPointer(root_token.slice(self.source()))) |binding| {
@@ -1310,7 +1314,7 @@ pub const Checker = struct {
             .return_stmt => |return_stmt| {
                 const expected = self.return_type;
                 if (return_stmt.value) |value| {
-                    const value_type = try self.checkExpression(value, expected);
+                    const value_type = try self.consumedValueType(value, try self.checkExpression(value, expected));
                     if (expected) |return_type| {
                         if (return_type.* == .void_type) {
                             try self.report(return_stmt.keyword.location, "this function does not return a value", .{});
@@ -1509,7 +1513,7 @@ pub const Checker = struct {
     }
 
     fn recordYield(self: *Checker, frame: *YieldFrame, value: *const ast.Expression, span: Token.Location, label: []const u8) Error!void {
-        const value_type = try self.checkExpression(value, frame.yielded);
+        const value_type = try self.consumedValueType(value, try self.checkExpression(value, frame.yielded));
         if (frame.yielded) |previous| {
             const unified = try self.unify(previous, value_type);
             if (unified == null) {
@@ -1778,6 +1782,17 @@ pub const Checker = struct {
                 return &bool_type;
             },
             .ampersand => {
+                // '&' on a reference-typed call result keeps the borrow
+                // verbatim (section 4.2); no addressable place is needed
+                if (unwrapGrouped(unary.operand).* == .call) {
+                    const operand_type = try self.checkExpression(unary.operand, null);
+                    const operand_resolved = try self.resolveAlias(operand_type);
+                    if (operand_resolved.* == .reference or operand_resolved.* == .slice) {
+                        return operand_type;
+                    }
+                    try self.report(unary.operator.location, "'&' requires an addressable value or a call already yielding a reference (section 4.2)", .{});
+                    return &unknown_type;
+                }
                 // '&' references any value in place (section 4.2); the
                 // reference is mutable when the referenced location is
                 const place = try self.lvalueOf(unary.operand) orelse {
@@ -2193,7 +2208,7 @@ pub const Checker = struct {
                 _ = try self.checkExpression(member.value, null);
                 continue;
             };
-            const value_type = try self.checkExpression(member.value, field.field_type);
+            const value_type = try self.consumedValueType(member.value, try self.checkExpression(member.value, field.field_type));
             try self.expectAssignable(value_type, field.field_type, member.value, member.name.location);
         }
         // every member must be initialized
@@ -3232,7 +3247,7 @@ pub const Checker = struct {
         }
         const checked = @min(call.arguments.len, function.parameter_types.len);
         for (call.arguments[0..checked], function.parameter_types[0..checked]) |argument, parameter_type| {
-            const argument_type = try self.checkExpression(argument, parameter_type);
+            const argument_type = try self.consumedValueType(argument, try self.checkExpression(argument, parameter_type));
             try self.expectAssignable(argument_type, parameter_type, argument, self.expressionSpan(argument));
         }
         for (call.arguments[checked..]) |argument| _ = try self.checkExpression(argument, null);
@@ -3482,6 +3497,7 @@ pub const Checker = struct {
             &self.type_targets,
             &sink.writer,
         );
+        machine.pierced_results = &self.pierced_results;
         machine.comptime_mode = true;
         machine.step_budget = 1_000_000;
         machine.current_view = view_index;
@@ -3983,7 +3999,7 @@ pub const Checker = struct {
             const argument_type: *const Type = if (try self.contextualArgument(argument))
                 &unknown_type
             else
-                try self.checkExpression(argument, null);
+                try self.consumedValueType(argument, try self.checkExpression(argument, null));
             try argument_types.append(self.arena, argument_type);
         }
 
@@ -4087,7 +4103,7 @@ pub const Checker = struct {
             const argument_type: *const Type = if (try self.contextualArgument(argument))
                 &unknown_type
             else
-                try self.checkExpression(argument, null);
+                try self.consumedValueType(argument, try self.checkExpression(argument, null));
             try argument_types.append(self.arena, argument_type);
         }
 
@@ -4171,7 +4187,7 @@ pub const Checker = struct {
         const checked = @min(call.arguments.len, function.parameters.len);
         for (call.arguments[0..checked], function.parameters[0..checked]) |argument, parameter| {
             const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, &empty_type_environment, interface.view_index);
-            const argument_type = try self.checkExpression(argument, parameter_type);
+            const argument_type = try self.consumedValueType(argument, try self.checkExpression(argument, parameter_type));
             try self.expectAssignable(argument_type, parameter_type, argument, self.expressionSpan(argument));
         }
         for (call.arguments[checked..]) |argument| _ = try self.checkExpression(argument, null);
@@ -4737,6 +4753,35 @@ pub const Checker = struct {
 
     fn stringSliceType(self: *Checker) Error!*const Type {
         return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.{ .primitive = .u8 }) } });
+    }
+
+    // reference-binding explicitness (section 4.2): a call's reference-
+    // typed result does not flow bare into a use site (a binding, an
+    // argument, a member initializer, an assignment value, or a
+    // return/break/yield). '&f()' keeps the borrow; a bare '&T' result
+    // pierces to a deep copy of the pointee; a bare '&[T]' result is an
+    // error, its pointee is unsized. Macro bodies keep their dynamic
+    // semantics (tooling pass only).
+    fn consumedValueType(self: *Checker, expression: *const ast.Expression, checked: *const Type) Error!*const Type {
+        if (self.tooling_only) return checked;
+        const unwrapped = unwrapGrouped(expression);
+        if (unwrapped.* != .call) return checked;
+        const resolved = try self.resolveAlias(checked);
+        switch (resolved.*) {
+            .slice => {
+                try self.report(self.expressionSpan(expression), "a call's '&[T]' result must be marked at a use site: '&' before the call keeps the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
+                return checked;
+            },
+            .reference => {
+                const pierced = try self.pierce(checked);
+                try self.pierced_results.put(self.arena, unwrapped, {});
+                // the use consumes the pointee: the recorded type says so,
+                // and codegen sizes slots and stores from it
+                try self.expression_types.put(self.arena, unwrapped, pierced);
+                return pierced;
+            },
+            else => return checked,
+        }
     }
 
     fn makeType(self: *Checker, value: Type) Error!*const Type {

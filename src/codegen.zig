@@ -1100,7 +1100,27 @@ pub const Codegen = struct {
             .unary => return self.evalUnary(expression),
             .binary => return self.evalBinary(expression),
             .cast => return self.evalCast(expression),
-            .call => return self.evalCall(expression),
+            .call => {
+                const result = try self.evalCall(expression);
+                // a bare '&T' result at a use site pierces to a copy of the
+                // pointee (section 4.2): scalars load, aggregates hand back
+                // a place-backed operand that consumers deep-copy
+                if (self.checker.pierced_results.contains(expression)) {
+                    // the recorded type is already the pointee: the callee
+                    // returned a pointer, so load or wrap it
+                    const pointee = try self.resolvedOf(try self.typeOf(expression));
+                    switch (try self.classify(pointee, self.spanOf(expression))) {
+                        .scalar => |llvm| {
+                            const loaded = try self.freshTemp();
+                            try self.instruction("{s} = load {s}, ptr {s}", .{ loaded, llvm, result.scalar.text });
+                            return .{ .scalar = .{ .text = loaded, .llvm = llvm } };
+                        },
+                        .aggregate => |layout| return .{ .memory = .{ .pointer = result.scalar.text, .layout = layout } },
+                        .void_class => {},
+                    }
+                }
+                return result;
+            },
             .struct_init => return self.evalStructInit(expression),
             .array_literal => return self.evalArrayLiteral(expression),
             .array_fill => return self.evalArrayFill(expression),
@@ -1303,6 +1323,14 @@ pub const Codegen = struct {
                 return .{ .scalar = .{ .text = result, .llvm = operand.scalar.llvm } };
             },
             .ampersand => {
+                // '&' on a reference-typed call result keeps the borrow
+                // (section 4.2): the operand already carries the pointer
+                if (unwrapGrouped(unary.operand).* == .call) {
+                    const operand_type = try self.resolvedOf(try self.typeOf(unary.operand));
+                    if (operand_type.* == .reference or operand_type.* == .slice) {
+                        return self.evalExpression(unary.operand);
+                    }
+                }
                 const place = (try self.evalPlace(unary.operand)) orelse
                     return self.report(span, "'&' needs an addressable operand", .{});
                 // borrowing a heap array yields a slice fat pair viewing

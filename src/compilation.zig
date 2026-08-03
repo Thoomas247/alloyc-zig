@@ -576,6 +576,7 @@ pub const Compilation = struct {
             output,
         );
         interpreter.host_io = environment.host_io;
+        if (compilation.checker) |checked| interpreter.pierced_results = &checked.pierced_results;
         interpreter.process_arguments = environment.arguments;
         return interpreter.run() catch |err| switch (err) {
             error.RuntimeFault => {
@@ -1352,6 +1353,47 @@ test "macro bodies never surface checker diagnostics" {
     );
 }
 
+test "reference results are borrowed explicitly, in both engines" {
+    // '&shared(...)' keeps the borrow and observes the mutation; the bare
+    // call pierces to a copy taken before it (section 4.2)
+    try expectRuns(
+        \\fn shared(source: &i64) -> &i64 {
+        \\    return &source;
+        \\}
+        \\fn main() -> i32 {
+        \\    var backing: i64 = 5;
+        \\    const copied = shared(&backing);
+        \\    const kept = &shared(&backing);
+        \\    backing = 40;
+        \\    return copied to i32 + kept to i32;
+        \\}
+    , 45, "");
+    try expectBuildsAndRuns("reference_explicitness",
+        \\fn shared(source: &i64) -> &i64 {
+        \\    return &source;
+        \\}
+        \\fn main() -> i32 {
+        \\    var backing: i64 = 5;
+        \\    const copied = shared(&backing);
+        \\    const kept = &shared(&backing);
+        \\    backing = 40;
+        \\    return copied to i32 + kept to i32;
+        \\}
+    , 45, "");
+}
+
+test "a bare slice-returning call at a use site is an error" {
+    try expectCheckErrors(
+        \\fn view(source: &[u8]) -> &[u8] {
+        \\    return source;
+        \\}
+        \\fn main() -> i32 {
+        \\    const text = view("abc");
+        \\    return text.length() to i32;
+        \\}
+    , &.{"a call's '&[T]' result must be marked at a use site"});
+}
+
 test "a same-named associated function hints at the extension form" {
     try expectCheckErrors(
         \\interface Serializable {
@@ -1761,7 +1803,7 @@ test "a concrete extension overrides an interface default" {
         \\fn name(self c: &Circle) -> &[u8] { return "circle"; }
         \\fn f() {
         \\    const circle = Circle { .radius = 1.0 };
-        \\    const label: &[u8] = circle.name();
+        \\    const label: &[u8] = &circle.name();
         \\}
     );
 }
@@ -3502,7 +3544,7 @@ test "the interpreter serves process arguments through the lang item" {
         \\import std::process;
         \\extern printf(format: &[u8], ...) -> i32;
         \\fn main() -> i64 {
-        \\    const all = arguments();
+        \\    const all = &arguments();
         \\    for (all) |argument| {
         \\        printf("%s\n", argument);
         \\    }
