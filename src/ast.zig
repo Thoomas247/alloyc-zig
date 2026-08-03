@@ -47,13 +47,21 @@ pub const Definition = struct {
 pub const TypeDef = struct {
     name: Token,
     type_parameters: []const TypeParameter,
-    interfaces: []const Token,
+    interfaces: []const InterfaceMarker,
     base: *const TypeExpression,
+};
+
+/// A conformance marker ('type V<T> : Iterable<T, VectorCursor<T>>') or a
+/// generic constraint ('It: Iterator<T>'): an interface name plus the type
+/// arguments binding the interface's own type parameters (section 5.2).
+pub const InterfaceMarker = struct {
+    name: Token,
+    type_arguments: []const *const TypeExpression,
 };
 
 pub const TypeParameter = struct {
     name: Token,
-    constraint: ?Token,
+    constraint: ?InterfaceMarker,
 };
 
 pub const FnDef = struct {
@@ -86,6 +94,7 @@ pub const ExternDef = struct {
 
 pub const InterfaceDef = struct {
     name: Token,
+    type_parameters: []const TypeParameter,
     functions: []const InterfaceFn,
 };
 

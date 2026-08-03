@@ -61,6 +61,10 @@ pub const Interpreter = struct {
     // call nodes whose bare reference result pierces to a copy at the use
     // site (section 4.2 reference-binding explicitness), from the checker
     pierced_results: ?*const std.AutoHashMapUnmanaged(*const ast.Expression, void) = null,
+    // the active comptime call chain (function, macro, and extension
+    // names, outermost first): a fault inside a macro body reports where
+    // evaluation was, since macro bodies carry no static diagnostics
+    comptime_call_names: std.ArrayList([]const u8) = .empty,
     open_files: std.ArrayList(OpenFile) = .empty,
     // the argv tail behind std::process::arguments (section 5.1a)
     process_arguments: []const []const u8 = &.{},
@@ -331,7 +335,29 @@ pub const Interpreter = struct {
 
     fn fault(self: *Interpreter, comptime format: []const u8, arguments: anytype) Error {
         self.fault_message = std.fmt.allocPrint(self.arena, format, arguments) catch return error.OutOfMemory;
+        if (self.comptime_mode and self.comptime_call_names.items.len != 0) {
+            var text: std.ArrayList(u8) = .empty;
+            text.appendSlice(self.arena, self.fault_message.?) catch return error.OutOfMemory;
+            text.appendSlice(self.arena, "; comptime call chain: ") catch return error.OutOfMemory;
+            for (self.comptime_call_names.items, 0..) |name, index| {
+                if (index != 0) text.appendSlice(self.arena, " -> ") catch return error.OutOfMemory;
+                text.appendSlice(self.arena, name) catch return error.OutOfMemory;
+            }
+            self.fault_message = text.toOwnedSlice(self.arena) catch return error.OutOfMemory;
+        }
         return error.RuntimeFault;
+    }
+
+    // one frame of the comptime call chain; pops happen on every exit
+    // path, and a fault composes the chain before unwinding pops it
+    fn pushComptimeName(self: *Interpreter, name: []const u8) Error!void {
+        if (!self.comptime_mode) return;
+        try self.comptime_call_names.append(self.arena, name);
+    }
+
+    fn popComptimeName(self: *Interpreter) void {
+        if (!self.comptime_mode) return;
+        _ = self.comptime_call_names.pop();
     }
 
     fn source(self: *const Interpreter) []const u8 {
@@ -536,6 +562,20 @@ pub const Interpreter = struct {
     }
 
     fn evalExpression(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const value = try self.evalExpressionRaw(expression);
+        // a bare '&T' use site (a call result or a variable read) consumes
+        // a deep copy of the pointee, never an alias (section 4.2)
+        if (self.pierced_results) |pierced| {
+            if (value == .reference and pierced.contains(expression)) {
+                // the reference may point at another reference cell
+                // (a reborrowed parameter): chase like any read
+                return self.deepCopy((try self.pierceCell(value.reference)).*);
+            }
+        }
+        return value;
+    }
+
+    fn evalExpressionRaw(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         if (self.step_budget) |budget| {
             if (budget == 0) return self.fault("compile-time evaluation exceeded its step budget (section 6.1)", .{});
             self.step_budget = budget - 1;
@@ -561,21 +601,12 @@ pub const Interpreter = struct {
             .unary => return self.evalUnary(expression),
             .binary => return self.evalBinary(expression),
             .cast => return self.evalCast(expression),
-            .call => {
-                const value = try self.evalCall(expression);
-                // a bare '&T' result at a use site is a deep copy of the
-                // pointee, never an alias (section 4.2)
-                if (self.pierced_results) |pierced| {
-                    if (value == .reference and pierced.contains(expression)) {
-                        // the reference may point at another reference cell
-                        // (a reborrowed parameter): chase like any read
-                        return self.deepCopy((try self.pierceCell(value.reference)).*);
-                    }
-                }
-                return value;
-            },
+            .call => return self.evalCall(expression),
             .member => {
-                const place = try self.evalPlace(expression) orelse return self.fault("cannot read this member", .{});
+                const place = try self.evalPlace(expression) orelse {
+                    const member_name = expression.member.name.slice(self.source());
+                    return self.fault("cannot read member '{s}' here (the receiver is not a struct value)", .{member_name});
+                };
                 // pointee transparency (section 4.2): reading a pointer or
                 // reference field yields a copy of the pointee
                 return self.deepCopy((try self.pierceCell(place)).*);
@@ -862,6 +893,11 @@ pub const Interpreter = struct {
                 if (place.* == .heap_array) {
                     const instance = place.heap_array orelse return self.fault("use of a moved-from array", .{});
                     return .{ .slice = instance };
+                }
+                // re-borrowing a place already holding a slice yields the
+                // same view (section 4.2)
+                if (place.* == .slice) {
+                    return place.*;
                 }
                 return .{ .reference = place };
             },
@@ -1557,7 +1593,7 @@ pub const Interpreter = struct {
         if (receiver.definition.kind != .type_def) return false;
         const view_source = self.views[receiver.view_index].source;
         for (receiver.definition.kind.type_def.interfaces) |marker| {
-            const marker_symbol = self.firstVisibleFrom(marker.slice(view_source), receiver.view_index) orelse continue;
+            const marker_symbol = self.firstVisibleFrom(marker.name.slice(view_source), receiver.view_index) orelse continue;
             if (marker_symbol.definition == interface_definition) return true;
         }
         return false;
@@ -1621,6 +1657,8 @@ pub const Interpreter = struct {
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
         defer self.call_depth -= 1;
+        try self.pushComptimeName(fn_def.name.slice(self.views[symbol.view_index].source));
+        defer self.popComptimeName();
         if (self.debug_hook != null) {
             try self.debug_stack.append(self.arena, .{
                 .name = fn_def.name.slice(self.views[symbol.view_index].source),
@@ -1748,6 +1786,8 @@ pub const Interpreter = struct {
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
         defer self.call_depth -= 1;
+        try self.pushComptimeName(macro_def.name.slice(self.views[symbol.view_index].source));
+        defer self.popComptimeName();
 
         // arguments evaluate in the caller's view, the body in its own
         const arguments = try self.evalArguments(call.arguments);
@@ -1788,6 +1828,8 @@ pub const Interpreter = struct {
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
         defer self.call_depth -= 1;
+        try self.pushComptimeName("|lambda|");
+        defer self.popComptimeName();
 
         const saved_view = self.current_view;
         self.current_view = instance.view_index;
@@ -2130,7 +2172,13 @@ pub const Interpreter = struct {
         const unwrapped = unwrapGrouped(condition);
         if (unwrapped.* != .cast or unwrapped.cast.operator.tag != .keyword_is) return false;
         const cast = unwrapped.cast;
-        const place = try self.evalPlace(cast.operand) orelse return false;
+        const place = (try self.evalPlace(cast.operand)) orelse temporary: {
+            // an 'is' subject may be a temporary (a call result); it lives
+            // in a fresh cell so the capture can borrow or take the payload
+            const cell = try self.arena.create(Value);
+            cell.* = try self.evalExpression(cast.operand);
+            break :temporary cell;
+        };
         const pierced = try self.pierceCell(place);
         const target_token = cast.target.named.path[cast.target.named.path.len - 1];
         const target_name = target_token.slice(self.source());

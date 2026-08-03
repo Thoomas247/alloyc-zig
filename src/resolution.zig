@@ -369,8 +369,8 @@ pub const Resolver = struct {
             .type_def => |type_def| {
                 try self.pushFrame(false);
                 try self.bindTypeParameters(type_def.type_parameters);
-                for (type_def.interfaces) |interface_name| {
-                    try self.resolveInterfaceName(interface_name);
+                for (type_def.interfaces) |marker| {
+                    try self.resolveInterfaceMarker(marker);
                 }
                 try self.resolveTypeExpression(type_def.base, false);
                 self.popFrame();
@@ -390,6 +390,10 @@ pub const Resolver = struct {
                 }
             },
             .interface_def => |interface_def| {
+                // the interface's own type parameters scope over every
+                // declared signature ('fn next() -> Option<&T>')
+                try self.pushFrame(false);
+                try self.bindTypeParameters(interface_def.type_parameters);
                 for (interface_def.functions) |interface_fn| {
                     for (interface_fn.parameters) |parameter| {
                         try self.resolveTypeExpression(parameter.parameter_type, false);
@@ -398,6 +402,7 @@ pub const Resolver = struct {
                         try self.resolveTypeExpression(return_type, false);
                     }
                 }
+                self.popFrame();
             },
             .macro_def => |macro_def| {
                 try self.pushFrame(false);
@@ -427,10 +432,19 @@ pub const Resolver = struct {
 
     fn bindTypeParameters(self: *Resolver, type_parameters: []const ast.TypeParameter) Error!void {
         for (type_parameters) |type_parameter| {
+            // a constraint's type arguments may reference the parameters
+            // declared to its left ('<T, It: Iterator<T>>', section 3.7)
             if (type_parameter.constraint) |constraint| {
-                try self.resolveInterfaceName(constraint);
+                try self.resolveInterfaceMarker(constraint);
             }
             try self.bind(type_parameter.name, .type_parameter);
+        }
+    }
+
+    fn resolveInterfaceMarker(self: *Resolver, marker: ast.InterfaceMarker) Error!void {
+        try self.resolveInterfaceName(marker.name);
+        for (marker.type_arguments) |argument| {
+            try self.resolveTypeExpression(argument, false);
         }
     }
 

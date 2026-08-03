@@ -668,14 +668,61 @@ pub const Server = struct {
         for (keyword_completions) |keyword| {
             try items.append(arena, .{ .label = keyword, .kind = 14 });
         }
+        var offered: std.StringHashMapUnmanaged(void) = .empty;
+        // locals and parameters in scope, with their checked types, when
+        // the analysis matches the open text
+        if (self.requestLocation(params)) |location| {
+            try self.scopedLocalCompletions(arena, &items, &offered, location);
+        }
         for (self.symbols.items) |symbol| {
+            // an extension calls through '.' and an associated function
+            // through 'Type::' - neither is invocable bare, so they
+            // complete in those contexts instead
+            if (dotOnlyFunction(symbol.definition) or qualifiedOnlyFunction(symbol.definition)) continue;
+            try offered.put(arena, symbol.name, {});
             try items.append(arena, .{
                 .label = symbol.name,
                 .kind = symbol.completion_kind,
                 .detail = symbol.detail,
             });
         }
+        // a lexical harvest of the open text backs everything else, so a
+        // name still completes while the buffer fails to parse mid-edit
+        if (self.requestLocation(params)) |location| {
+            try harvestIdentifiers(arena, &items, &offered, location);
+        }
         try self.respond(id, items.items);
+    }
+
+    // every local declaration inside the definition enclosing the cursor
+    // and textually before it, typed from the checker's tooling table.
+    // Approximation: block scoping inside the definition is not replayed,
+    // so a name from an inner block still offers after its block ends.
+    fn scopedLocalCompletions(self: *Server, arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem), offered: *std.StringHashMapUnmanaged(void), location: RequestLocation) !void {
+        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return;
+        const unit = self.analysis orelse return;
+        const checker = unit.checker orelse return;
+        const view = unit.views[view_index];
+        if (!std.mem.eql(u8, view.source, location.text)) return;
+        const extent = definitionExtent(view.source, location.offset) orelse return;
+        // scan backwards so a shadowing later declaration wins its name
+        const declarations = checker.declaration_types.items;
+        var index = declarations.len;
+        while (index > 0) {
+            index -= 1;
+            const declaration = declarations[index];
+            if (declaration.view_index != view_index) continue;
+            if (declaration.span.start < extent.start or declaration.span.end > extent.end) continue;
+            if (declaration.span.start >= location.offset) continue;
+            const name = view.source[declaration.span.start..declaration.span.end];
+            const entry = try offered.getOrPut(arena, name);
+            if (entry.found_existing) continue;
+            try items.append(arena, .{
+                .label = name,
+                .kind = 6,
+                .detail = declaration.binding_type.render(arena) catch null,
+            });
+        }
     }
 
     // completion after 'receiver.': the receiver's type comes from the
@@ -778,8 +825,16 @@ pub const Server = struct {
                 for (type_def.base.enum_type) |member| {
                     try items.append(arena, .{ .label = member.name.slice(enum_source), .kind = 20 });
                 }
-                return;
             }
+            // 'Type::' also reaches the associated functions
+            for (merged.associated) |entry| {
+                if (entry.type_definition != symbol.definition) continue;
+                const detail: ?[]const u8 = for (self.symbols.items) |candidate| {
+                    if (candidate.definition == entry.symbol.definition) break candidate.detail;
+                } else null;
+                try items.append(arena, .{ .label = entry.name, .kind = 3, .detail = detail });
+            }
+            if (type_def.base.* == .enum_type) return;
             // an aliased or synthesised enum ('type T = #...') has no
             // syntactic members; the checker resolved its variants
             const checker = unit.checker orelse continue;
@@ -806,6 +861,7 @@ pub const Server = struct {
             else
                 module_definition.visibility != .private;
             if (!visible) continue;
+            if (dotOnlyFunction(module_definition) or qualifiedOnlyFunction(module_definition)) continue;
             const name_token = definitionName(module_definition);
             try items.append(arena, .{
                 .label = name_token.slice(target.source),
@@ -1579,6 +1635,68 @@ fn definitionDetail(source: []const u8, name_offset: usize, definition: *const a
 }
 
 // the whole source line containing the offset, trimmed, as a signature
+
+// the byte extent of the top-level definition whose body braces contain
+// the offset, found lexically so it works on any text state
+fn definitionExtent(source: []const u8, offset: usize) ?struct { start: usize, end: usize } {
+    var scanner = tokenizer_module.Tokenizer.init(source);
+    var start: ?usize = null;
+    var depth: usize = 0;
+    while (true) {
+        const token = scanner.next();
+        if (token.tag == .end_of_file) return null;
+        switch (token.tag) {
+            .keyword_fn, .keyword_macro => if (depth == 0 and start == null) {
+                start = token.location.start;
+            },
+            .brace_left => depth += 1,
+            .brace_right => {
+                depth -|= 1;
+                if (depth == 0) {
+                    if (start) |from| {
+                        if (offset >= from and offset <= token.location.end) {
+                            return .{ .start = from, .end = token.location.end };
+                        }
+                    }
+                    start = null;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+// every identifier of the open text not already offered: the last-resort
+// completion layer that never depends on a successful parse
+fn harvestIdentifiers(arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem), offered: *std.StringHashMapUnmanaged(void), location: Server.RequestLocation) !void {
+    var scanner = tokenizer_module.Tokenizer.init(location.text);
+    while (true) {
+        const token = scanner.next();
+        if (token.tag == .end_of_file) return;
+        if (token.tag != .identifier) continue;
+        // skip the word being typed at the cursor
+        if (location.offset >= token.location.start and location.offset <= token.location.end) continue;
+        const name = token.slice(location.text);
+        const entry = try offered.getOrPut(arena, name);
+        if (entry.found_existing) continue;
+        try items.append(arena, .{ .label = name, .kind = 1 });
+    }
+}
+
+// an extension function is invoked through '.' only (section 4.5)
+fn dotOnlyFunction(definition: *const ast.Definition) bool {
+    if (definition.kind != .fn_def) return false;
+    const fn_def = definition.kind.fn_def;
+    if (fn_def.qualifier != null) return false;
+    const parameters = fn_def.function.parameters;
+    return parameters.len != 0 and parameters[0].is_self;
+}
+
+// an associated function is invoked through 'Type::' only (section 5.4)
+fn qualifiedOnlyFunction(definition: *const ast.Definition) bool {
+    return definition.kind == .fn_def and definition.kind.fn_def.qualifier != null;
+}
+
 fn declarationLine(source: []const u8, offset: usize) []const u8 {
     var line_start = offset;
     while (line_start > 0 and source[line_start - 1] != '\n') line_start -= 1;
@@ -2043,6 +2161,161 @@ test "hover on a call resolves the checked target, not the first name" {
 
     const transcript = output.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, transcript, "fn Right::make") != null);
+}
+
+test "dot-only and Type::-only functions stay out of bare completion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/dot_only.alloy";
+    const good =
+        "type Counter = struct { value: i64 };\n" ++
+        "fn bump(self c: &var Counter, amount: i64) { c.value += amount; }\n" ++
+        "fn Counter::fresh() -> Counter { return Counter { .value = 0 }; }\n" ++
+        "fn plain() -> i64 { return 1; }\n" ++
+        "fn main() -> i32 {\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    const typing =
+        "type Counter = struct { value: i64 };\n" ++
+        "fn bump(self c: &var Counter, amount: i64) { c.value += amount; }\n" ++
+        "fn Counter::fresh() -> Counter { return Counter { .value = 0 }; }\n" ++
+        "fn plain() -> i64 { return 1; }\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const c = Counter::\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = good } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/completion",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 5, .character = 4 } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri, .version = 2 },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = typing }},
+            },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 3,
+            .method = "textDocument/completion",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 5, .character = 23 } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    // the bare-completion response alone: the extension and the
+    // associated function never appear as callable items (kind 3),
+    // while 'plain' does
+    const bare_start = std.mem.indexOf(u8, transcript, "\"id\":2,\"result\"").?;
+    const bare_end = std.mem.indexOf(u8, transcript, "\"id\":3,\"result\"") orelse transcript.len;
+    const bare = transcript[bare_start..bare_end];
+    try std.testing.expect(std.mem.indexOf(u8, bare, "\"label\":\"bump\",\"kind\":3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "\"label\":\"fresh\",\"kind\":3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "\"label\":\"plain\",\"kind\":3") != null);
+    // 'Counter::' reaches the associated function
+    const qualified = transcript[bare_end..];
+    try std.testing.expect(std.mem.indexOf(u8, qualified, "\"label\":\"fresh\",\"kind\":3") != null);
+}
+
+test "completion offers scoped locals with types and harvests while broken" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/local_completion.alloy";
+    const good =
+        "fn helper() -> i64 {\n" ++
+        "    const hidden_local = 1;\n" ++
+        "    return hidden_local;\n" ++
+        "}\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const entry_path = \"spec\";\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    // typing an argument: the buffer no longer parses
+    const typing =
+        "fn helper() -> i64 {\n" ++
+        "    const hidden_local = 1;\n" ++
+        "    return hidden_local;\n" ++
+        "}\n" ++
+        "fn main() -> i32 {\n" ++
+        "    const entry_path = \"spec\";\n" ++
+        "    use(entr\n" ++
+        "    return 0;\n" ++
+        "}\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = good } },
+        }, .{}),
+        // fresh analysis: inside main, after entry_path's declaration
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 2,
+            .method = "textDocument/completion",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 6, .character = 4 } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri, .version = 2 },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = typing }},
+            },
+        }, .{}),
+        // stale analysis: the lexical harvest still offers the local
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .id = 3,
+            .method = "textDocument/completion",
+            .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 6, .character = 12 } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    // fresh: the local carries its checked type; the other function's
+    // local only appears through the lexical layer (kind 1, untyped)
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "{\"label\":\"entry_path\",\"kind\":6,\"detail\":\"&[u8]\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"label\":\"hidden_local\",\"kind\":1") != null);
+    // stale: entry_path still offered (harvested, no type available)
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"label\":\"entry_path\",\"kind\":1") != null);
 }
 
 test "semantic tokens color by resolution, not by name" {

@@ -392,23 +392,53 @@ pub const Checker = struct {
             .arguments = try arguments.toOwnedSlice(self.arena),
         } });
         for (type_def.interfaces) |marker| {
-            const marker_name = marker.slice(self.source());
+            const marker_name = marker.name.slice(self.source());
             const symbol = self.firstVisible(marker_name, self.current_view) orelse continue;
             // a non-interface marker was already reported during resolution
             if (symbol.definition.kind != .interface_def) continue;
-            try self.verifyInterface(concrete, .{
-                .definition = symbol.definition,
-                .view_index = symbol.view_index,
-                .name = marker_name,
-            }, marker.location);
+            try self.validateMarkerArity(marker, self.current_view);
+            // the marker's type arguments bind the interface's own type
+            // parameters ('Iterable<T, VectorCursor<T>>', section 5.2)
+            const instantiated = (try self.interfaceOfConstraint(marker, environment, self.current_view)).?;
+            try self.verifyInterface(concrete, instantiated, marker.name.location);
         }
+    }
+
+    // binds a generic interface's type parameters to one instantiation's
+    // arguments, for resolving the declared signatures (section 5.2)
+    fn interfaceEnvironment(self: *Checker, interface: Type.Interface) Error!*TypeEnvironment {
+        const environment = try self.arena.create(TypeEnvironment);
+        environment.* = .empty;
+        const interface_def = interface.definition.kind.interface_def;
+        const interface_source = self.views[interface.view_index].source;
+        for (interface_def.type_parameters, 0..) |type_parameter, index| {
+            if (index >= interface.arguments.len) break;
+            try environment.put(self.arena, type_parameter.name.slice(interface_source), interface.arguments[index]);
+        }
+        return environment;
     }
 
     fn verifyInterface(self: *Checker, concrete: *const Type, interface: Type.Interface, span: Token.Location) Error!void {
         const interface_def = interface.definition.kind.interface_def;
         const interface_source = self.views[interface.view_index].source;
+        const interface_environment = try self.interfaceEnvironment(interface);
+        // the instantiation's arguments must satisfy the interface's own
+        // constraints ('Iterable<T, It: Iterator<T>>' requires the bound
+        // 'It' to conform to 'Iterator<T>' at this instantiation)
+        for (interface_def.type_parameters, 0..) |type_parameter, index| {
+            if (index >= interface.arguments.len) break;
+            const constraint = (try self.interfaceOfConstraint(type_parameter.constraint, interface_environment, interface.view_index)) orelse continue;
+            if (!try self.implements(interface.arguments[index], constraint)) {
+                try self.report(span, "'{s}' does not satisfy the '{s}' constraint on '{s}''s type parameter '{s}' (section 5.2)", .{
+                    try interface.arguments[index].render(self.arena),
+                    constraint.name,
+                    interface.name,
+                    type_parameter.name.slice(interface_source),
+                });
+            }
+        }
         for (interface_def.functions) |function| {
-            switch (try self.findSatisfyingExtension(concrete, interface, function)) {
+            switch (try self.findSatisfyingExtension(concrete, interface, interface_environment, function)) {
                 .satisfied => {},
                 .missing => {
                     const function_name = function.name.slice(interface_source);
@@ -452,7 +482,7 @@ pub const Checker = struct {
     // parameter sequence and return type matching precisely (section 5.2).
     // deliberately closed-world: even a library-internal extension
     // satisfies, since vtables span the whole unit (section 5.4)
-    fn findSatisfyingExtension(self: *Checker, concrete: *const Type, interface: Type.Interface, function: ast.InterfaceFn) Error!SatisfactionVerdict {
+    fn findSatisfyingExtension(self: *Checker, concrete: *const Type, interface: Type.Interface, interface_environment: *const TypeEnvironment, function: ast.InterfaceFn) Error!SatisfactionVerdict {
         const interface_source = self.views[interface.view_index].source;
         const function_name = function.name.slice(interface_source);
         const symbols = self.globals.get(function_name) orelse return .missing;
@@ -467,7 +497,19 @@ pub const Checker = struct {
             const self_child = try self.pierce(self_type);
             const receiver_matches = switch (self_child.*) {
                 .interface => |child| child.definition == interface.definition,
-                .declared => |child| child.definition == concrete.declared.definition,
+                .declared => |child| matched: {
+                    if (child.definition != concrete.declared.definition) break :matched false;
+                    // bind the candidate's type parameters through the
+                    // receiver: 'fn iterator<E>(self v: &Vector<E>)'
+                    // verified against 'Vector<T>' maps E to T, so its
+                    // return 'VectorCursor<E>' compares as 'VectorCursor<T>'
+                    for (child.arguments, 0..) |receiver_argument, index| {
+                        if (index >= concrete.declared.arguments.len) break;
+                        if (receiver_argument.* != .type_parameter) continue;
+                        try candidate_environment.put(self.arena, receiver_argument.type_parameter.name, concrete.declared.arguments[index]);
+                    }
+                    break :matched true;
+                },
                 else => false,
             };
             if (!receiver_matches) continue;
@@ -476,7 +518,7 @@ pub const Checker = struct {
             var matches = true;
             for (parameters[1..], function.parameters) |candidate_parameter, declared_parameter| {
                 const candidate_type = try self.typeFromExpressionIn(candidate_parameter.parameter_type, candidate_environment, symbol.view_index);
-                const declared_type = try self.typeFromExpressionIn(declared_parameter.parameter_type, &empty_type_environment, interface.view_index);
+                const declared_type = try self.typeFromExpressionIn(declared_parameter.parameter_type, interface_environment, interface.view_index);
                 if (!candidate_type.eql(declared_type)) {
                     matches = false;
                     break;
@@ -488,7 +530,7 @@ pub const Checker = struct {
                 else
                     &void_type;
                 const declared_return: *const Type = if (function.return_type) |expression|
-                    try self.typeFromExpressionIn(expression, &empty_type_environment, interface.view_index)
+                    try self.typeFromExpressionIn(expression, interface_environment, interface.view_index)
                 else
                     &void_type;
                 if (!candidate_return.eql(declared_return)) matches = false;
@@ -500,31 +542,75 @@ pub const Checker = struct {
 
     pub const TypeEnvironment = std.StringHashMapUnmanaged(*const Type);
 
-    fn typeParameterEnvironment(self: *Checker, type_parameters: []const ast.TypeParameter, view_index: usize) Error!*TypeEnvironment {
+    pub fn typeParameterEnvironment(self: *Checker, type_parameters: []const ast.TypeParameter, view_index: usize) Error!*TypeEnvironment {
         const view_source = self.views[view_index].source;
         const environment = try self.arena.create(TypeEnvironment);
         environment.* = .empty;
         for (type_parameters) |type_parameter| {
             const name = type_parameter.name.slice(view_source);
-            const constraint = self.interfaceOfConstraint(type_parameter.constraint, view_index);
+            // built sequentially: a constraint's type arguments resolve
+            // against the parameters declared to its left
+            // ('<T, It: Iterator<T>>', section 3.7)
+            const constraint = try self.interfaceOfConstraint(type_parameter.constraint, environment, view_index);
             const parameter = try self.makeType(.{ .type_parameter = .{ .name = name, .constraint = constraint } });
             try environment.put(self.arena, name, parameter);
         }
         return environment;
     }
 
-    // resolves a constraint token ('T: Number') to its interface, looked
-    // up from the view declaring the constraint
-    fn interfaceOfConstraint(self: *const Checker, constraint_token: ?Token, view_index: usize) ?Type.Interface {
-        const token = constraint_token orelse return null;
-        const name = token.slice(self.views[view_index].source);
+    // resolves a constraint marker ('T: Number', 'It: Iterator<T>') to its
+    // interface, looked up from the view declaring the constraint; quiet,
+    // because candidate probing calls it repeatedly - arity errors are
+    // reported once per definition by validateMarkerArity
+    fn interfaceOfConstraint(self: *Checker, constraint_marker: ?ast.InterfaceMarker, environment: *const TypeEnvironment, view_index: usize) Error!?Type.Interface {
+        const marker = constraint_marker orelse return null;
+        const name = marker.name.slice(self.views[view_index].source);
         const symbol = self.firstVisible(name, view_index) orelse return null;
         if (symbol.definition.kind != .interface_def) return null;
+        var arguments: std.ArrayList(*const Type) = .empty;
+        for (marker.type_arguments) |argument| {
+            try arguments.append(self.arena, try self.typeFromExpressionIn(argument, environment, view_index));
+        }
         return .{
             .definition = symbol.definition,
             .view_index = symbol.view_index,
             .name = name,
+            .arguments = try arguments.toOwnedSlice(self.arena),
         };
+    }
+
+    // a generic interface's arguments may mention type parameters; a call
+    // site's bindings substitute into them before conformance is checked
+    fn substituteInterface(self: *Checker, interface: Type.Interface, environment: *const TypeEnvironment) Error!Type.Interface {
+        if (interface.arguments.len == 0) return interface;
+        const arguments = try self.arena.alloc(*const Type, interface.arguments.len);
+        for (interface.arguments, 0..) |argument, index| {
+            arguments[index] = try self.substitute(argument, environment);
+        }
+        return .{
+            .definition = interface.definition,
+            .view_index = interface.view_index,
+            .name = interface.name,
+            .arguments = arguments,
+        };
+    }
+
+    // reports a marker or constraint whose argument count does not match
+    // the interface's declared type parameters (section 5.2); separated
+    // from interfaceOfConstraint so quiet probing never reports
+    fn validateMarkerArity(self: *Checker, marker: ast.InterfaceMarker, view_index: usize) Error!void {
+        const name = marker.name.slice(self.views[view_index].source);
+        const symbol = self.firstVisible(name, view_index) orelse return;
+        if (symbol.definition.kind != .interface_def) return;
+        const expected = symbol.definition.kind.interface_def.type_parameters.len;
+        if (marker.type_arguments.len != expected) {
+            try self.report(marker.name.location, "'{s}' expects {d} type argument{s}, found {d} (section 5.2)", .{
+                name,
+                expected,
+                if (expected == 1) "" else "s",
+                marker.type_arguments.len,
+            });
+        }
     }
 
     // builds a Type from a syntactic type expression (section 3.2)
@@ -693,10 +779,28 @@ pub const Checker = struct {
         const last = named.path[named.path.len - 1].slice(view_source);
         const symbol = (try self.pathSymbol(named.path, view_index)) orelse return null;
         if (symbol.definition.kind != .interface_def) return null;
+        // a generic interface object requires every type parameter
+        // instantiated ('&Iterator<u64>'): the object type pins the
+        // signatures, so dispatch has a fixed ABI (section 5.2)
+        const interface_def = symbol.definition.kind.interface_def;
+        if (named.type_arguments.len != interface_def.type_parameters.len) {
+            try self.report(named.path[0].location, "'{s}' expects {d} type argument{s}, found {d} (section 5.2)", .{
+                last,
+                interface_def.type_parameters.len,
+                if (interface_def.type_parameters.len == 1) "" else "s",
+                named.type_arguments.len,
+            });
+            return &unknown_type;
+        }
+        var arguments: std.ArrayList(*const Type) = .empty;
+        for (named.type_arguments) |argument| {
+            try arguments.append(self.arena, try self.typeFromExpressionIn(argument, environment, view_index));
+        }
         return try self.makeType(.{ .interface = .{
             .definition = symbol.definition,
             .view_index = symbol.view_index,
             .name = last,
+            .arguments = try arguments.toOwnedSlice(self.arena),
         } });
     }
 
@@ -939,20 +1043,19 @@ pub const Checker = struct {
         const resolved = try self.resolveAlias(candidate);
         switch (resolved.*) {
             .unknown => return true,
-            .interface => |other| return other.definition == interface.definition,
+            .interface => |other| return other.eqlInterface(interface),
             .type_parameter => |parameter| {
                 const constraint = parameter.constraint orelse return false;
-                return constraint.definition == interface.definition;
+                return constraint.eqlInterface(interface);
             },
             else => {},
         }
         if (self.langItem(interface)) |item| {
             switch (item) {
                 .number => if (resolved.isNumeric() and resolved.* != .declared) return true,
-                .iterable => switch (resolved.*) {
-                    .slice, .heap_array, .fixed_array => return true,
-                    else => {},
-                },
+                // arrays are for-compatible natively and no longer
+                // implement Iterable implicitly (sections 4.3, 5.1)
+                .iterable => {},
             }
         }
         if (resolved.* != .declared) return false;
@@ -960,10 +1063,46 @@ pub const Checker = struct {
         const definition_source = self.views[resolved.declared.view_index].source;
         for (type_def.interfaces) |marker| {
             // the marker resolves where the type is declared
-            const symbol = self.firstVisible(marker.slice(definition_source), resolved.declared.view_index) orelse continue;
-            if (symbol.definition == interface.definition) return true;
+            const symbol = self.firstVisible(marker.name.slice(definition_source), resolved.declared.view_index) orelse continue;
+            if (symbol.definition != interface.definition) continue;
+            if (interface.arguments.len == 0) return true;
+            // a generic conformance matches when the marker's arguments,
+            // with the instance's arguments substituted in, equal the
+            // required instantiation ('Vector<u8> : Iterable<u8, ...>')
+            const environment = try self.declaredEnvironment(resolved.declared);
+            const declared = (try self.interfaceOfConstraint(marker, environment, resolved.declared.view_index)) orelse continue;
+            if (declared.eqlInterface(interface)) return true;
         }
         return false;
+    }
+
+    /// The instantiation of one conforming type behind a generic interface
+    /// object (section 5.2): unifies the type's conformance marker against
+    /// the required interface arguments and returns the type's own argument
+    /// list ('VectorCursor<E> : Iterator<E>' against 'Iterator<u64>' yields
+    /// '[u64]'), or null when the type cannot conform at that instantiation.
+    /// Only meaningful for instantiated generic interfaces.
+    pub fn implementerArguments(self: *Checker, definition: *const ast.Definition, view_index: usize, interface: Type.Interface) Error!?[]const *const Type {
+        if (definition.kind != .type_def) return null;
+        const type_def = definition.kind.type_def;
+        const definition_source = self.views[view_index].source;
+        const marker = for (type_def.interfaces) |candidate| {
+            const symbol = self.firstVisible(candidate.name.slice(definition_source), view_index) orelse continue;
+            if (symbol.definition == interface.definition) break candidate;
+        } else return null;
+        if (marker.type_arguments.len != interface.arguments.len) return null;
+        const environment = try self.typeParameterEnvironment(type_def.type_parameters, view_index);
+        var bindings: TypeEnvironment = .empty;
+        for (marker.type_arguments, interface.arguments) |declared_expression, required| {
+            const declared = try self.typeFromExpressionIn(declared_expression, environment, view_index);
+            if (!try self.unifyParameter(declared, required, &bindings)) return null;
+        }
+        var arguments: std.ArrayList(*const Type) = .empty;
+        for (type_def.type_parameters) |type_parameter| {
+            const bound = bindings.get(type_parameter.name.slice(definition_source)) orelse return null;
+            try arguments.append(self.arena, bound);
+        }
+        return try arguments.toOwnedSlice(self.arena);
     }
 
     // a type parameter constrained by the Number lang item behaves
@@ -1810,6 +1949,12 @@ pub const Checker = struct {
                         .child = pierced.heap_array.child,
                     } });
                 }
+                // re-borrowing a place already holding a slice yields the
+                // same view: '&view' on a '&[u8]' binding is idempotent
+                // (section 4.2)
+                if (pierced.* == .slice) {
+                    return place.pierced;
+                }
                 return self.makeType(.{ .reference = .{ .mutable = place.mutable, .child = place.pierced } });
             },
             .keyword_new => {
@@ -2039,6 +2184,12 @@ pub const Checker = struct {
                         try self.report(variant_token.location, "enum '{s}' has no variant '{s}'", .{ body.name, variant_name });
                     }
                 } else if (try self.interfaceObject(operand)) |interface| {
+                    // runtime identity carries no instantiation, so a
+                    // generic interface object only dispatches (section 5.2)
+                    if (interface.arguments.len != 0) {
+                        try self.report(cast.operator.location, "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 5.2)", .{interface.name});
+                        return &bool_type;
+                    }
                     const target = try self.typeFromExpression(cast.target, self.scope_types);
                     if (target.* != .unknown and !try self.implements(target, interface)) {
                         const rendered = try target.render(self.arena);
@@ -2743,13 +2894,20 @@ pub const Checker = struct {
                 // the cursor protocol (section 4.3): 'iterator()' yields a
                 // cursor whose 'next()' returns Option<T>
                 if (try self.cursorElement(subject, subject_type)) |cursor_element| {
+                    // a custom subject additionally declares its Iterable
+                    // conformance; arrays are for-compatible natively and
+                    // never take the marker (sections 4.3, 5.2)
+                    if (!try self.declaresIterable(subject_type)) {
+                        const rendered = try subject_type.render(self.arena);
+                        try self.report(self.expressionSpan(subject), "{s} provides 'iterator()' but does not declare 'Iterable' conformance (': Iterable<...>', sections 4.3, 5.2)", .{rendered});
+                    }
                     element = cursor_element;
                     mutable = false;
                 }
             }
             if (element == null) {
                 const rendered = try subject_type.render(self.arena);
-                try self.report(self.expressionSpan(subject), "{s} is not iterable: provide 'iterator()' and 'next()' extension functions (section 4.3)", .{rendered});
+                try self.report(self.expressionSpan(subject), "{s} is not iterable: declare 'Iterable' conformance and provide the 'iterator()' and 'next()' extension functions (sections 4.3, 5.2)", .{rendered});
             }
             try element_types.append(self.arena, element orelse &unknown_type);
             try element_mutability.append(self.arena, mutable);
@@ -2794,6 +2952,39 @@ pub const Checker = struct {
         };
     }
 
+    // whether a custom 'for' subject declares Iterable conformance
+    // (sections 4.3, 5.2); the conformance verification already guarantees
+    // the declared 'iterator' matches the interface
+    fn declaresIterable(self: *Checker, subject_type: *const Type) Error!bool {
+        const resolved = try self.resolveAlias(try self.pierce(subject_type));
+        switch (resolved.*) {
+            .declared => |declared| {
+                const type_def = declared.definition.kind.type_def;
+                const definition_source = self.views[declared.view_index].source;
+                for (type_def.interfaces) |marker| {
+                    const symbol = self.firstVisible(marker.name.slice(definition_source), declared.view_index) orelse continue;
+                    if (symbol.definition.kind != .interface_def) continue;
+                    const interface: Type.Interface = .{
+                        .definition = symbol.definition,
+                        .view_index = symbol.view_index,
+                        .name = marker.name.slice(definition_source),
+                    };
+                    if (self.langItem(interface) == .iterable) return true;
+                }
+                return false;
+            },
+            // a constrained type parameter iterates through its Iterable
+            // constraint
+            .type_parameter => |parameter| {
+                const constraint = parameter.constraint orelse return false;
+                return self.langItem(constraint) == .iterable;
+            },
+            // any other subject already failed the structural forms and
+            // will not duck-type a cursor either
+            else => return true,
+        }
+    }
+
     // resolves the cursor protocol for one 'for' subject (section 4.3):
     // 'subject.iterator()' yields a cursor, 'cursor.next()' yields
     // 'Option<T>', and the loop variable binds to T
@@ -2816,11 +3007,48 @@ pub const Checker = struct {
         return self.optionPayload(next_type);
     }
 
-    const QuietCandidate = struct {
+    pub const QuietCandidate = struct {
         symbol: resolution.Symbol,
         return_type: *const Type,
         type_bindings: []const Type.Binding,
     };
+
+    /// Resolves an extension call for one monomorphized receiver during
+    /// code generation: a call through a generic constraint (section 5.2)
+    /// records no static target, so each function instance re-resolves the
+    /// callee against its concrete receiver type. Closed-world like the
+    /// interface vtables: visibility is not re-checked here.
+    pub fn resolveInstanceMethod(self: *Checker, receiver_type: *const Type, name: []const u8, argument_types: []const *const Type, skip_interface_receivers: bool) Error!?QuietCandidate {
+        const receiver: MethodReceiver = .{
+            .raw = receiver_type,
+            .pierced = try self.pierce(receiver_type),
+            .mutable = true,
+        };
+        const symbols = self.globals.get(name) orelse return null;
+        const empty_call = .{ .type_arguments = @as([]const *const ast.TypeExpression, &.{}) };
+        var result: ?QuietCandidate = null;
+        for (symbols.items) |symbol| {
+            if (symbol.definition.kind != .fn_def) continue;
+            const fn_def = symbol.definition.kind.fn_def;
+            if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
+            // interface-receiver candidates are DEFAULT implementations
+            // (section 5.2); dispatch prefers type-specific extensions and
+            // handles defaults separately
+            if (skip_interface_receivers) {
+                const candidate_environment = try self.typeParameterEnvironment(fn_def.type_parameters, symbol.view_index);
+                const self_type = try self.typeFromExpressionIn(fn_def.function.parameters[0].parameter_type, candidate_environment, symbol.view_index);
+                if ((try self.pierce(self_type)).* == .interface) continue;
+            }
+            if (try self.tryCandidate(symbol, empty_call, argument_types, receiver, null)) |candidate| {
+                result = .{
+                    .symbol = symbol,
+                    .return_type = candidate.return_type,
+                    .type_bindings = candidate.type_bindings,
+                };
+            }
+        }
+        return result;
+    }
 
     // resolves a zero-argument extension call without emitting diagnostics
     fn quietMethodCandidate(self: *Checker, receiver: MethodReceiver, name: []const u8) Error!?QuietCandidate {
@@ -3040,6 +3268,12 @@ pub const Checker = struct {
     // a match arm on an interface object names a concrete type and captures
     // the downcasted value (section 3.2)
     fn checkInterfaceArm(self: *Checker, interface: Type.Interface, pattern: *const ast.Expression, capture: ?ast.Capture, subject_raw: *const Type) Error!void {
+        // runtime identity carries no instantiation, so a generic
+        // interface object only dispatches (section 5.2)
+        if (interface.arguments.len != 0) {
+            try self.report(self.expressionSpan(pattern), "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 5.2)", .{interface.name});
+            return;
+        }
         const unwrapped = unwrapGrouped(pattern);
         if (unwrapped.* != .path) {
             try self.report(self.expressionSpan(pattern), "a match arm on an interface object must name a concrete type implementing '{s}' (section 3.2)", .{interface.name});
@@ -3745,7 +3979,7 @@ pub const Checker = struct {
                 if (type_def.type_parameters.len != 0) continue;
                 for (type_def.interfaces) |marker| {
                     // the marker resolves where the type is declared
-                    const marker_symbol = self.firstVisible(marker.slice(view.source), view_index) orelse continue;
+                    const marker_symbol = self.firstVisible(marker.name.slice(view.source), view_index) orelse continue;
                     if (marker_symbol.definition != interface_definition) continue;
                     const declared = try self.makeType(.{ .declared = .{
                         .definition = definition,
@@ -3880,7 +4114,7 @@ pub const Checker = struct {
                     const marker_source = self.views[resolved.declared.view_index].source;
                     var markers: std.ArrayList([]const u8) = .empty;
                     for (type_def.interfaces) |marker| {
-                        try markers.append(self.arena, marker.slice(marker_source));
+                        try markers.append(self.arena, marker.name.slice(marker_source));
                     }
                     description.interface_names = try markers.toOwnedSlice(self.arena);
                 }
@@ -4184,15 +4418,18 @@ pub const Checker = struct {
         if (call.arguments.len != function.parameters.len) {
             try self.report(name_token.location, "'{s}' expects {d} argument(s), found {d}", .{ name, function.parameters.len, call.arguments.len });
         }
+        // a generic constraint's instantiation binds the interface's own
+        // type parameters inside the declared signatures (section 5.2)
+        const interface_environment = try self.interfaceEnvironment(interface);
         const checked = @min(call.arguments.len, function.parameters.len);
         for (call.arguments[0..checked], function.parameters[0..checked]) |argument, parameter| {
-            const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, &empty_type_environment, interface.view_index);
+            const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, interface_environment, interface.view_index);
             const argument_type = try self.consumedValueType(argument, try self.checkExpression(argument, parameter_type));
             try self.expectAssignable(argument_type, parameter_type, argument, self.expressionSpan(argument));
         }
         for (call.arguments[checked..]) |argument| _ = try self.checkExpression(argument, null);
         return if (function.return_type) |return_expression|
-            try self.typeFromExpressionIn(return_expression, &empty_type_environment, interface.view_index)
+            try self.typeFromExpressionIn(return_expression, interface_environment, interface.view_index)
         else
             &void_type;
     }
@@ -4274,7 +4511,7 @@ pub const Checker = struct {
                 try placeholders.put(self.arena, parameter_name, environment.get(parameter_name).?);
                 continue;
             }
-            const constraint = self.interfaceOfConstraint(type_parameter.constraint, symbol.view_index);
+            const constraint = try self.interfaceOfConstraint(type_parameter.constraint, &placeholders, symbol.view_index);
             try placeholders.put(self.arena, parameter_name, try self.makeType(.{ .type_parameter = .{ .name = parameter_name, .constraint = constraint } }));
         }
 
@@ -4332,8 +4569,12 @@ pub const Checker = struct {
         for (type_parameters, 0..) |type_parameter, index| {
             const parameter_name = type_parameter.name.slice(definition_source);
             const bound = environment.get(parameter_name) orelse return null;
-            if (self.interfaceOfConstraint(type_parameter.constraint, symbol.view_index)) |constraint| {
-                if (!try self.implements(bound, constraint)) return null;
+            if (try self.interfaceOfConstraint(type_parameter.constraint, &placeholders, symbol.view_index)) |constraint| {
+                // the constraint's arguments may name sibling type
+                // parameters ('<T, It: Iterator<T>>'); this call's bindings
+                // substitute in before conformance is checked (section 3.7)
+                const bound_constraint = try self.substituteInterface(constraint, environment);
+                if (!try self.implements(bound, bound_constraint)) return null;
             }
             type_bindings[index] = .{ .name = parameter_name, .bound = bound };
         }
@@ -4445,6 +4686,21 @@ pub const Checker = struct {
                     .definition = declared.definition,
                     .view_index = declared.view_index,
                     .name = declared.name,
+                    .arguments = try arguments.toOwnedSlice(self.arena),
+                } });
+            },
+            // a generic interface object's arguments monomorphize like a
+            // declared type's ('&Iterator<T>' becomes '&Iterator<u64>')
+            .interface => |interface| {
+                if (interface.arguments.len == 0) return candidate;
+                var arguments: std.ArrayList(*const Type) = .empty;
+                for (interface.arguments) |argument| {
+                    try arguments.append(self.arena, try self.substitute(argument, bindings));
+                }
+                return self.makeType(.{ .interface = .{
+                    .definition = interface.definition,
+                    .view_index = interface.view_index,
+                    .name = interface.name,
                     .arguments = try arguments.toOwnedSlice(self.arena),
                 } });
             },
@@ -4765,23 +5021,50 @@ pub const Checker = struct {
     fn consumedValueType(self: *Checker, expression: *const ast.Expression, checked: *const Type) Error!*const Type {
         if (self.tooling_only) return checked;
         const unwrapped = unwrapGrouped(expression);
-        if (unwrapped.* != .call) return checked;
         const resolved = try self.resolveAlias(checked);
+        if (resolved.* != .slice and resolved.* != .reference) return checked;
+        if (unwrapped.* == .call) {
+            switch (resolved.*) {
+                .slice => {
+                    try self.report(self.expressionSpan(expression), "a call's '&[T]' result must be marked at a use site: '&' before the call keeps the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
+                    return checked;
+                },
+                .reference => return self.pierceConsumed(unwrapped, checked, resolved),
+                else => unreachable,
+            }
+        }
+        // using a VARIABLE uses the value (section 4.2): a bare place read
+        // consumes the pointee, and passing the borrow itself is spelled
+        // '&x'. Unary results ('&x', 'new x') are already explicit, and
+        // non-place expressions (literals, subslices, yielded values)
+        // construct their reference visibly.
+        if (unwrapped.* == .unary) return checked;
+        if ((try self.lvalueOf(unwrapped)) == null) return checked;
         switch (resolved.*) {
             .slice => {
-                try self.report(self.expressionSpan(expression), "a call's '&[T]' result must be marked at a use site: '&' before the call keeps the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
+                try self.report(self.expressionSpan(expression), "a '&[T]' variable used here means the array value, which is unsized: '&' passes the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
                 return checked;
             },
-            .reference => {
-                const pierced = try self.pierce(checked);
-                try self.pierced_results.put(self.arena, unwrapped, {});
-                // the use consumes the pointee: the recorded type says so,
-                // and codegen sizes slots and stores from it
-                try self.expression_types.put(self.arena, unwrapped, pierced);
-                return pierced;
+            .reference => |indirection| {
+                // an interface object's erased value cannot be copied out
+                if ((try self.resolveAlias(indirection.child)).* == .interface) {
+                    try self.report(self.expressionSpan(expression), "an interface-object variable used here means the erased value: write '&' to pass the interface object (sections 4.2, 5.2)", .{});
+                    return checked;
+                }
+                return self.pierceConsumed(unwrapped, checked, resolved);
             },
-            else => return checked,
+            else => unreachable,
         }
+    }
+
+    // the use consumes the pointee as a deep copy: the recorded type says
+    // so, and both engines copy through the pierced_results mark
+    fn pierceConsumed(self: *Checker, unwrapped: *const ast.Expression, checked: *const Type, resolved: *const Type) Error!*const Type {
+        _ = resolved;
+        const pierced = try self.pierce(checked);
+        try self.pierced_results.put(self.arena, unwrapped, {});
+        try self.expression_types.put(self.arena, unwrapped, pierced);
+        return pierced;
     }
 
     fn makeType(self: *Checker, value: Type) Error!*const Type {

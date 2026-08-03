@@ -196,6 +196,19 @@ pub const Type = union(enum) {
         definition: *const ast.Definition,
         view_index: usize,
         name: []const u8,
+        // the types binding a generic interface's own type parameters
+        // ('Iterable<u64, PacketCursor>', section 5.2); empty when the
+        // interface is not generic
+        arguments: []const *const Type = &.{},
+
+        pub fn eqlInterface(left: Interface, right: Interface) bool {
+            if (left.definition != right.definition) return false;
+            if (left.arguments.len != right.arguments.len) return false;
+            for (left.arguments, right.arguments) |left_argument, right_argument| {
+                if (!left_argument.eql(right_argument)) return false;
+            }
+            return true;
+        }
     };
 
     pub const InlineEnum = struct {
@@ -223,7 +236,7 @@ pub const Type = union(enum) {
             .declared => |declared| eqlDeclared(declared, right.declared),
             .structural => |fields| eqlFields(fields, right.structural),
             .type_parameter => |parameter| std.mem.eql(u8, parameter.name, right.type_parameter.name),
-            .interface => |interface| interface.definition == right.interface.definition,
+            .interface => |interface| interface.eqlInterface(right.interface),
             // identity here is the same syntactic occurrence; structural
             // compatibility between distinct occurrences lives in coercion
             .inline_enum => |inline_enum| inline_enum.members.ptr == right.inline_enum.members.ptr,
@@ -351,7 +364,17 @@ pub const Type = union(enum) {
                 try writer.writeAll(" }");
             },
             .type_parameter => |parameter| try writer.writeAll(parameter.name),
-            .interface => |interface| try writer.writeAll(interface.name),
+            .interface => |interface| {
+                try writer.writeAll(interface.name);
+                if (interface.arguments.len != 0) {
+                    try writer.writeAll("<");
+                    for (interface.arguments, 0..) |argument, index| {
+                        if (index != 0) try writer.writeAll(", ");
+                        try argument.write(writer);
+                    }
+                    try writer.writeAll(">");
+                }
+            },
             .inline_enum => try writer.writeAll("enum { ... }"),
             .structural_enum => |variants| {
                 try writer.writeAll("enum { ");

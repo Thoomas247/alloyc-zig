@@ -66,6 +66,9 @@ pub const Codegen = struct {
     expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
     call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
     call_type_bindings: *const std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding),
+    // per-instance targets for constraint-dispatched calls (section 5.2),
+    // filled during emission by constraintCallTarget
+    constraint_call_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding) = .empty,
     comptime_values: *const std.AutoHashMapUnmanaged(*const ast.Expression, Interpreter.Value),
     cast_shapes: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes),
     diagnostics: *std.ArrayList(Diagnostic),
@@ -88,6 +91,11 @@ pub const Codegen = struct {
     // runtime type identity globals, one per concrete declared type; the
     // address is the identity an interface object carries (section 5.2)
     type_descriptors: std.AutoHashMapUnmanaged(*const ast.Definition, []const u8),
+    // per-instantiation identities for generic types behind generic
+    // interface objects, keyed by definition pointer + canonical type key
+    instance_descriptors: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // implementer lists per generic-interface instantiation
+    instance_implementer_lists: std.StringHashMapUnmanaged([]const Implementer) = .empty,
     // constant closure blocks for named functions used as values (section
     // 4.4), memoized by the instance name
     static_closures: std.StringHashMapUnmanaged([]const u8),
@@ -1343,6 +1351,11 @@ pub const Codegen = struct {
                     try self.instruction("store i64 {s}, ptr {s}", .{ view.length, length_slot });
                     return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
                 }
+                // re-borrowing a slice-typed place yields the same view:
+                // the fat pair itself is the value (section 4.2)
+                if ((try self.resolvedOf(place.value_type)).* == .slice) {
+                    return .{ .memory = .{ .pointer = place.pointer, .layout = .{ .size = 16, .alignment = 8 } } };
+                }
                 return .{ .scalar = .{ .text = place.pointer, .llvm = "ptr" } };
             },
             .keyword_new => return self.evalNew(expression),
@@ -1383,6 +1396,7 @@ pub const Codegen = struct {
                 // the fat pair carries the identity for the virtual drop
                 // (section 5.2)
                 if ((try self.resolvedOf(indirection.child)).* == .interface) {
+                    const interface = (try self.resolvedOf(indirection.child)).interface;
                     const concrete = try self.resolvedOf(try self.typeOf(operand));
                     if (concrete.* != .declared) {
                         return self.report(span, "only named types convert to interface objects (section 5.2)", .{});
@@ -1394,7 +1408,7 @@ pub const Codegen = struct {
                     const allocation = try self.allocateFixed(concrete_layout.size);
                     try self.zeroFill(allocation, concrete_layout.size);
                     try self.storeOperand(allocation, coerced, concrete, span);
-                    return self.interfacePair(allocation, concrete.declared.definition);
+                    return self.interfacePair(allocation, concrete, interface.arguments.len != 0);
                 }
                 const pointee_layout = (try self.layoutQuery(indirection.child, 0)) orelse
                     return self.report(span, "this pointee type has no defined layout", .{});
@@ -1907,6 +1921,12 @@ pub const Codegen = struct {
             if (std.mem.eql(u8, name, "length") and call.arguments.len == 0) {
                 return self.lengthCall(callee.member.object, span);
             }
+            // a call through a generic constraint has no static target
+            // (the checker typed it against the interface, section 5.2);
+            // the monomorphized receiver resolves the extension here
+            if (try self.constraintCallTarget(expression, callee.member)) |symbol| {
+                return self.callFunction(expression, symbol, callee);
+            }
             // the receiver place evaluates exactly once: a second walk
             // would re-run subscript side effects; a temporary receiver
             // materializes and drops after the call (section 4.5)
@@ -2025,12 +2045,42 @@ pub const Codegen = struct {
         return self.report(span, "no variant '{s}' here", .{name});
     }
 
+    // resolves a member call whose receiver the checker typed as a
+    // constrained type parameter: the target only exists per instance,
+    // where the current bindings make the receiver concrete (section 5.2)
+    fn constraintCallTarget(self: *Codegen, expression: *const ast.Expression, member: anytype) Error!?resolution.Symbol {
+        const object = unwrapGrouped(member.object);
+        const recorded = self.checker.expression_types.get(object) orelse local: {
+            // the receiver of a checked member call has no recorded
+            // expression type when it is a plain local read
+            if (object.* != .path or object.path.len != 1) return null;
+            const local = self.lookupLocal(object.path[0].slice(self.source())) orelse return null;
+            break :local local.declared_type;
+        };
+        // interface objects dispatch through their identity instead
+        if ((try self.resolvedOf(try self.checker.pierce(recorded))).* == .interface) return null;
+        const call = expression.call;
+        const receiver_type = try self.substituted(recorded);
+        const argument_types = try self.arena.alloc(*const Type, call.arguments.len);
+        for (call.arguments, 0..) |argument, index| {
+            argument_types[index] = try self.substituted(try self.typeOf(argument));
+        }
+        const name = member.name.slice(self.source());
+        const candidate = (try self.checker.resolveInstanceMethod(receiver_type, name, argument_types, true)) orelse return null;
+        try self.constraint_call_bindings.put(self.arena, expression, candidate.type_bindings);
+        return candidate.symbol;
+    }
+
     fn callFunction(self: *Codegen, expression: *const ast.Expression, symbol: resolution.Symbol, callee: *const ast.Expression) Error!Operand {
         const call = expression.call;
         const span = self.spanOf(expression);
         // the call site's inferred bindings (section 3.7) substitute through
         // the caller's own bindings, so nested generics chain concretely
-        const raw_bindings = self.call_type_bindings.get(expression) orelse &.{};
+        // a constraint-dispatched call resolved per instance overrides the
+        // checker's recorded (generic) bindings; instances emit one at a
+        // time, so the freshest entry is always the current instance's
+        const raw_bindings = self.constraint_call_bindings.get(expression) orelse
+            (self.call_type_bindings.get(expression) orelse &.{});
         var bindings: std.ArrayList(Type.Binding) = .empty;
         for (raw_bindings) |binding| {
             try bindings.append(self.arena, .{ .name = binding.name, .bound = try self.substituted(binding.bound) });
@@ -4126,6 +4176,10 @@ pub const Codegen = struct {
         definition: *const ast.Definition,
         view_index: usize,
         name: []const u8,
+        // the implementer's own instantiation behind a generic interface
+        // object ('VectorCursor<E> : Iterator<E>' behind '&Iterator<u64>'
+        // carries '[u64]'); empty for non-generic implementers
+        arguments: []const *const Type = &.{},
     };
 
     // the merged unit is the whole program, so the implementers of an
@@ -4133,6 +4187,29 @@ pub const Codegen = struct {
     // memoized because dispatch sites and the virtual drop and copy
     // helpers all enumerate the same list
     fn interfaceImplementers(self: *Codegen, interface: Type.Interface) Error![]const Implementer {
+        // an instantiated generic interface enumerates per instantiation:
+        // each conforming type's marker unifies against the required
+        // arguments to derive that implementer's own bindings
+        if (interface.arguments.len != 0) {
+            const memo_key = try self.instantiationKey(interface);
+            if (self.instance_implementer_lists.get(memo_key)) |existing| return existing;
+            var implementers: std.ArrayList(Implementer) = .empty;
+            for (self.views, 0..) |view, view_index| {
+                for (view.module.definitions) |*definition| {
+                    if (definition.kind != .type_def) continue;
+                    const arguments = (try self.checker.implementerArguments(definition, view_index, interface)) orelse continue;
+                    try implementers.append(self.arena, .{
+                        .definition = definition,
+                        .view_index = view_index,
+                        .name = definition.kind.type_def.name.slice(view.source),
+                        .arguments = arguments,
+                    });
+                }
+            }
+            const list = try implementers.toOwnedSlice(self.arena);
+            try self.instance_implementer_lists.put(self.arena, memo_key, list);
+            return list;
+        }
         if (self.implementer_lists.get(interface.definition)) |existing| return existing;
         var implementers: std.ArrayList(Implementer) = .empty;
         for (self.views, 0..) |view, view_index| {
@@ -4141,7 +4218,7 @@ pub const Codegen = struct {
                 const type_def = definition.kind.type_def;
                 for (type_def.interfaces) |marker| {
                     // the marker resolves where the type is declared
-                    const symbol = self.firstVisible(marker.slice(view.source), view_index) orelse continue;
+                    const symbol = self.firstVisible(marker.name.slice(view.source), view_index) orelse continue;
                     if (symbol.definition != interface.definition) continue;
                     try implementers.append(self.arena, .{
                         .definition = definition,
@@ -4157,10 +4234,26 @@ pub const Codegen = struct {
         return list;
     }
 
+    fn instantiationKey(self: *Codegen, interface: Type.Interface) Error![]const u8 {
+        var text: std.Io.Writer.Allocating = .init(self.arena);
+        defer text.deinit();
+        text.writer.print("{d}", .{@intFromPtr(interface.definition)}) catch return error.OutOfMemory;
+        for (interface.arguments) |argument| {
+            text.writer.print("|{s}", .{try self.typeKey(argument, 0)}) catch return error.OutOfMemory;
+        }
+        return self.arena.dupe(u8, text.writer.buffered());
+    }
+
     // the interface-object fat pair: the data pointer at offset 0 and the
-    // per-type identity at offset 8 (section 5.2)
-    fn interfacePair(self: *Codegen, data_pointer: []const u8, definition: *const ast.Definition) Error!Operand {
-        const descriptor = try self.typeDescriptor(definition);
+    // per-type identity at offset 8 (section 5.2); a generic interface's
+    // identity is per instantiation, a non-generic one stays per
+    // definition so downcasts keep matching
+    fn interfacePair(self: *Codegen, data_pointer: []const u8, concrete: *const Type, generic_interface: bool) Error!Operand {
+        const resolved = try self.resolvedOf(concrete);
+        const descriptor = if (generic_interface)
+            try self.typeDescriptorFor(concrete)
+        else
+            try self.typeDescriptor(resolved.declared.definition);
         const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
         try self.instruction("store ptr {s}, ptr {s}", .{ data_pointer, pair });
         const identity_pointer = try self.byteOffset(pair, 8);
@@ -4174,9 +4267,25 @@ pub const Codegen = struct {
             .definition = implementer.definition,
             .view_index = implementer.view_index,
             .name = implementer.name,
-            .arguments = &.{},
+            .arguments = implementer.arguments,
         } };
         return concrete;
+    }
+
+    // the identity for one concrete instantiation: a generic type gets a
+    // descriptor per instantiation, so 'Cursor<u64>' and 'Cursor<u8>'
+    // behind '&Iterator<...>' objects never confuse dispatch (section 5.2)
+    fn typeDescriptorFor(self: *Codegen, concrete: *const Type) Error![]const u8 {
+        const resolved = try self.resolvedOf(concrete);
+        if (resolved.* != .declared) return self.report(.{ .start = 0, .end = 0 }, "internal: an interface object needs a declared concrete type", .{});
+        if (resolved.declared.arguments.len == 0) return self.typeDescriptor(resolved.declared.definition);
+        const key = try std.fmt.allocPrint(self.arena, "{d}|{s}", .{ @intFromPtr(resolved.declared.definition), try self.typeKey(resolved, 0) });
+        if (self.instance_descriptors.get(key)) |existing| return existing;
+        const name = try std.fmt.allocPrint(self.arena, "alloy.type.{s}.{d}", .{ resolved.declared.name, self.global_counter });
+        self.global_counter += 1;
+        self.constants.writer.print("@\"{s}\" = internal constant i8 0\n", .{name}) catch return error.OutOfMemory;
+        try self.instance_descriptors.put(self.arena, key, name);
+        return name;
     }
 
     // the drop body for an owning interface object '*I' (section 5.2):
@@ -4200,7 +4309,7 @@ pub const Codegen = struct {
             const concrete = try self.implementerType(implementer);
             // implementers without owned heap free the allocation alone
             if (!try self.ownsHeap(concrete, 0)) continue;
-            const descriptor = try self.typeDescriptor(implementer.definition);
+            const descriptor = try self.typeDescriptorFor(concrete);
             const arm = try self.freshLabel("drop.arm");
             const miss = try self.freshLabel("drop.miss");
             const matches = try self.freshTemp();
@@ -4237,7 +4346,7 @@ pub const Codegen = struct {
         try self.instruction("{s} = load ptr, ptr {s}", .{ identity, identity_slot });
         for (try self.interfaceImplementers(interface)) |implementer| {
             const concrete = try self.implementerType(implementer);
-            const descriptor = try self.typeDescriptor(implementer.definition);
+            const descriptor = try self.typeDescriptorFor(concrete);
             const arm = try self.freshLabel("copy.arm");
             const miss = try self.freshLabel("copy.miss");
             const matches = try self.freshTemp();
@@ -4272,12 +4381,19 @@ pub const Codegen = struct {
             if (symbol.definition.kind != .fn_def) continue;
             const fn_def = symbol.definition.kind.fn_def;
             if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
-            const self_type = try self.checker.typeFromExpressionIn(fn_def.function.parameters[0].parameter_type, &empty_type_environment, symbol.view_index);
+            const self_type = try self.candidateSelfType(fn_def, symbol.view_index);
             const pierced = try self.checker.pierce(self_type);
             const resolved = try self.checker.resolveAlias(pierced);
             if (resolved.* == .declared and resolved.declared.definition == type_definition) return symbol;
         }
         return null;
+    }
+
+    // the receiver type in the candidate's OWN parameter environment: a
+    // generic candidate's 'Cursor<E>' must not report 'E' as undeclared
+    fn candidateSelfType(self: *Codegen, fn_def: ast.FnDef, view_index: usize) Error!*const Type {
+        const environment = try self.checker.typeParameterEnvironment(fn_def.type_parameters, view_index);
+        return self.checker.typeFromExpressionIn(fn_def.function.parameters[0].parameter_type, environment, view_index);
     }
 
     // the default implementation: an extension whose receiver is the
@@ -4288,7 +4404,7 @@ pub const Codegen = struct {
             if (symbol.definition.kind != .fn_def) continue;
             const fn_def = symbol.definition.kind.fn_def;
             if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
-            const self_type = try self.checker.typeFromExpressionIn(fn_def.function.parameters[0].parameter_type, &empty_type_environment, symbol.view_index);
+            const self_type = try self.candidateSelfType(fn_def, symbol.view_index);
             const pierced = try self.checker.pierce(self_type);
             if (pierced.* == .interface and pierced.interface.definition == interface.definition) return symbol;
         }
@@ -4330,8 +4446,16 @@ pub const Codegen = struct {
 
         const implementers = try self.interfaceImplementers(interface);
         for (implementers) |implementer| {
-            const target = (try self.findTypeExtension(implementer.definition, name)) orelse continue;
-            const descriptor = try self.typeDescriptor(implementer.definition);
+            // the concrete instantiation resolves the extension (and its
+            // type bindings, for generic implementers) like the checker
+            // would at a static call site
+            const concrete = try self.implementerType(implementer);
+            var substituted_arguments: std.ArrayList(*const Type) = .empty;
+            for (argument_types.items) |argument_type| {
+                try substituted_arguments.append(self.arena, try self.substituted(argument_type));
+            }
+            const target = (try self.checker.resolveInstanceMethod(concrete, name, substituted_arguments.items, true)) orelse continue;
+            const descriptor = try self.typeDescriptorFor(concrete);
             const arm = try self.freshLabel("dispatch.arm");
             const miss = try self.freshLabel("dispatch.miss");
             const matches = try self.freshTemp();
@@ -4339,7 +4463,7 @@ pub const Codegen = struct {
             try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, arm, miss });
             self.terminated = true;
             try self.startBlock(arm);
-            try self.emitDispatchArm(target, "ptr", data, argument_operands.items, argument_types.items, slot, span);
+            try self.emitDispatchArm(target.symbol, target.type_bindings, "ptr", data, argument_operands.items, argument_types.items, slot, span);
             try self.instruction("br label %{s}", .{exit});
             self.terminated = true;
             try self.startBlock(miss);
@@ -4347,7 +4471,7 @@ pub const Codegen = struct {
         if (try self.findInterfaceDefault(interface, name)) |default_symbol| {
             // the default implementation's receiver is the interface
             // object: the fat pair passes whole (section 5.2)
-            try self.emitDispatchArm(default_symbol, "ptr", place.pointer, argument_operands.items, argument_types.items, slot, span);
+            try self.emitDispatchArm(default_symbol, &.{}, "ptr", place.pointer, argument_operands.items, argument_types.items, slot, span);
             try self.instruction("br label %{s}", .{exit});
             self.terminated = true;
         } else {
@@ -4357,8 +4481,8 @@ pub const Codegen = struct {
         return self.slotOperand(slot, span);
     }
 
-    fn emitDispatchArm(self: *Codegen, symbol: resolution.Symbol, receiver_llvm: []const u8, receiver_text: []const u8, argument_operands: []const Operand, argument_types: []const *const Type, slot: ?Slot, span: Token.Location) Error!void {
-        const info = try self.functionInfo(symbol, span, &.{});
+    fn emitDispatchArm(self: *Codegen, symbol: resolution.Symbol, type_bindings: []const Type.Binding, receiver_llvm: []const u8, receiver_text: []const u8, argument_operands: []const Operand, argument_types: []const *const Type, slot: ?Slot, span: Token.Location) Error!void {
+        const info = try self.functionInfo(symbol, span, type_bindings);
         var lowered: std.ArrayList([]const u8) = .empty;
         var result_pointer: ?[]const u8 = null;
         if (info.aggregate_return) {
@@ -4427,7 +4551,8 @@ pub const Codegen = struct {
                 if (operand != .scalar) {
                     return self.report(span, "internal: this indirection operand has no scalar pointer", .{});
                 }
-                return self.interfacePair(operand.scalar.text, pointee.declared.definition);
+                const interface = (try self.resolvedOf(to_child.?)).interface;
+                return self.interfacePair(operand.scalar.text, pointee, interface.arguments.len != 0);
             }
         }
         switch (operand) {

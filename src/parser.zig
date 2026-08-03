@@ -102,11 +102,11 @@ pub const Parser = struct {
         _ = try self.expect(.keyword_type, "'type'");
         const name = try self.expect(.identifier, "a type name");
         const type_parameters = try self.parseTypeParameters();
-        var interfaces: std.ArrayList(Token) = .empty;
+        var interfaces: std.ArrayList(ast.InterfaceMarker) = .empty;
         if (self.match(.colon) != null) {
-            try interfaces.append(self.arena, try self.expect(.identifier, "an interface name"));
+            try interfaces.append(self.arena, try self.parseInterfaceMarker());
             while (self.match(.comma) != null) {
-                try interfaces.append(self.arena, try self.expect(.identifier, "an interface name"));
+                try interfaces.append(self.arena, try self.parseInterfaceMarker());
             }
         }
         _ = try self.expect(.equal, "'='");
@@ -154,6 +154,7 @@ pub const Parser = struct {
     fn parseInterfaceDef(self: *Parser) Error!ast.InterfaceDef {
         _ = try self.expect(.keyword_interface, "'interface'");
         const name = try self.expect(.identifier, "an interface name");
+        const type_parameters = try self.parseTypeParameters();
         _ = try self.expect(.brace_left, "'{'");
         var functions: std.ArrayList(ast.InterfaceFn) = .empty;
         self.skipSemicolons();
@@ -174,7 +175,7 @@ pub const Parser = struct {
             self.skipSemicolons();
         }
         _ = try self.expect(.brace_right, "'}'");
-        return .{ .name = name, .functions = try functions.toOwnedSlice(self.arena) };
+        return .{ .name = name, .type_parameters = type_parameters, .functions = try functions.toOwnedSlice(self.arena) };
     }
 
     fn parseMacroDef(self: *Parser) Error!ast.MacroDef {
@@ -214,16 +215,35 @@ pub const Parser = struct {
         if (self.match(.angle_left) != null) {
             while (true) {
                 const parameter_name = try self.expect(.identifier, "a type parameter name");
-                var constraint: ?Token = null;
+                var constraint: ?ast.InterfaceMarker = null;
                 if (self.match(.colon) != null) {
-                    constraint = try self.expect(.identifier, "a constraint name");
+                    constraint = try self.parseInterfaceMarker();
                 }
                 try type_parameters.append(self.arena, .{ .name = parameter_name, .constraint = constraint });
+                // a pending half of '>>' closes this list before any comma
+                if (self.pending_angle) break;
                 if (self.match(.comma) == null) break;
             }
             try self.expectAngleRight();
         }
         return type_parameters.toOwnedSlice(self.arena);
+    }
+
+    // an interface name with optional type arguments, used by conformance
+    // markers and generic constraints ('It: Iterator<T>', section 5.2)
+    fn parseInterfaceMarker(self: *Parser) Error!ast.InterfaceMarker {
+        const name = try self.expect(.identifier, "an interface name");
+        var type_arguments: std.ArrayList(*const ast.TypeExpression) = .empty;
+        if (self.match(.angle_left) != null) {
+            while (true) {
+                try type_arguments.append(self.arena, try self.parseType());
+                // a pending half of '>>' closes this list before any comma
+                if (self.pending_angle) break;
+                if (self.match(.comma) == null) break;
+            }
+            try self.expectAngleRight();
+        }
+        return .{ .name = name, .type_arguments = try type_arguments.toOwnedSlice(self.arena) };
     }
 
     const ParameterList = struct {
@@ -1156,7 +1176,7 @@ test "type definition with interfaces, generics, and nested angle close" {
     ;
     const module = try parseForTest(&arena, source);
     const type_def = module.definitions[0].kind.type_def;
-    try testing.expectEqualStrings("Number", type_def.type_parameters[0].constraint.?.slice(source));
+    try testing.expectEqualStrings("Number", type_def.type_parameters[0].constraint.?.name.slice(source));
     try testing.expectEqual(@as(usize, 2), type_def.interfaces.len);
     const members = type_def.base.struct_type;
     const rows_type = members[0].member_type.named;

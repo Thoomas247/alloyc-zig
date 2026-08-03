@@ -792,22 +792,24 @@ test "the interpreter runs lambdas with captured environments" {
 test "the interpreter drives custom iterables through the cursor protocol" {
     var sources = TestSources.initComptime(.{
         .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+        .{ "std/iterable.alloy", "import std::option;\npub interface Iterator<T> { fn next() -> Option<&T>; }\npub interface Iterable<T, It: Iterator<T>> { fn iterator() -> It; }" },
     });
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
     _ = try compilation.addModule("main.alloy",
         \\import std::option;
-        \\type Range = struct { limit: u64 };
-        \\type RangeCursor = struct { current: u64, limit: u64 };
+        \\import std::iterable;
+        \\type Range : Iterable<u64, RangeCursor> = struct { limit: u64 };
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
         \\fn iterator(self r: &Range) -> RangeCursor {
         \\    return RangeCursor { .current = 0, .limit = r.limit };
         \\}
-        \\fn next(self c: &var RangeCursor) -> Option<u64> {
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
         \\    if (c.current == c.limit) {
         \\        return Option::None;
         \\    };
         \\    c.current += 1;
-        \\    return Option::Some(c.current);
+        \\    return Option::Some(&c.current);
         \\}
         \\fn main() -> i32 {
         \\    const range = Range { .limit = 4 };
@@ -1295,6 +1297,21 @@ fn expectCheckErrors(source: []const u8, expected: []const []const u8) !void {
     }
 }
 
+fn expectCheckErrorsWith(sources: *TestSources, source: []const u8, expected: []const []const u8) !void {
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(sources)), .function = testLoader };
+    try std.testing.expect(!try compilation.run(loader));
+    try std.testing.expectEqual(expected.len, compilation.diagnostics.items.len);
+    for (compilation.diagnostics.items, expected) |diagnostic, fragment| {
+        if (std.mem.indexOf(u8, diagnostic.message, fragment) == null) {
+            std.debug.print("message '{s}' does not contain '{s}'\n", .{ diagnostic.message, fragment });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 fn expectChecks(source: []const u8) !void {
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
@@ -1353,6 +1370,62 @@ test "macro bodies never surface checker diagnostics" {
     );
 }
 
+test "a comptime fault reports its call chain" {
+    try expectCheckErrors(
+        \\macro inner(text: &[u8]) {
+        \\    return text.bogus.length();
+        \\}
+        \\macro outer() {
+        \\    return #inner("x");
+        \\}
+        \\type Broken = #outer();
+        \\fn main() -> i32 { return 0; }
+    , &.{"comptime call chain: outer -> inner"});
+}
+
+test "an 'is' capture works on a temporary subject in both engines" {
+    // the subject is a call result, not a place: the interpreter used to
+    // treat it as a silent non-match and always take the else branch
+    try expectRuns(
+        \\type Maybe = enum { Some: i64, None };
+        \\fn produce(flag: bool) -> Maybe {
+        \\    if (flag) { return Maybe::Some(42); }
+        \\    return Maybe::None;
+        \\}
+        \\fn main() -> i32 {
+        \\    var total = 0;
+        \\    if (produce(true) is ::Some) |value| {
+        \\        total += value to i32;
+        \\    }
+        \\    if (produce(false) is ::Some) |value| {
+        \\        total += value to i32;
+        \\    } else {
+        \\        total += 1;
+        \\    }
+        \\    return total;
+        \\}
+    , 43, "");
+    try expectBuildsAndRuns("is_temporary_subject",
+        \\type Maybe = enum { Some: i64, None };
+        \\fn produce(flag: bool) -> Maybe {
+        \\    if (flag) { return Maybe::Some(42); }
+        \\    return Maybe::None;
+        \\}
+        \\fn main() -> i32 {
+        \\    var total = 0;
+        \\    if (produce(true) is ::Some) |value| {
+        \\        total += value to i32;
+        \\    }
+        \\    if (produce(false) is ::Some) |value| {
+        \\        total += value to i32;
+        \\    } else {
+        \\        total += 1;
+        \\    }
+        \\    return total;
+        \\}
+    , 43, "");
+}
+
 test "reference results are borrowed explicitly, in both engines" {
     // '&shared(...)' keeps the borrow and observes the mutation; the bare
     // call pierces to a copy taken before it (section 4.2)
@@ -1385,7 +1458,7 @@ test "reference results are borrowed explicitly, in both engines" {
 test "a bare slice-returning call at a use site is an error" {
     try expectCheckErrors(
         \\fn view(source: &[u8]) -> &[u8] {
-        \\    return source;
+        \\    return &source;
         \\}
         \\fn main() -> i32 {
         \\    const text = view("abc");
@@ -1708,7 +1781,7 @@ test "string literals are static u8 slices" {
         \\fn consume(text: &[u8]) -> u64 { return text.length(); }
         \\fn f() {
         \\    var greeting: &[u8] = "hello";
-        \\    var size = consume(greeting);
+        \\    var size = consume(&greeting);
         \\    var bytes: u64 = greeting.length();
         \\    var first: u8 = greeting[0];
         \\}
@@ -2140,19 +2213,14 @@ test "constrained generics expose interface functions" {
 test "lang item interfaces are satisfied implicitly" {
     var sources = TestSources.initComptime(.{
         .{ "std/number.alloy", "pub interface Number { }" },
-        .{ "std/iterable.alloy", "pub interface Iterable {\n    fn length() -> u64;\n}" },
     });
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
     _ = try compilation.addModule("main.alloy",
         \\import std::number;
-        \\import std::iterable;
         \\fn double<T: Number>(value: T) -> T { return value + value; }
-        \\fn count<T: Iterable>(subject: T) -> u64 { return 0; }
         \\fn f() {
         \\    const doubled: u32 = double(7 as u32);
-        \\    const fill = [1 : 4];
-        \\    const total = count(fill);
         \\}
     );
     const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
@@ -2168,22 +2236,24 @@ test "lang item interfaces are satisfied implicitly" {
 test "custom iterables drive for loops via the cursor protocol" {
     var sources = TestSources.initComptime(.{
         .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+        .{ "std/iterable.alloy", "import std::option;\npub interface Iterator<T> { fn next() -> Option<&T>; }\npub interface Iterable<T, It: Iterator<T>> { fn iterator() -> It; }" },
     });
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
     _ = try compilation.addModule("main.alloy",
         \\import std::option;
-        \\type Range = struct { limit: u64 };
-        \\type RangeCursor = struct { current: u64, limit: u64 };
+        \\import std::iterable;
+        \\type Range : Iterable<u64, RangeCursor> = struct { limit: u64 };
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
         \\fn iterator(self r: &Range) -> RangeCursor {
         \\    return RangeCursor { .current = 0, .limit = r.limit };
         \\}
-        \\fn next(self c: &var RangeCursor) -> Option<u64> {
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
         \\    if (c.current == c.limit) {
         \\        return Option::None;
         \\    };
         \\    c.current += 1;
-        \\    return Option::Some(c.current);
+        \\    return Option::Some(&c.current);
         \\}
         \\fn f() {
         \\    const range = Range { .limit = 3 };
@@ -2211,6 +2281,257 @@ test "a type without the cursor protocol is not iterable" {
         \\    for (plain) |n| { }
         \\}
     , &.{"Plain is not iterable"});
+}
+
+// the shared std stub for the generic-iterable tests below
+const iterable_stub_sources = .{
+    .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+    .{ "std/iterable.alloy", "import std::option;\npub interface Iterator<T> { fn next() -> Option<&T>; }\npub interface Iterable<T, It: Iterator<T>> { fn iterator() -> It; }" },
+};
+
+test "a cursor-capable type still declares Iterable conformance" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    try expectCheckErrorsWith(&sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\type Range = struct { limit: u64 };
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
+        \\fn iterator(self r: &Range) -> RangeCursor {
+        \\    return RangeCursor { .current = 0, .limit = r.limit };
+        \\}
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
+        \\    if (c.current == c.limit) {
+        \\        return ::None;
+        \\    };
+        \\    c.current += 1;
+        \\    return ::Some(&c.current);
+        \\}
+        \\fn f() {
+        \\    const range = Range { .limit = 3 };
+        \\    for (range) |n| { }
+        \\}
+    , &.{"provides 'iterator()' but does not declare 'Iterable' conformance"});
+}
+
+test "generic interface conformance checks the instantiated signature" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    // 'next' returns 'Option<u64>' where 'Iterator<u64>' declares
+    // 'Option<&u64>': the substituted signature catches it
+    try expectCheckErrorsWith(&sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
+        \\fn next(self c: &var RangeCursor) -> Option<u64> {
+        \\    return ::None;
+        \\}
+    , &.{"the extension 'next' for 'RangeCursor' does not match the signature declared by 'Iterator'"});
+}
+
+test "a conformance marker binds every interface type parameter" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    try expectCheckErrorsWith(&sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\type Bag : Iterable<u64> = struct { limit: u64 };
+    , &.{ "'Iterable' expects 2 type arguments, found 1", "'Bag' does not implement 'Iterable'" });
+}
+
+test "a generic interface object requires full instantiation and never downcasts" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    // a bare generic interface behind an indirection is a partial erasure
+    try expectCheckErrorsWith(&sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\fn f(cursor: &Iterator) { }
+    , &.{"'Iterator' expects 1 type argument, found 0"});
+    // runtime identity carries no instantiation, so no downcasting
+    var downcast_sources = TestSources.initComptime(iterable_stub_sources);
+    try expectCheckErrorsWith(&downcast_sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\type RangeCursor : Iterator<u64> = struct { current: u64 };
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
+        \\    return ::None;
+        \\}
+        \\fn f(cursor: &Iterator<u64>) -> bool {
+        \\    return cursor is RangeCursor;
+        \\}
+    , &.{"downcasting a generic interface object ('Iterator') is not supported"});
+}
+
+test "generic interface objects dispatch dynamically in both engines" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    const source =
+        \\import std::option;
+        \\import std::iterable;
+        \\type Range : Iterable<u64, RangeCursor> = struct { limit: u64 };
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
+        \\fn iterator(self r: &Range) -> RangeCursor {
+        \\    return RangeCursor { .current = 0, .limit = r.limit };
+        \\}
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
+        \\    if (c.current == c.limit) {
+        \\        return ::None;
+        \\    };
+        \\    c.current += 1;
+        \\    return ::Some(&c.current);
+        \\}
+        \\type Repeater<T> : Iterator<T> = struct { value: T, remaining: u64 };
+        \\fn next<T>(self r: &var Repeater<T>) -> Option<&T> {
+        \\    if (r.remaining == 0) {
+        \\        return ::None;
+        \\    };
+        \\    r.remaining -= 1;
+        \\    return ::Some(&r.value);
+        \\}
+        \\fn total(it: &var Iterator<u64>) -> u64 {
+        \\    var sum: u64 = 0;
+        \\    while (true) {
+        \\        const step = it.next();
+        \\        if (step is ::Some) |value: &| {
+        \\            sum += value;
+        \\        } else {
+        \\            break;
+        \\        }
+        \\    }
+        \\    return sum;
+        \\}
+        \\fn main() -> i32 {
+        \\    var range_cursor = RangeCursor { .current = 0, .limit = 3 };
+        \\    var repeater: Repeater<u64> = Repeater { .value = 7, .remaining = 2 };
+        \\    const combined = total(&range_cursor) + total(&repeater);
+        \\    return combined to i32;
+        \\}
+    ;
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 20), exit_code);
+    try expectBuildsAndRunsWith("dyn_iterator", source, &sources, 20, "");
+}
+
+test "constraints take type arguments and dispatch interface functions" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    const source =
+        \\import std::option;
+        \\import std::iterable;
+        \\type Range : Iterable<u64, RangeCursor> = struct { limit: u64 };
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
+        \\fn iterator(self r: &Range) -> RangeCursor {
+        \\    return RangeCursor { .current = 0, .limit = r.limit };
+        \\}
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
+        \\    if (c.current == c.limit) {
+        \\        return ::None;
+        \\    };
+        \\    c.current += 1;
+        \\    return ::Some(&c.current);
+        \\}
+        \\fn drain<T, It: Iterator<T>>(cursor: It) -> u64 {
+        \\    var mine = cursor;
+        \\    var count: u64 = 0;
+        \\    while (mine.next() is ::Some) {
+        \\        count += 1;
+        \\    }
+        \\    return count;
+        \\}
+        \\fn main() -> i32 {
+        \\    const range = Range { .limit = 3 };
+        \\    return drain<u64, RangeCursor>(range.iterator()) to i32;
+        \\}
+    ;
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 3), exit_code);
+    try expectBuildsAndRunsWith("constraint_dispatch", source, &sources, 3, "");
+}
+
+test "using a reference variable bare consumes the value" {
+    // a slice variable's value is the unsized array: '&' or 'new' required
+    try expectCheckErrors(
+        \\fn take(view: &[u8]) -> u64 {
+        \\    return view.length();
+        \\}
+        \\fn main() -> i32 {
+        \\    const text: &[u8] = "abc";
+        \\    return take(text) to i32;
+        \\}
+    , &.{"a '&[T]' variable used here means the array value"});
+    // a '&T' variable used bare is the pointee value, so it no longer
+    // fits a '&T' parameter; passing the borrow is spelled '&x'
+    try expectCheckErrors(
+        \\fn read(source: &i64) -> i64 {
+        \\    return source;
+        \\}
+        \\fn main() -> i32 {
+        \\    var backing: i64 = 5;
+        \\    const borrowed = &backing;
+        \\    return read(borrowed) to i32;
+        \\}
+    , &.{"no overload of 'read' matches"});
+}
+
+test "reference variables copy bare and borrow with an ampersand" {
+    // 'copied' snapshots the pointee before the mutation; 'alias'
+    // re-borrows the same backing and observes it
+    const source =
+        \\fn main() -> i32 {
+        \\    var backing: i64 = 5;
+        \\    const borrowed = &backing;
+        \\    const copied: i64 = borrowed;
+        \\    backing = 40;
+        \\    const alias = &borrowed;
+        \\    return (copied + alias) to i32;
+        \\}
+    ;
+    try expectRuns(source, 45, "");
+    try expectBuildsAndRuns("reference_variable_use", source, 45, "");
+}
+
+test "re-borrowing a reference or slice binding is idempotent" {
+    const source =
+        \\fn take(view: &[u8]) -> u64 {
+        \\    return view.length();
+        \\}
+        \\fn main() -> i32 {
+        \\    const owned: *[u8] = new [65 : 3];
+        \\    const view = &owned;
+        \\    return take(&view) to i32;
+        \\}
+    ;
+    try expectRuns(source, 3, "");
+    try expectBuildsAndRuns("slice_reborrow", source, 3, "");
+}
+
+test "a bound violating a constraint's arguments is rejected" {
+    var sources = TestSources.initComptime(iterable_stub_sources);
+    // RangeCursor conforms to Iterator<u64>, not Iterator<u8>
+    try expectCheckErrorsWith(&sources,
+        \\import std::option;
+        \\import std::iterable;
+        \\type RangeCursor : Iterator<u64> = struct { current: u64, limit: u64 };
+        \\fn next(self c: &var RangeCursor) -> Option<&u64> {
+        \\    return ::None;
+        \\}
+        \\fn drain<T, It: Iterator<T>>(cursor: It) -> u64 {
+        \\    return 0;
+        \\}
+        \\fn f() {
+        \\    const cursor = RangeCursor { .current = 0, .limit = 3 };
+        \\    const drained = drain<u8, RangeCursor>(cursor);
+        \\}
+    , &.{"no overload of 'drain' matches"});
 }
 
 test "imports load transitively through the loader" {
@@ -3008,21 +3329,24 @@ test "native executables dispatch through interface objects" {
 test "native executables match strings and run cursors" {
     const cursor_sources = TestSources.initComptime(.{
         .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None, };" },
+        .{ "std/iterable.alloy", "import std::option;\npub interface Iterator<T> { fn next() -> Option<&T>; }\npub interface Iterable<T, It: Iterator<T>> { fn iterator() -> It; }" },
     });
     try expectBuildsAndRunsWith("strings_cursors",
         \\import std::option;
+        \\import std::iterable;
         \\extern printf(format: &[u8], ...) -> i32;
-        \\type Countdown = struct { current: i32 };
-        \\type CountdownCursor = struct { remaining: i32 };
+        \\type Countdown : Iterable<i32, CountdownCursor> = struct { current: i32 };
+        \\type CountdownCursor : Iterator<i32> = struct { remaining: i32, current: i32 };
         \\fn iterator(self c: &Countdown) -> CountdownCursor {
-        \\    return CountdownCursor { .remaining = c.current };
+        \\    return CountdownCursor { .remaining = c.current, .current = 0 };
         \\}
-        \\fn next(self it: &var CountdownCursor) -> Option<i32> {
+        \\fn next(self it: &var CountdownCursor) -> Option<&i32> {
         \\    if (it.remaining == 0) {
         \\        return ::None;
         \\    }
         \\    it.remaining -= 1;
-        \\    return ::Some(it.remaining);
+        \\    it.current = it.remaining;
+        \\    return ::Some(&it.current);
         \\}
         \\fn nameOf(code: i32) -> &[u8] {
         \\    var name = match (code) {
@@ -3030,7 +3354,7 @@ test "native executables match strings and run cursors" {
         \\        2 { yield "two"; }
         \\        else { yield "many"; }
         \\    };
-        \\    return name;
+        \\    return &name;
         \\}
         \\fn main() -> i32 {
         \\    var sum = 0;
@@ -3360,25 +3684,28 @@ test "break exits loops through ifs and yield reaches the value construct" {
 test "native executables release loop temporaries and interrupted cursors" {
     const option_sources = TestSources.initComptime(.{
         .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None, };" },
+        .{ "std/iterable.alloy", "import std::option;\npub interface Iterator<T> { fn next() -> Option<&T>; }\npub interface Iterable<T, It: Iterator<T>> { fn iterator() -> It; }" },
     });
     try expectBuildsAndRunsWith("loop_releases",
         \\import std::option;
+        \\import std::iterable;
         \\extern printf(format: &[u8], ...) -> i32;
         \\type Wallet = struct { cash: *var i64 };
         \\fn makeWallets() -> [Wallet : 2] {
         \\    return [Wallet { .cash = new 3 } : 2];
         \\}
-        \\type Boxes = struct { limit: i64 };
-        \\type BoxCursor = struct { remaining: i64 };
+        \\type Boxes : Iterable<i64, BoxCursor> = struct { limit: i64 };
+        \\type BoxCursor : Iterator<i64> = struct { remaining: i64, current: i64, hoard: *var i64 };
         \\fn iterator(self b: &Boxes) -> BoxCursor {
-        \\    return BoxCursor { .remaining = b.limit };
+        \\    return BoxCursor { .remaining = b.limit, .current = 0, .hoard = new 7 };
         \\}
-        \\fn next(self it: &var BoxCursor) -> Option<*var i64> {
+        \\fn next(self it: &var BoxCursor) -> Option<&i64> {
         \\    if (it.remaining == 0) {
         \\        return ::None;
         \\    }
         \\    it.remaining -= 1;
-        \\    return ::Some(new (it.remaining * 10));
+        \\    it.current = it.remaining * 10;
+        \\    return ::Some(&it.current);
         \\}
         \\fn main() -> i32 {
         \\    var total: i64 = 0;
@@ -3471,11 +3798,11 @@ test "heap arrays borrow as slices, subslice, and move on return" {
         \\    const owned = make(4);
         \\    const view: &[u8] = &owned;
         \\    const tail = owned[2..4];
-        \\    const doubled = duplicate(view);
+        \\    const doubled = duplicate(&view);
         \\    const text: &[u8] = "abc";
         \\    const middle = text[1..2];
-        \\    printf("%d %d %d %d %d\n", view.length(), sum(view), sum(tail), middle[0], sum(&doubled));
-        \\    return sum(view) + sum(tail);
+        \\    printf("%d %d %d %d %d\n", view.length(), sum(&view), sum(&tail), middle[0], sum(&doubled));
+        \\    return sum(&view) + sum(&tail);
         \\}
     , 24, "4 18 6 98 18\n");
     try expectRunFault(
@@ -3516,11 +3843,11 @@ test "native executables borrow, subslice, and return heap arrays" {
         \\    const owned = make(4);
         \\    const view: &[u8] = &owned;
         \\    const tail = owned[2..4];
-        \\    const doubled = duplicate(view);
+        \\    const doubled = duplicate(&view);
         \\    const text: &[u8] = "abc";
         \\    const middle = text[1..2];
-        \\    printf("%d %d %d %d %d\n", view.length(), sum(view), sum(tail), middle[0], sum(&doubled));
-        \\    return (sum(view) + sum(tail)) to i32;
+        \\    printf("%d %d %d %d %d\n", view.length(), sum(&view), sum(&tail), middle[0], sum(&doubled));
+        \\    return (sum(&view) + sum(&tail)) to i32;
         \\}
     , 24, "4 18 6 98 18\n");
 }
@@ -3546,7 +3873,7 @@ test "the interpreter serves process arguments through the lang item" {
         \\fn main() -> i64 {
         \\    const all = &arguments();
         \\    for (all) |argument| {
-        \\        printf("%s\n", argument);
+        \\        printf("%s\n", &argument);
         \\    }
         \\    return all.length() to i64;
         \\}
