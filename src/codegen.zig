@@ -69,6 +69,10 @@ pub const Codegen = struct {
     // per-instance targets for constraint-dispatched calls (section 5.2),
     // filled during emission by constraintCallTarget
     constraint_call_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding) = .empty,
+    // the labels of the inline-capture bind diamond under construction
+    // (emitCaptureDiamond / startCaptureBind / finishCaptureBind)
+    capture_bind_label: []const u8 = "",
+    capture_join_label: []const u8 = "",
     comptime_values: *const std.AutoHashMapUnmanaged(*const ast.Expression, Interpreter.Value),
     cast_shapes: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes),
     diagnostics: *std.ArrayList(Diagnostic),
@@ -1261,6 +1265,65 @@ pub const Codegen = struct {
                 const instance = staticElements(value) orelse return null;
                 return self.staticArrayConstant(instance, try self.resolvedOf(array.element));
             },
+            .structural, .declared => {
+                if (value != .struct_value) return null;
+                const slots = (try self.fieldSlotsQuery(resolved)) orelse return null;
+                const layout = (try self.layoutQuery(resolved, 0)) orelse return null;
+                // a packed struct with explicit padding reproduces the
+                // section 3.9 byte layout exactly, so the field slots the
+                // generated code reads through line up
+                var type_text: std.ArrayList(u8) = .empty;
+                var value_text: std.ArrayList(u8) = .empty;
+                try type_text.appendSlice(self.arena, "<{ ");
+                try value_text.appendSlice(self.arena, "<{ ");
+                var cursor: u64 = 0;
+                var first = true;
+                for (slots) |slot| {
+                    const field = for (value.struct_value.fields) |candidate| {
+                        if (std.mem.eql(u8, candidate.name, slot.name)) break candidate;
+                    } else return null;
+                    const field_type = try self.resolvedOf(slot.field_type);
+                    const field_layout = (try self.layoutQuery(field_type, 1)) orelse return null;
+                    const rendered = (try self.staticConstant(field.value, field_type)) orelse return null;
+                    if (slot.offset > cursor) {
+                        if (!first) {
+                            try type_text.appendSlice(self.arena, ", ");
+                            try value_text.appendSlice(self.arena, ", ");
+                        }
+                        const pad = try std.fmt.allocPrint(self.arena, "[{d} x i8]", .{slot.offset - cursor});
+                        try type_text.appendSlice(self.arena, pad);
+                        try value_text.appendSlice(self.arena, pad);
+                        try value_text.appendSlice(self.arena, " zeroinitializer");
+                        first = false;
+                    }
+                    if (!first) {
+                        try type_text.appendSlice(self.arena, ", ");
+                        try value_text.appendSlice(self.arena, ", ");
+                    }
+                    try type_text.appendSlice(self.arena, rendered.type_text);
+                    try value_text.appendSlice(self.arena, rendered.type_text);
+                    try value_text.append(self.arena, ' ');
+                    try value_text.appendSlice(self.arena, rendered.value_text);
+                    cursor = slot.offset + field_layout.size;
+                    first = false;
+                }
+                if (layout.size > cursor) {
+                    if (!first) {
+                        try type_text.appendSlice(self.arena, ", ");
+                        try value_text.appendSlice(self.arena, ", ");
+                    }
+                    const pad = try std.fmt.allocPrint(self.arena, "[{d} x i8]", .{layout.size - cursor});
+                    try type_text.appendSlice(self.arena, pad);
+                    try value_text.appendSlice(self.arena, pad);
+                    try value_text.appendSlice(self.arena, " zeroinitializer");
+                }
+                try type_text.appendSlice(self.arena, " }>");
+                try value_text.appendSlice(self.arena, " }>");
+                return .{
+                    .type_text = try type_text.toOwnedSlice(self.arena),
+                    .value_text = try value_text.toOwnedSlice(self.arena),
+                };
+            },
             else => return null,
         }
     }
@@ -1800,6 +1863,10 @@ pub const Codegen = struct {
                     const type_id = try self.loadPointerField(place.pointer, 8);
                     const result = try self.freshTemp();
                     try self.instruction("{s} = icmp eq ptr {s}, @\"{s}\"", .{ result, type_id, descriptor.name });
+                    if (cast.capture) |capture| {
+                        const data = try self.loadPointerField(place.pointer, 0);
+                        try self.emitInlineCaptureBind(capture, result, data, descriptor.concrete, true, span);
+                    }
                     return .{ .scalar = .{ .text = result, .llvm = "i1" } };
                 }
                 const frame = (try self.enumFrameQuery(place.value_type)) orelse
@@ -1809,6 +1876,14 @@ pub const Codegen = struct {
                 const tag = try self.loadTag(place.pointer, frame);
                 const result = try self.freshTemp();
                 try self.instruction("{s} = icmp eq {s} {s}, {d}", .{ result, tagTypeText(frame.tag_size), tag, variant_index });
+                if (cast.capture) |capture| {
+                    const payload_type = frame.variants[variant_index].payload;
+                    const payload_pointer = if (payload_type != null)
+                        try self.byteOffset(place.pointer, frame.payload_offset)
+                    else
+                        place.pointer;
+                    try self.emitInlineCaptureBind(capture, result, payload_pointer, payload_type orelse &void_type, false, span);
+                }
                 return .{ .scalar = .{ .text = result, .llvm = "i1" } };
             },
             else => return self.report(span, "this cast is not yet supported by native code generation", .{}),
@@ -2625,6 +2700,13 @@ pub const Codegen = struct {
         const elements = expression.array_literal;
         const span = self.spanOf(expression);
         const resolved = try self.resolvedOf(try self.typeOf(expression));
+        if (resolved.* == .slice and elements.len == 0) {
+            // '[]' in slice position: the canonical empty view - null
+            // data pointer, zero length (section 3.2)
+            const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+            try self.zeroFill(pair, 16);
+            return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
+        }
         if (resolved.* != .fixed_array) return self.report(span, "this array literal has no fixed layout", .{});
         const element_type = resolved.fixed_array.element;
         const element_layout = (try self.layoutQuery(element_type, 0)) orelse
@@ -2806,14 +2888,13 @@ pub const Codegen = struct {
         const else_label = if (if_expr.else_branch != null) try self.freshLabel("if.else") else null;
         const exit_label = try self.freshLabel("if.exit");
 
-        var capture_binding: ?CaptureBinding = null;
-        if (if_expr.capture) |capture| {
-            capture_binding = try self.isConditionCapture(if_expr.condition, capture, then_label, else_label orelse exit_label);
-        } else {
-            const condition = try self.evalExpression(if_expr.condition);
-            try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ condition.scalar.text, then_label, else_label orelse exit_label });
-            self.terminated = true;
-        }
+        // the frame spans condition, then, and else: inline 'is' captures
+        // bind conditionally during the condition and drop at the shared
+        // exit, where zero-initialized slots make unmatched paths no-ops
+        try self.pushFrame();
+        const condition = try self.evalExpression(if_expr.condition);
+        try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ condition.scalar.text, then_label, else_label orelse exit_label });
+        self.terminated = true;
 
         // only a value-position if receives 'yield'; a statement-position
         // if is transparent so yields reach the enclosing value construct
@@ -2822,13 +2903,6 @@ pub const Codegen = struct {
         }
         try self.startBlock(then_label);
         try self.pushFrame();
-        if (capture_binding) |binding| {
-            if (binding.borrowed) {
-                try self.bindBorrowed(binding.capture.name.slice(self.source()), binding.payload_pointer, binding.payload_type);
-            } else {
-                try self.bindCapture(binding.capture, binding.payload_pointer, binding.payload_type, span);
-            }
-        }
         try self.execStatement(if_expr.then_branch);
         try self.closeFrame();
         if (!self.terminated) {
@@ -2847,17 +2921,9 @@ pub const Codegen = struct {
         }
         if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit_label);
+        try self.closeFrame();
         return self.slotOperand(slot, span);
     }
-
-    const CaptureBinding = struct {
-        capture: ast.Capture,
-        payload_pointer: []const u8,
-        payload_type: *const Type,
-        // a downcast capture borrows the concrete value behind the data
-        // pointer instead of copying a payload (section 3.2)
-        borrowed: bool = false,
-    };
 
     const Descriptor = struct {
         name: []const u8,
@@ -2886,55 +2952,122 @@ pub const Codegen = struct {
         try self.bindLocal(name, slot, reference_type);
     }
 
-    // 'if (subject is ::Variant) |payload|' binds the payload; with an
-    // interface-object subject 'if (s is Dog) |d|' borrows the concrete
-    // value on a type identity match (section 3.2)
-    fn isConditionCapture(self: *Codegen, condition: *const ast.Expression, capture: ast.Capture, then_label: []const u8, miss_label: []const u8) Error!CaptureBinding {
-        const unwrapped = unwrapGrouped(condition);
-        const span = self.spanOf(condition);
-        if (unwrapped.* != .cast or unwrapped.cast.operator.tag != .keyword_is) {
-            return self.report(span, "an 'if' capture needs an 'is' condition", .{});
+    // 'x is ::Variant |v|': the binding slot allocates and zeroes at
+    // function entry (a moved-from state, so scope-end drops are safe on
+    // every path), re-zeroes per evaluation for loop re-binding, and
+    // fills only on the matched path (section 3.2)
+    fn emitInlineCaptureBind(self: *Codegen, capture: ast.Capture, matches: []const u8, payload_pointer: []const u8, payload_type: *const Type, borrowed: bool, span: Token.Location) Error!void {
+        const name = capture.name.slice(self.source());
+        const mode = captureMode(capture);
+        // borrows hold a pointer and own nothing
+        if (borrowed or mode == .reference) {
+            const slot = try self.scalarSlot("ptr");
+            try self.emitCaptureDiamond(matches, slot, null);
+            try self.startCaptureBind();
+            try self.storeScalar(slot, .{ .text = payload_pointer, .llvm = "ptr" });
+            try self.finishCaptureBind();
+            const reference_type = try self.arena.create(Type);
+            reference_type.* = .{ .reference = .{ .mutable = false, .child = payload_type } };
+            try self.bindLocal(name, slot, reference_type);
+            return;
         }
-        const cast = unwrapped.cast;
-        const operand_type = try self.typeOf(cast.operand);
-        const place = (try self.evalPlace(cast.operand)) orelse place: {
-            const value = try self.evalExpression(cast.operand);
-            const memory = try self.ensureMemory(value, operand_type, span);
-            break :place Place{ .pointer = memory.pointer, .value_type = operand_type };
-        };
-        if (try self.interfaceOfPlace(place)) |_| {
-            const descriptor = try self.downcastDescriptor(cast.target, span);
-            const data = try self.loadPointerField(place.pointer, 0);
-            const type_id = try self.loadPointerField(place.pointer, 8);
-            const matches = try self.freshTemp();
-            try self.instruction("{s} = icmp eq ptr {s}, @\"{s}\"", .{ matches, type_id, descriptor.name });
-            try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, then_label, miss_label });
-            self.terminated = true;
-            return .{ .capture = capture, .payload_pointer = data, .payload_type = descriptor.concrete, .borrowed = true };
+        switch (mode) {
+            .copy => switch (try self.classify(payload_type, span)) {
+                .void_class => return,
+                .scalar => |llvm| {
+                    const slot = try self.scalarSlot(llvm);
+                    try self.zeroScalarSlotInEntry(slot, llvm);
+                    const owns = try self.ownsHeap(payload_type, 0);
+                    try self.emitCaptureDiamond(matches, slot, if (owns) payload_type else null);
+                    try self.startCaptureBind();
+                    if (owns) {
+                        const helper = try self.copyHelper(payload_type, span);
+                        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, slot, payload_pointer });
+                    } else {
+                        const loaded = try self.loadScalar(payload_pointer, llvm);
+                        try self.storeScalar(slot, .{ .text = loaded, .llvm = llvm });
+                    }
+                    try self.finishCaptureBind();
+                    try self.bindLocal(name, slot, payload_type);
+                },
+                .aggregate => |layout| {
+                    const slot = try self.aggregateSlot(layout);
+                    try self.zeroAggregateSlotInEntry(slot, layout.size);
+                    const owns = try self.ownsHeap(payload_type, 0);
+                    try self.emitCaptureDiamond(matches, slot, if (owns) payload_type else null);
+                    try self.startCaptureBind();
+                    if (owns) {
+                        const helper = try self.copyHelper(payload_type, span);
+                        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, slot, payload_pointer });
+                    } else {
+                        try self.copyBytes(slot, payload_pointer, layout.size);
+                    }
+                    try self.finishCaptureBind();
+                    try self.bindLocal(name, slot, payload_type);
+                },
+            },
+            .owning => {
+                const resolved = try self.resolvedOf(payload_type);
+                if (resolved.* != .pointer and resolved.* != .heap_array) {
+                    return self.report(span, "an owning capture needs a pointer payload (section 2.1)", .{});
+                }
+                const layout = (try self.layoutQuery(payload_type, 0)) orelse
+                    return self.report(span, "this payload type has no defined layout", .{});
+                const slot = try self.aggregateSlot(layout);
+                try self.zeroAggregateSlotInEntry(slot, layout.size);
+                try self.emitCaptureDiamond(matches, slot, payload_type);
+                try self.startCaptureBind();
+                try self.copyBytes(slot, payload_pointer, layout.size);
+                try self.instruction("store ptr null, ptr {s}", .{payload_pointer});
+                try self.finishCaptureBind();
+                try self.bindLocal(name, slot, payload_type);
+            },
+            .reference => unreachable,
         }
-        const frame = (try self.enumFrameQuery(place.value_type)) orelse
-            return self.report(span, "'is' needs an enum or interface-object subject", .{});
-        const target_token = cast.target.named.path[cast.target.named.path.len - 1];
-        const variant_name = target_token.slice(self.source());
-        const variant_index = try self.variantIndex(frame, variant_name, span);
-        const tag = try self.loadTag(place.pointer, frame);
-        const matches = try self.freshTemp();
-        try self.instruction("{s} = icmp eq {s} {s}, {d}", .{ matches, tagTypeText(frame.tag_size), tag, variant_index });
-        // the payload address computes before the branch terminates this
-        // block; afterwards it would land in an unreachable block and fail
-        // to dominate the capture binding in the then block
-        const payload_type = frame.variants[variant_index].payload;
-        const payload_pointer = if (payload_type != null)
-            try self.byteOffset(place.pointer, frame.payload_offset)
-        else
-            place.pointer;
-        try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, then_label, miss_label });
+    }
+
+    // the shared shape around a conditional capture bind: drop whatever
+    // the slot held from a previous loop iteration (zeroed the first
+    // time), re-zero it, then branch into the bind arm on a match
+    fn emitCaptureDiamond(self: *Codegen, matches: []const u8, slot: []const u8, dropped_type: ?*const Type) Error!void {
+        if (dropped_type) |previous| {
+            const helper = try self.dropHelper(previous, .{ .start = 0, .end = 0 });
+            try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, slot });
+            const layout = (try self.layoutQuery(previous, 0)) orelse return;
+            try self.zeroFill(slot, layout.size);
+        }
+        const bind_label = try self.freshLabel("capture.bind");
+        const join_label = try self.freshLabel("capture.join");
+        try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ matches, bind_label, join_label });
         self.terminated = true;
-        return .{
-            .capture = capture,
-            .payload_pointer = payload_pointer,
-            .payload_type = payload_type orelse &void_type,
-        };
+        self.capture_bind_label = bind_label;
+        self.capture_join_label = join_label;
+    }
+
+    fn startCaptureBind(self: *Codegen) Error!void {
+        try self.startBlock(self.capture_bind_label);
+    }
+
+    fn finishCaptureBind(self: *Codegen) Error!void {
+        try self.instruction("br label %{s}", .{self.capture_join_label});
+        self.terminated = true;
+        try self.startBlock(self.capture_join_label);
+    }
+
+    fn zeroScalarSlotInEntry(self: *Codegen, slot: []const u8, llvm: []const u8) Error!void {
+        const stored: []const u8 = if (std.mem.eql(u8, llvm, "i1")) "i8" else llvm;
+        const zero: []const u8 = if (std.mem.eql(u8, stored, "ptr"))
+            "null"
+        else if (std.mem.eql(u8, stored, "float") or std.mem.eql(u8, stored, "double"))
+            "0.0"
+        else
+            "0";
+        self.allocas.writer.print("  store {s} {s}, ptr {s}\n", .{ stored, zero, slot }) catch return error.OutOfMemory;
+    }
+
+    fn zeroAggregateSlotInEntry(self: *Codegen, slot: []const u8, size: u64) Error!void {
+        try self.declareIntrinsic("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)");
+        self.allocas.writer.print("  call void @llvm.memset.p0.i64(ptr {s}, i8 0, i64 {d}, i1 false)\n", .{ slot, size }) catch return error.OutOfMemory;
     }
 
     fn evalWhile(self: *Codegen, expression: *const ast.Expression, while_expr: ast.WhileExpression) Error!Operand {
@@ -2944,11 +3077,16 @@ pub const Codegen = struct {
         const body = try self.freshLabel("while.body");
         const after = try self.freshLabel("while.after");
         const exit = try self.freshLabel("while.exit");
+        // 'break' also drops the condition-capture frame, so the target
+        // records the depth outside it
+        try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         try self.startBlock(header);
+        // condition captures re-bind each iteration: their bind sites drop
+        // and re-zero the slots, and the frame closes on the exit path
+        try self.pushFrame();
         const condition = try self.evalExpression(while_expr.condition);
         try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ condition.scalar.text, body, after });
         self.terminated = true;
-        try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         try self.startBlock(body);
         try self.pushFrame();
         try self.execStatement(while_expr.body);
@@ -2958,6 +3096,7 @@ pub const Codegen = struct {
             self.terminated = true;
         }
         try self.startBlock(after);
+        try self.closeFrame();
         if (while_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);

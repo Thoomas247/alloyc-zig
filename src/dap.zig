@@ -329,6 +329,7 @@ pub const Server = struct {
         };
         const unit = try self.gpa.create(Compilation);
         unit.* = Compilation.init(self.gpa);
+        unit.comptime_io = self.io;
         self.unit = unit;
         _ = try unit.addModule(try session.dupe(u8, program), source);
         var disk_loader: DiskLoader = .{

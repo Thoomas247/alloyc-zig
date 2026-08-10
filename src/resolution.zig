@@ -338,11 +338,16 @@ pub const Resolver = struct {
                     continue;
                 }
                 // only fn definitions may share a name within one library
-                // (overloading, section 3.6); different libraries reuse names
-                // freely, clashes surface at unqualified use sites instead
+                // (overloading, section 3.6), and a macro may share a name
+                // with functions - '#name' always selects the macro, a bare
+                // 'name' never does (section 6.3); different libraries
+                // reuse names freely, clashes surface at unqualified use
+                // sites instead
                 var conflict: ?Symbol = null;
                 for (existing.value_ptr.items) |other| {
                     if (!sameLibrary(self.views[other.view_index].library, view.library)) continue;
+                    if (callableKind(definition) and callableKind(other.definition) and
+                        (definition.kind == .macro_def) != (other.definition.kind == .macro_def)) continue;
                     if (definition.kind == .fn_def and other.definition.kind == .fn_def) continue;
                     conflict = other;
                     break;
@@ -441,6 +446,13 @@ pub const Resolver = struct {
         }
     }
 
+    fn callableKind(definition: *const ast.Definition) bool {
+        return switch (definition.kind) {
+            .fn_def, .extern_def, .macro_def => true,
+            else => false,
+        };
+    }
+
     fn resolveInterfaceMarker(self: *Resolver, marker: ast.InterfaceMarker) Error!void {
         try self.resolveInterfaceName(marker.name);
         for (marker.type_arguments) |argument| {
@@ -513,6 +525,9 @@ pub const Resolver = struct {
                 // an 'is' target may name an enum variant (section 3.2)
                 const allow_variant = cast.operator.tag == .keyword_is;
                 try self.resolveTypeExpression(cast.target, allow_variant);
+                // an inline 'is' capture binds into the enclosing condition
+                // frame, visible to later conjuncts and the branch body
+                if (cast.capture) |capture| try self.bindCapture(capture);
             },
             .call => |call| {
                 try self.resolveExpression(call.callee);
@@ -538,6 +553,9 @@ pub const Resolver = struct {
                 if (struct_init.path) |path| {
                     try self.resolvePath(path, .type);
                 }
+                for (struct_init.type_arguments) |argument| {
+                    try self.resolveTypeExpression(argument, false);
+                }
                 for (struct_init.members) |member| {
                     try self.resolveExpression(member.value);
                 }
@@ -554,9 +572,10 @@ pub const Resolver = struct {
                 try self.resolveExpression(array_range.end);
             },
             .if_expr => |if_expr| {
-                try self.resolveExpression(if_expr.condition);
+                // the frame spans condition and then-branch: inline 'is'
+                // captures bind during the condition (section 3.2)
                 try self.pushFrame(false);
-                if (if_expr.capture) |capture| try self.bindCapture(capture);
+                try self.resolveExpression(if_expr.condition);
                 try self.resolveStatement(if_expr.then_branch);
                 self.popFrame();
                 if (if_expr.else_branch) |else_branch| {
@@ -564,8 +583,12 @@ pub const Resolver = struct {
                 }
             },
             .while_expr => |while_expr| {
+                // like 'if': condition captures are visible in the body,
+                // re-bound each iteration
+                try self.pushFrame(false);
                 try self.resolveExpression(while_expr.condition);
                 try self.resolveStatement(while_expr.body);
+                self.popFrame();
                 if (while_expr.else_branch) |else_branch| {
                     try self.resolveStatement(else_branch);
                 }

@@ -570,10 +570,20 @@ pub const Parser = struct {
                         break :implied .{ .path = path, .type_arguments = &.{}, .implied = true };
                     } else try self.parseNamedType();
                     const target = try self.create(ast.TypeExpression, .{ .named = named });
+                    // 'x is ::Some |v|' captures the payload inline
+                    // (section 3.2); the lookahead keeps '|' as bitwise or
+                    // elsewhere, and match-arm captures stay the arm's own
+                    var capture: ?ast.Capture = null;
+                    if (!self.stop_at_pipe and self.current().tag == .pipe and self.looksLikeCapture()) {
+                        _ = self.advance();
+                        capture = try self.parseCapture();
+                        _ = try self.expect(.pipe, "'|'");
+                    }
                     operand = try self.create(ast.Expression, .{ .cast = .{
                         .operator = operator,
                         .operand = operand,
                         .target = target,
+                        .capture = capture,
                     } });
                 },
                 .keyword_as, .keyword_to => {
@@ -695,8 +705,18 @@ pub const Parser = struct {
             if (self.match(.comma) == null) break;
         }
         try self.expectAngleRight();
+        // 'Vector<T> { ... }': a struct literal binding the type's
+        // parameters explicitly (section 3.7)
+        if (self.current().tag == .brace_left and self.allow_struct_init and callee.* == .path) {
+            const members = try self.parseMemberInits();
+            return self.create(ast.Expression, .{ .struct_init = .{
+                .path = callee.path,
+                .type_arguments = try type_arguments.toOwnedSlice(self.arena),
+                .members = members,
+            } });
+        }
         if (self.current().tag != .parenthesis_left) {
-            return self.fail(self.current(), "expected '(' after generic arguments", .{});
+            return self.fail(self.current(), "expected '(' or '{{' after generic arguments", .{});
         }
         const arguments = try self.parseCallArguments();
         return self.create(ast.Expression, .{ .call = .{
@@ -801,6 +821,11 @@ pub const Parser = struct {
 
     fn parseArrayLiteralOrFill(self: *Parser) Error!*const ast.Expression {
         _ = try self.expect(.bracket_left, "'['");
+        // '[]' is the empty array literal; its element type comes from
+        // context (section 3.2)
+        if (self.match(.bracket_right) != null) {
+            return self.create(ast.Expression, .{ .array_literal = &.{} });
+        }
         // '[..end]' is a range generator starting at 0 (section 2.1)
         if (self.match(.dot_dot)) |operator| {
             const end = try self.parseInnerExpression();
@@ -835,17 +860,15 @@ pub const Parser = struct {
         _ = try self.expect(.parenthesis_left, "'('");
         const condition = try self.parseInnerExpression();
         _ = try self.expect(.parenthesis_right, "')'");
-        var capture: ?ast.Capture = null;
+        // the retired postfix capture: captures moved inside the condition
+        // onto the 'is' test itself (section 3.2)
         if (self.current().tag == .pipe) {
-            _ = self.advance();
-            capture = try self.parseCapture();
-            _ = try self.expect(.pipe, "'|'");
+            return self.fail(self.current(), "the capture follows the 'is' test inside the condition: 'if (x is ::Some |v|)' (section 3.2)", .{});
         }
         const then_branch = try self.parseStatement();
         const else_branch = try self.parseElseBranch();
         return .{
             .condition = condition,
-            .capture = capture,
             .then_branch = then_branch,
             .else_branch = else_branch,
         };
@@ -977,6 +1000,14 @@ pub const Parser = struct {
         }
         const annotation = try self.parseType();
         return .{ .modifier = null, .name = name, .annotation = annotation };
+    }
+
+    // whether a '|' opens a capture clause ('|name|', '|name: ...|')
+    // rather than a bitwise-or operand; pure lookahead
+    fn looksLikeCapture(self: *const Parser) bool {
+        if (self.tokens[self.token_index + 1].tag != .identifier) return false;
+        const after = self.tokens[self.token_index + 2].tag;
+        return after == .pipe or after == .colon;
     }
 
     // looks past '&' / '*' and an optional 'var' without consuming anything
@@ -1252,7 +1283,7 @@ test "if with is test, owning capture, and else past a semicolon" {
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    if (h is Holder::Boxed) |boxed: *| {
+        \\    if (h is Holder::Boxed |boxed: *|) {
         \\        use(boxed);
         \\    } else {
         \\        nothing();
@@ -1264,7 +1295,7 @@ test "if with is test, owning capture, and else past a semicolon" {
     const body = module.definitions[0].kind.fn_def.function.body.block;
     const if_expr = body[0].expression.if_expr;
     try testing.expectEqual(Token.Tag.keyword_is, if_expr.condition.cast.operator.tag);
-    try testing.expectEqual(ast.TypeModifier.pointer, if_expr.capture.?.modifier.?);
+    try testing.expectEqual(ast.TypeModifier.pointer, if_expr.condition.cast.capture.?.modifier.?);
     try testing.expect(if_expr.else_branch != null);
     try testing.expect(body[1].expression.if_expr.else_branch != null);
 }

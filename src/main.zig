@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
 
     var compilation = alloyc.Compilation.init(allocator);
     defer compilation.deinit();
+    compilation.comptime_io = init.io;
 
     _ = try compilation.addModule(entrypoint_file_path, source);
 

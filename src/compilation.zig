@@ -169,6 +169,9 @@ pub const Compilation = struct {
     // the checker outlives its stage: code generation queries it for
     // section 3.9 layouts instead of re-deriving them
     checker: ?*Checker = null,
+    // the io handle behind '#read_file' (section 6.4); null keeps
+    // compile-time evaluation filesystem-free (the hermetic-test default)
+    comptime_io: ?std.Io = null,
     // the message of the last interpreter runtime fault
     fault: ?[]const u8 = null,
 
@@ -537,6 +540,13 @@ pub const Compilation = struct {
             &compilation.diagnostics,
             compilation.allocator,
         );
+        // '#read_file' (section 6.4) resolves against the entry module's
+        // directory; a null io keeps compile-time evaluation
+        // filesystem-free (the hermetic-test default)
+        checker.comptime_io = compilation.comptime_io;
+        if (compilation.modules.items.len != 0) {
+            checker.comptime_root = std.fs.path.dirname(compilation.modules.items[0].path) orelse ".";
+        }
         try checker.run();
         compilation.checker = checker;
         // the side tables live in the compilation arena and feed stage 5
@@ -695,7 +705,7 @@ test "the interpreter handles structs enums and matches" {
         \\        ::Idle { yield 0; }
         \\        ::Busy |load| { yield load; }
         \\    };
-        \\    if (st is ::Busy) |amount| {
+        \\    if (st is ::Busy |amount|) {
         \\        return (described + amount) to i32;
         \\    }
         \\    return -1;
@@ -958,12 +968,12 @@ test "macros synthesise enum types" {
         \\        Signal::Idle { total += 1 }
         \\        Signal::Busy |load| { total += load to i64 }
         \\    }
-        \\    if (busy is Signal::Busy) |load| {
+        \\    if (busy is Signal::Busy |load|) {
         \\        total += load to i64;
         \\    }
         \\    var word = busy as u64;
         \\    var round = word as Signal;
-        \\    if (round is Signal::Busy) |load| {
+        \\    if (round is Signal::Busy |load|) {
         \\        total += load to i64;
         \\    }
         \\    printf("members %d\n", #Signal.member_names().length());
@@ -1265,7 +1275,7 @@ test "captures and type parameters bind names" {
     _ = try compilation.addModule("main.alloy",
         \\type Holder = enum { Boxed: u32, Empty };
         \\fn pick<T>(value: T, holder: Holder) -> T {
-        \\    if (holder is Holder::Boxed) |inner| {
+        \\    if (holder is Holder::Boxed |inner|) {
         \\        consume(inner);
         \\    }
         \\    match (holder) {
@@ -1394,10 +1404,10 @@ test "an 'is' capture works on a temporary subject in both engines" {
         \\}
         \\fn main() -> i32 {
         \\    var total = 0;
-        \\    if (produce(true) is ::Some) |value| {
+        \\    if (produce(true) is ::Some |value|) {
         \\        total += value to i32;
         \\    }
-        \\    if (produce(false) is ::Some) |value| {
+        \\    if (produce(false) is ::Some |value|) {
         \\        total += value to i32;
         \\    } else {
         \\        total += 1;
@@ -1413,10 +1423,10 @@ test "an 'is' capture works on a temporary subject in both engines" {
         \\}
         \\fn main() -> i32 {
         \\    var total = 0;
-        \\    if (produce(true) is ::Some) |value| {
+        \\    if (produce(true) is ::Some |value|) {
         \\        total += value to i32;
         \\    }
-        \\    if (produce(false) is ::Some) |value| {
+        \\    if (produce(false) is ::Some |value|) {
         \\        total += value to i32;
         \\    } else {
         \\        total += 1;
@@ -1677,7 +1687,7 @@ test "the interpreter reinterprets structs arrays and enums" {
         \\    var word = status as u64;
         \\    var round = word as Status;
         \\    var payload: u64 = 0;
-        \\    if (round is Status::Busy) |load| {
+        \\    if (round is Status::Busy |load|) {
         \\        payload = load to u64;
         \\    }
         \\    return (word - 38654705665 + payload) to i64;
@@ -1761,7 +1771,7 @@ test "enum payload captures type the payload" {
         \\type Holder = enum { Boxed: *u32, Empty };
         \\fn f() {
         \\    var h: Holder = Holder::Boxed(new 5);
-        \\    if (h is Holder::Boxed) |taken: *| {
+        \\    if (h is Holder::Boxed |taken: *|) {
         \\        var inner: u32 = taken;
         \\    }
         \\    if (h is Holder::Empty) { }
@@ -1771,7 +1781,7 @@ test "enum payload captures type the payload" {
         \\type Holder = enum { Boxed: u32, Empty };
         \\fn f() {
         \\    const h: Holder = Holder::Boxed(1);
-        \\    if (h is Holder::Boxed) |taken: *| { }
+        \\    if (h is Holder::Boxed |taken: *|) { }
         \\}
     , &.{"owning capture requires a pointer-typed value"});
 }
@@ -1915,13 +1925,13 @@ test "interface objects downcast with 'is'" {
         \\type Circle : Shape = struct { radius: f32 };
         \\fn area(self c: &Circle) -> f32 { return c.radius; }
         \\fn measure(shape: &Shape) -> f32 {
-        \\    if (shape is Circle) |c| {
+        \\    if (shape is Circle |c|) {
         \\        return c.area();
         \\    }
         \\    return 0.0;
         \\}
         \\fn grow(shape: *var Shape) {
-        \\    if (shape is Circle) |c| {
+        \\    if (shape is Circle |c|) {
         \\        c.radius += 1.0;
         \\    }
         \\}
@@ -1932,7 +1942,7 @@ test "interface objects downcast with 'is'" {
         \\}
         \\type Square = struct { side: f32 };
         \\fn measure(shape: &Shape) -> f32 {
-        \\    if (shape is Square) |s| {
+        \\    if (shape is Square |s|) {
         \\        return 0.0;
         \\    }
         \\    return 1.0;
@@ -1994,7 +2004,7 @@ test "implied enum variants infer their type" {
         \\    s = ::Busy(3);
         \\    var m: Maybe<u32> = ::Just(7);
         \\    const lone = ::Idle;
-        \\    if (s is ::Busy) |load| {
+        \\    if (s is ::Busy |load|) {
         \\        return load;
         \\    }
         \\    return match (s) {
@@ -2093,7 +2103,7 @@ test "variant constructions must bind every type parameter" {
     });
 }
 
-test "matches must be exhaustive" {
+test "value-yielding matches must be exhaustive" {
     try expectChecks(
         \\type State = enum { Idle, Busy: u32 };
         \\fn f(s: State) -> u32 {
@@ -2113,21 +2123,44 @@ test "matches must be exhaustive" {
     );
     try expectCheckErrors(
         \\type State = enum { Idle, Busy: u32, Done };
-        \\fn f(s: State) {
-        \\    match (s) {
-        \\        State::Idle { }
-        \\    }
+        \\fn f(s: State) -> u32 {
+        \\    return match (s) {
+        \\        State::Idle { yield 0; }
+        \\    };
         \\}
-        \\fn g(n: u32) {
-        \\    match (n) {
-        \\        0 { }
-        \\        1 { }
-        \\    }
+        \\fn g(n: u32) -> u32 {
+        \\    return match (n) {
+        \\        0 { yield 1; }
+        \\        1 { yield 2; }
+        \\    };
         \\}
     , &.{
         "this match does not cover variants 'Busy', 'Done' of 'State'",
         "a match over this subject can never cover every value: add an 'else' arm",
     });
+}
+
+test "a statement match needs no exhaustiveness and skips unmatched subjects" {
+    // statement position: any subset of the subject's values may be
+    // covered; an unmatched subject is a no-op (section 4.3)
+    try expectBuildsAndRuns("statement_match_no_else",
+        \\type State = enum { Idle, Busy: u32, Done };
+        \\fn f(s: State) -> i32 {
+        \\    var hit: i32 = 7;
+        \\    match (s) {
+        \\        State::Busy |load| { hit = load to i32; }
+        \\    }
+        \\    return hit;
+        \\}
+        \\fn main() -> i32 {
+        \\    var total = f(::Idle) + f(::Busy(10)) + f(::Done);
+        \\    match (total to u32) {
+        \\        0 { total = 100; }
+        \\        1 { total = 200; }
+        \\    }
+        \\    return total;
+        \\}
+    , 24, "");
 }
 
 test "a bare interface type needs an indirection" {
@@ -2388,7 +2421,7 @@ test "generic interface objects dispatch dynamically in both engines" {
         \\    var sum: u64 = 0;
         \\    while (true) {
         \\        const step = it.next();
-        \\        if (step is ::Some) |value: &| {
+        \\        if (step is ::Some |value: &|) {
         \\            sum += value;
         \\        } else {
         \\            break;
@@ -2455,6 +2488,179 @@ test "constraints take type arguments and dispatch interface functions" {
     const exit_code = try compilation.interpret(&output.writer);
     try std.testing.expectEqual(@as(i64, 3), exit_code);
     try expectBuildsAndRunsWith("constraint_dispatch", source, &sources, 3, "");
+}
+
+test "struct literals bind type parameters explicitly" {
+    var sources = TestSources.initComptime(.{
+        .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+    });
+    const source =
+        \\import std::option;
+        \\type Sack<T> = struct { storage: Option<*var [T]>, count: u64 };
+        \\fn Sack::with_capacity<T>(size: u64) -> Sack<T> {
+        \\    var sack = Sack<T> { .storage = ::None, .count = size };
+        \\    return sack;
+        \\}
+        \\fn main() -> i32 {
+        \\    const sack = Sack<u8> { .storage = ::None, .count = 2 };
+        \\    const made = Sack::with_capacity<u8>(4);
+        \\    return (sack.count + made.count) to i32;
+        \\}
+    ;
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 6), exit_code);
+    try expectBuildsAndRunsWith("generic_struct_literal", source, &sources, 6, "");
+}
+
+test "a struct literal's type arguments match the type's parameters" {
+    try expectCheckErrors(
+        \\type Pair = struct { x: i64 };
+        \\fn f() {
+        \\    const p = Pair<i64> { .x = 1 };
+        \\}
+    , &.{"'Pair' expects 0 type arguments, found 1"});
+}
+
+test "inline is captures chain through a condition and rebind in while" {
+    var sources = TestSources.initComptime(.{
+        .{ "std/option.alloy", "pub type Option<T> = enum { Some: T, None };" },
+    });
+    const source =
+        \\import std::option;
+        \\type Pair = struct { left: Option<u8>, right: Option<u8> };
+        \\fn main() -> i32 {
+        \\    const pair = Pair { .left = ::Some(40), .right = ::Some(2) };
+        \\    var total: i32 = 0;
+        \\    if (pair.left is ::Some |first| && first == 40 && pair.right is ::Some |second|) {
+        \\        total += first to i32 + second to i32;
+        \\    }
+        \\    if (pair.left is ::Some) {
+        \\        total += 1;
+        \\    }
+        \\    var countdown: Option<u8> = ::Some(3);
+        \\    while (countdown is ::Some |step|) {
+        \\        total += step to i32;
+        \\        if (step == 1) {
+        \\            countdown = ::None;
+        \\        } else {
+        \\            countdown = ::Some(step - 1);
+        \\        }
+        \\    }
+        \\    return total;
+        \\}
+    ;
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 49), exit_code);
+    try expectBuildsAndRunsWith("inline_captures", source, &sources, 49, "");
+}
+
+test "an is capture demands a dominating conjunct position" {
+    // under '||' a failed test still reaches uses of the capture
+    try expectCheckErrors(
+        \\type Holder = enum { Boxed: u32, Empty };
+        \\fn f() {
+        \\    const h: Holder = Holder::Boxed(1);
+        \\    if (h is ::Boxed |taken| || taken == 2) { }
+        \\}
+    , &.{"an 'is' capture is only valid on a direct '&&' conjunct of an 'if' or 'while' condition"});
+    // outside a condition there is no branch to scope the binding
+    try expectCheckErrors(
+        \\type Holder = enum { Boxed: u32, Empty };
+        \\fn f() {
+        \\    const h: Holder = Holder::Boxed(1);
+        \\    const tested = h is ::Boxed |taken|;
+        \\}
+    , &.{"an 'is' capture is only valid on a direct '&&' conjunct of an 'if' or 'while' condition"});
+}
+
+test "the retired postfix if capture names the inline form" {
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    _ = try compilation.addModule("main.alloy",
+        \\type Holder = enum { Boxed: u32, Empty };
+        \\fn f() {
+        \\    const h: Holder = Holder::Boxed(1);
+        \\    if (h is ::Boxed) |taken| { }
+        \\}
+    );
+    try std.testing.expect(!try compilation.run(null));
+    try std.testing.expect(compilation.diagnostics.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, compilation.diagnostics.items[0].message, "the capture follows the 'is' test inside the condition") != null);
+}
+
+test "read_file reads project files at compile time and stays sandboxed" {
+    const io = std.testing.io;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ".zig-cache/read_file_probe.txt", .data = "hello alloy" });
+    var sources = TestSources.initComptime(.{
+        .{ "std/macros.alloy", "pub macro read_file(path);" },
+    });
+    const source =
+        \\import std::macros;
+        \\fn main() -> i32 {
+        \\    const text = #read_file(".zig-cache/read_file_probe.txt");
+        \\    return text.length() to i32;
+        \\}
+    ;
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    compilation.comptime_io = io;
+    _ = try compilation.addModule("main.alloy", source);
+    const loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&sources)), .function = testLoader };
+    try std.testing.expect(try compilation.run(loader));
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const exit_code = try compilation.interpret(&output.writer);
+    try std.testing.expectEqual(@as(i64, 11), exit_code);
+    try expectBuildsAndRunsWith("read_file_comptime", source, &sources, 11, "");
+
+    // '..' escaping the project root is a compile-time error
+    var escape_sources = TestSources.initComptime(.{
+        .{ "std/macros.alloy", "pub macro read_file(path);" },
+    });
+    var escaping = Compilation.init(std.testing.allocator);
+    defer escaping.deinit();
+    escaping.comptime_io = io;
+    _ = try escaping.addModule("main.alloy",
+        \\import std::macros;
+        \\fn main() -> i32 {
+        \\    const text = #read_file("../secret.txt");
+        \\    return 0;
+        \\}
+    );
+    const escape_loader: ModuleLoader = .{ .context = @constCast(@ptrCast(&escape_sources)), .function = testLoader };
+    try std.testing.expect(!try escaping.run(escape_loader));
+    try std.testing.expect(std.mem.indexOf(u8, escaping.diagnostics.items[0].message, "cannot escape the project root") != null);
+}
+
+test "a macro may share its name with functions" {
+    const source =
+        \\macro tag(value: i64) {
+        \\    return value * 2;
+        \\}
+        \\fn tag(x: i64) -> i64 {
+        \\    return x + 1;
+        \\}
+        \\fn main() -> i32 {
+        \\    const doubled = #tag(4);
+        \\    return (tag(4) + doubled) to i32;
+        \\}
+    ;
+    try expectRuns(source, 13, "");
+    try expectBuildsAndRuns("macro_fn_name_share", source, 13, "");
 }
 
 test "using a reference variable bare consumes the value" {
@@ -2636,6 +2842,8 @@ fn expectBuildsAndRunsMode(name: []const u8, source: []const u8, extra_sources: 
 
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
+    // '#read_file' fixtures read real files relative to the test cwd
+    compilation.comptime_io = std.testing.io;
     _ = try compilation.addModule("main.alloy", source);
     const loader: ?ModuleLoader = if (extra_sources) |sources|
         .{ .context = @constCast(@ptrCast(sources)), .function = testLoader }
@@ -3130,7 +3338,7 @@ test "release executables match checked executables" {
         \\    var second: *Critter = move pet;
         \\    total += second.legs();
         \\    pet = new Spider { .hairs = new 7 };
-        \\    if (pet is Spider) |s| {
+        \\    if (pet is Spider |s|) {
         \\        total += s.hairs;
         \\    }
         \\    printf("total %d\n", total to i32);
@@ -3306,7 +3514,7 @@ test "native executables dispatch through interface objects" {
         \\fn area(self c: &Circle) -> i32 { return 3 * c.radius * c.radius; }
         \\fn sides(self s: &Shape) -> i32 { return 0; }
         \\fn describe(s: &Shape) -> i32 {
-        \\    if (s is Square) |sq| {
+        \\    if (s is Square |sq|) {
         \\        printf("square %d\n", sq.width);
         \\    }
         \\    return s.area() + s.sides();
@@ -3430,7 +3638,7 @@ test "native executables drop owning interface objects" {
         \\fn main() -> i32 {
         \\    var pet: *Critter = new Spider { .hairs = new 1000 };
         \\    var count = pet.legs();
-        \\    if (pet is Spider) |s| {
+        \\    if (pet is Spider |s|) {
         \\        count += s.hairs;
         \\    }
         \\    pet = new Worm { .tag = 3 };
@@ -3468,6 +3676,54 @@ test "native executables materialize comptime aggregate values" {
         \\    return total to i32 * 10 + sum;
         \\}
     , 95, "");
+}
+
+test "the empty array literal adopts its contextual type" {
+    try expectBuildsAndRuns("empty_array_literal",
+        \\fn none<T>() -> &[T] {
+        \\    return [];
+        \\}
+        \\fn main() -> i32 {
+        \\    const e = &none<i64>();
+        \\    var total = e.length() + 3;
+        \\    for (e) |x| { total += x to u64; }
+        \\    const bytes: &[u8] = [];
+        \\    total += bytes.length();
+        \\    return total to i32;
+        \\}
+    , 3, "");
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const mystery = [];
+        \\    return 0;
+        \\}
+    , &.{"an empty array literal '[]' is only valid where a '&[T]' slice is expected"});
+}
+
+test "native executables materialize comptime struct arrays" {
+    try expectBuildsAndRuns("comptime_struct_materialize",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\type Pair = struct {
+        \\    name: &[u8],
+        \\    symbol: &[u8],
+        \\    weight: u8
+        \\};
+        \\macro pairs() {
+        \\    return [
+        \\        Pair { .name = "plus", .symbol = "+", .weight = 1 },
+        \\        Pair { .name = "arrow", .symbol = "->", .weight = 2 }
+        \\    ];
+        \\}
+        \\fn main() -> i32 {
+        \\    const table = #pairs();
+        \\    var total: i32 = 0;
+        \\    for (table) |pair: &| {
+        \\        printf("%.*s %.*s\n", pair.name.length() to i32, &pair.name, pair.symbol.length() to i32, &pair.symbol);
+        \\        total += pair.weight to i32 * 10 + pair.symbol.length() to i32;
+        \\    }
+        \\    return total;
+        \\}
+    , 33, "plus +\narrow ->\n");
 }
 
 test "native executables monomorphize lambdas inside generics" {
@@ -3920,7 +4176,7 @@ test "qualified functions live in their type's namespace" {
         \\    const moved = Point::at(3, 4);
         \\    var chosen: Option<i64> = Option::flag(true, 5);
         \\    var fallback: i64 = 0;
-        \\    if (chosen is ::Some) |value| {
+        \\    if (chosen is ::Some |value|) {
         \\        fallback = value;
         \\    }
         \\    return moved.x + moved.y + fallback;

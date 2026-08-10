@@ -12,7 +12,11 @@ pub const Diagnostic = struct {
     message: []const u8,
 
     pub fn render(diagnostic: Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        const position = locate(diagnostic.source, diagnostic.span.start);
+        // a span is clamped to the source defensively: a mismatched span
+        // must degrade the caret, never crash the compiler
+        const span_start = @min(diagnostic.span.start, diagnostic.source.len);
+        const span_end = @min(diagnostic.span.end, diagnostic.source.len);
+        const position = locate(diagnostic.source, span_start);
         try writer.print("{s}:{d}:{d}: error: {s}\n", .{
             diagnostic.path,
             position.line,
@@ -20,13 +24,13 @@ pub const Diagnostic = struct {
             diagnostic.message,
         });
         try writer.print("    {s}\n    ", .{diagnostic.source[position.line_start..position.line_end]});
-        for (diagnostic.source[position.line_start..diagnostic.span.start]) |byte| {
+        for (diagnostic.source[position.line_start..span_start]) |byte| {
             // tabs are copied so the caret stays aligned with the source line
             try writer.writeByte(if (byte == '\t') '\t' else ' ');
         }
         try writer.writeByte('^');
-        const span_end_in_line = @max(@min(diagnostic.span.end, position.line_end), diagnostic.span.start + 1);
-        try writer.splatByteAll('~', span_end_in_line - diagnostic.span.start - 1);
+        const span_end_in_line = @max(@min(span_end, position.line_end), span_start + 1);
+        try writer.splatByteAll('~', span_end_in_line - span_start - 1);
         try writer.writeByte('\n');
     }
 };

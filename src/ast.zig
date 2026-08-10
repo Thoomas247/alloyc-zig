@@ -207,6 +207,10 @@ pub const Expression = union(enum) {
         operator: Token,
         operand: *const Expression,
         target: *const TypeExpression,
+        // 'x is ::Some |v|': the capture binds the payload inline, valid
+        // only as a direct '&&' conjunct of an if or while condition
+        // (section 3.2); always null for 'as' and 'to'
+        capture: ?Capture = null,
     },
     call: struct {
         callee: *const Expression,
@@ -224,8 +228,9 @@ pub const Expression = union(enum) {
         end: *const Expression,
     },
     // a null path is an anonymous structural literal ('{ .x = 1 }'); a
-    // named literal may be module-qualified ('liba::Pair { ... }')
-    struct_init: struct { path: ?[]const Token, members: []const MemberInit },
+    // named literal may be module-qualified ('liba::Pair { ... }') and may
+    // bind a generic type's parameters explicitly ('Vector<T> { ... }')
+    struct_init: struct { path: ?[]const Token, type_arguments: []const *const TypeExpression = &.{}, members: []const MemberInit },
     array_literal: []const *const Expression,
     array_fill: struct { value: *const Expression, count: *const Expression },
     // '[start..end]' integer range generator; a null start means 0
@@ -252,7 +257,6 @@ pub const Capture = struct {
 
 pub const IfExpression = struct {
     condition: *const Expression,
-    capture: ?Capture,
     then_branch: *const Statement,
     else_branch: ?*const Statement,
 };

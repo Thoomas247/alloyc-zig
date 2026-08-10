@@ -50,6 +50,11 @@ pub const Interpreter = struct {
     // compile-time sandboxing (section 6.2): externs fault and evaluation
     // is bounded by a step budget
     comptime_mode: bool,
+    // the host facilities behind '#read_file' (section 6.4): the io handle
+    // and the project root every path resolves against; null keeps
+    // compile-time evaluation filesystem-free
+    comptime_io: ?std.Io = null,
+    comptime_root: []const u8 = ".",
     step_budget: ?u64,
     reflection: ?ReflectionHooks,
     call_depth: usize,
@@ -596,6 +601,13 @@ pub const Interpreter = struct {
                 // substituted by compile-time evaluation (section 6.1); the
                 // fallback covers '#' nodes inside other comptime evaluations
                 if (self.comptime_values.get(expression)) |value| return self.deepCopy(value);
+                // '#name(...)': the '#' selects the macro when the name is
+                // shared with functions (section 6.3); this covers macro
+                // bodies, whose calls carry no checked targets
+                if (self.comptime_mode and inner.* == .call and inner.call.callee.* == .path and inner.call.callee.path.len == 1) {
+                    const name = inner.call.callee.path[0].slice(self.source());
+                    if (try self.macroNameCall(name, inner.call)) |value| return value;
+                }
                 return self.evalExpression(inner);
             },
             .unary => return self.evalUnary(expression),
@@ -688,6 +700,13 @@ pub const Interpreter = struct {
                 }
                 const instance = try self.arena.create(Value.ArrayInstance);
                 instance.* = .{ .elements = values };
+                // '[]' in slice position is the canonical empty view
+                // (section 3.2), not a fixed array
+                if (elements.len == 0) {
+                    if (self.expression_types.get(expression)) |recorded| {
+                        if (recorded.* == .slice) return .{ .slice = instance };
+                    }
+                }
                 return .{ .array = instance };
             },
             .array_fill => |array_fill| {
@@ -1059,6 +1078,9 @@ pub const Interpreter = struct {
                 return .{ .integer = .{ .value = truncateToPrimitive(wide, target), .primitive = target } };
             },
             .keyword_is => {
+                if (cast.capture) |capture| {
+                    return .{ .bool_value = try self.evalIsWithCapture(expression, cast, capture) };
+                }
                 const operand = try self.evalExpression(cast.operand);
                 const target_token = cast.target.named.path[cast.target.named.path.len - 1];
                 const target_name = target_token.slice(self.source());
@@ -1382,6 +1404,8 @@ pub const Interpreter = struct {
                 const arguments = try self.evalArguments(call.arguments);
                 return self.callFunction(symbol, arguments, type_bindings);
             },
+            // '#macro(...)' with a checker-recorded target (section 6.3)
+            .macro_def => |macro_def| return self.callMacro(symbol, macro_def, call),
             else => return self.fault("this callee is not callable", .{}),
         }
     }
@@ -1731,6 +1755,28 @@ pub const Interpreter = struct {
             instance.* = .{ .elements = try self.arena.dupe(Value, implementers) };
             return .{ .array = instance };
         }
+        if (std.mem.eql(u8, name, "read_file")) {
+            if (call.arguments.len != 1) return self.fault("'read_file' expects one argument (section 6.4)", .{});
+            const argument = try self.evalExpression(call.arguments[0]);
+            const path = try self.byteSlice(argument);
+            // the comptime sandbox (section 6.2): project-relative paths
+            // only, never escaping the entry module's directory
+            if (std.fs.path.isAbsolute(path)) {
+                return self.fault("'read_file' takes a path inside the project, not an absolute one (section 6.2)", .{});
+            }
+            var components = std.mem.tokenizeAny(u8, path, "/\\");
+            while (components.next()) |component| {
+                if (std.mem.eql(u8, component, "..")) {
+                    return self.fault("'read_file' cannot escape the project root ('..' in '{s}', section 6.2)", .{path});
+                }
+            }
+            const io = self.comptime_io orelse return self.fault("compile-time file reading is unavailable here (section 6.4)", .{});
+            const joined = try std.fs.path.join(self.arena, &.{ self.comptime_root, path });
+            const contents = std.Io.Dir.cwd().readFileAlloc(io, joined, self.arena, .limited(64 * 1024 * 1024)) catch {
+                return self.fault("'read_file' could not read '{s}' (section 6.4)", .{path});
+            };
+            return try self.bytesValue(contents);
+        }
         if (std.mem.eql(u8, name, "name_of")) {
             if (call.arguments.len != 1) return self.fault("'name_of' expects one argument (section 6.4)", .{});
             var argument = try self.evalExpression(call.arguments[0]);
@@ -1751,19 +1797,30 @@ pub const Interpreter = struct {
     }
 
     // compile-time name resolution for macro bodies, which carry no checked
-    // call targets: macros match by name, functions by name and arity
+    // call targets: functions match by name and arity first — a bare call
+    // never means a macro sharing the name (section 6.3, '#name' does) —
+    // with the macro as the fallback
     fn comptimeNameCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
+        const symbols = self.globals.get(name) orelse return null;
+        for (symbols.items) |symbol| {
+            if (!self.symbolVisible(symbol)) continue;
+            if (symbol.definition.kind != .fn_def) continue;
+            const fn_def = symbol.definition.kind.fn_def;
+            if (fn_def.function.parameters.len == call.arguments.len) {
+                const arguments = try self.evalArguments(call.arguments);
+                return try self.callFunction(symbol, arguments, &.{});
+            }
+        }
+        return self.macroNameCall(name, call);
+    }
+
+    // the macro of the given name, ignoring functions sharing it
+    fn macroNameCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
         const symbols = self.globals.get(name) orelse return null;
         for (symbols.items) |symbol| {
             if (!self.symbolVisible(symbol)) continue;
             switch (symbol.definition.kind) {
                 .macro_def => |macro_def| return try self.callMacro(symbol, macro_def, call),
-                .fn_def => |fn_def| {
-                    if (fn_def.function.parameters.len == call.arguments.len) {
-                        const arguments = try self.evalArguments(call.arguments);
-                        return try self.callFunction(symbol, arguments, &.{});
-                    }
-                },
                 else => {},
             }
         }
@@ -2097,16 +2154,11 @@ pub const Interpreter = struct {
     // a statement-position if passes 'yield' through to the enclosing
     // value construct; only a value-position if consumes it (section 4.3)
     fn evalIf(self: *Interpreter, if_expr: ast.IfExpression, as_value: bool) Error!Value {
-        var taken = false;
-
+        // the frame spans condition and then-branch: inline 'is' captures
+        // bind during the condition (section 3.2)
         try self.pushFrame(false);
-        if (if_expr.capture) |capture| {
-            // 'if (x is Variant) |payload|' binds when the variant matches
-            taken = try self.bindIsCapture(if_expr.condition, capture);
-        } else {
-            const condition = try self.evalExpression(if_expr.condition);
-            taken = condition == .bool_value and condition.bool_value;
-        }
+        const condition = try self.evalExpression(if_expr.condition);
+        const taken = condition == .bool_value and condition.bool_value;
         if (taken) {
             const flow = if (as_value) try self.execYieldingBody(if_expr.then_branch) else try self.execStatement(if_expr.then_branch);
             self.popFrame();
@@ -2168,10 +2220,9 @@ pub const Interpreter = struct {
         };
     }
 
-    fn bindIsCapture(self: *Interpreter, condition: *const ast.Expression, capture: ast.Capture) Error!bool {
-        const unwrapped = unwrapGrouped(condition);
-        if (unwrapped.* != .cast or unwrapped.cast.operator.tag != .keyword_is) return false;
-        const cast = unwrapped.cast;
+    // 'x is Enum::Variant |capture|' evaluates the test and binds the
+    // payload (or the downcast value) into the current frame on a match
+    fn evalIsWithCapture(self: *Interpreter, expression: *const ast.Expression, cast: anytype, capture: ast.Capture) Error!bool {
         const place = (try self.evalPlace(cast.operand)) orelse temporary: {
             // an 'is' subject may be a temporary (a call result); it lives
             // in a fresh cell so the capture can borrow or take the payload
@@ -2185,7 +2236,7 @@ pub const Interpreter = struct {
         // a downcast: the capture borrows the concrete value in place,
         // mirroring the subject's indirection (section 3.2)
         if (pierced.* == .struct_value) {
-            if (self.type_targets.get(unwrapped)) |target| {
+            if (self.type_targets.get(expression)) |target| {
                 const identity = pierced.struct_value.identity orelse return false;
                 if (identity.definition != target.definition) return false;
             } else if (!std.mem.eql(u8, pierced.struct_value.type_name, target_name)) {
@@ -2252,9 +2303,15 @@ pub const Interpreter = struct {
 
     fn evalWhile(self: *Interpreter, while_expr: ast.WhileExpression) Error!Value {
         while (true) {
+            // condition captures live for one iteration (section 3.2)
+            try self.pushFrame(false);
             const condition = try self.evalExpression(while_expr.condition);
-            if (condition != .bool_value or !condition.bool_value) break;
+            if (condition != .bool_value or !condition.bool_value) {
+                self.popFrame();
+                break;
+            }
             const flow = try self.execLoopBody(while_expr.body);
+            self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
                 .yield_value => return self.flowYield(flow),

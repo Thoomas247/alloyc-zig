@@ -41,6 +41,7 @@ const builtin_macro_completions = [_]struct { name: []const u8, detail: []const 
     .{ .name = "enum_type", .detail = "macro enum_type() - std::macros" },
     .{ .name = "implementers_of", .detail = "macro implementers_of(target) - std::macros" },
     .{ .name = "name_of", .detail = "macro name_of(value) - std::macros" },
+    .{ .name = "read_file", .detail = "macro read_file(path) - std::macros" },
 };
 
 const keyword_completions = [_][]const u8{
@@ -459,6 +460,7 @@ pub const Server = struct {
     fn analyze(self: *Server, path: []const u8, document: Document) !void {
         const unit = try self.gpa.create(Compilation);
         unit.* = Compilation.init(self.gpa);
+        unit.comptime_io = self.io;
         errdefer {
             unit.deinit();
             self.gpa.destroy(unit);

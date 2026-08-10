@@ -59,6 +59,13 @@ pub const Checker = struct {
     // outputs for the later stages: the type of every expression, and the
     // overload each call site resolved to (keyed by the call expression)
     expression_types: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
+    // the 'is' tests allowed to carry an inline capture: direct '&&'
+    // conjuncts of an if or while condition (section 3.2)
+    condition_captures: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
+    // the host facilities behind '#read_file' (section 6.4), wired by the
+    // compilation; null keeps compile-time evaluation filesystem-free
+    comptime_io: ?std.Io = null,
+    comptime_root: []const u8 = ".",
     call_targets: std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol) = .empty,
     call_type_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding) = .empty,
     // values computed by compile-time evaluation (section 6.1), keyed by the
@@ -194,21 +201,44 @@ pub const Checker = struct {
     }
 
     pub fn run(self: *Checker) Error!void {
-        // views load breadth-first from the entry module, so reverse order
-        // checks dependencies before their importers. Eager macros evaluate
-        // MID-CHECK (section 6.3), and their bodies call imported code -
-        // which must already carry its side tables by then. Imports are
-        // also textually earlier in program order, matching the
-        // declaration-order rule.
+        // eager macros evaluate MID-CHECK (section 6.3) and their bodies
+        // call imported code, which must already carry its side tables by
+        // then: views are checked in import dependency order (post-order
+        // walk). Reverse discovery order is NOT enough - a module
+        // discovered early through one importer can also be imported by a
+        // later-discovered module, which would then check first.
+        const visited = try self.arena.alloc(bool, self.views.len);
+        @memset(visited, false);
+        var order: std.ArrayList(usize) = .empty;
+        defer order.deinit(self.arena);
         var view_index = self.views.len;
         while (view_index > 0) {
             view_index -= 1;
-            self.current_view = view_index;
-            for (self.views[view_index].module.definitions) |*definition| {
+            try self.scheduleView(view_index, visited, &order);
+        }
+        for (order.items) |scheduled| {
+            self.current_view = scheduled;
+            for (self.views[scheduled].module.definitions) |*definition| {
                 try self.checkDefinition(definition);
             }
         }
         try self.runPendingComptime();
+    }
+
+    // appends the view after its imports, so dependencies check first;
+    // imports walk in declaration order for deterministic diagnostics
+    fn scheduleView(self: *Checker, view_index: usize, visited: []bool, order: *std.ArrayList(usize)) Error!void {
+        if (visited[view_index]) return;
+        visited[view_index] = true;
+        const view = self.views[view_index];
+        for (view.module.imports) |import| {
+            const alias_token = import.alias orelse import.path[import.path.len - 1];
+            const alias_name = alias_token.slice(view.source);
+            const key = self.aliases[view_index].get(alias_name) orelse continue;
+            const dependency = self.module_keys.get(key) orelse continue;
+            try self.scheduleView(dependency, visited, order);
+        }
+        try order.append(self.arena, view_index);
     }
 
     fn checkDefinition(self: *Checker, definition: *const ast.Definition) Error!void {
@@ -751,12 +781,15 @@ pub const Checker = struct {
             const value = machine.evaluate(expression) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
-                    try self.report(span, "comptime evaluation failed: {s} (section 6.1)", .{machine.fault_message orelse "unspecified fault"});
+                    // the initializer may live in ANOTHER view than the one
+                    // being checked (an alias chased lazily): the report
+                    // must pair the span with the owning view's source
+                    try self.reportIn(view_index, span, "comptime evaluation failed: {s} (section 6.1)", .{machine.fault_message orelse "unspecified fault"});
                     break :result &unknown_type;
                 },
             };
             if (value != .type_value) {
-                try self.report(span, "a '#' expression in type position must yield a '#Type' (section 3.4)", .{});
+                try self.reportIn(view_index, span, "a '#' expression in type position must yield a '#Type' (section 3.4)", .{});
                 break :result &unknown_type;
             }
             break :result try self.descriptionToType(value.type_value, span);
@@ -1756,6 +1789,19 @@ pub const Checker = struct {
             .subslice => return self.checkSubslice(expression),
             .struct_init => return self.checkStructInit(expression, expected),
             .array_literal => |elements| {
+                if (elements.len == 0) {
+                    // '[]' is the canonical empty view and only exists in
+                    // slice context - a fixed array needs at least one
+                    // element (section 3.2)
+                    if (expected) |expectation| {
+                        const contextual = try self.resolveAlias(expectation);
+                        // the resolved slice, so both engines see '.slice'
+                        // without chasing aliases
+                        if (contextual.* == .slice) return contextual;
+                    }
+                    try self.report(self.expressionSpan(expression), "an empty array literal '[]' is only valid where a '&[T]' slice is expected (section 3.2)", .{});
+                    return &unknown_type;
+                }
                 var element_type: *const Type = &unknown_type;
                 var first = true;
                 const expected_element: ?*const Type = if (expected != null and expected.?.* == .fixed_array) expected.?.fixed_array.element else null;
@@ -2188,6 +2234,7 @@ pub const Checker = struct {
                     // generic interface object only dispatches (section 5.2)
                     if (interface.arguments.len != 0) {
                         try self.report(cast.operator.location, "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 5.2)", .{interface.name});
+                        if (cast.capture) |capture| try self.bind(capture.name, &unknown_type, false);
                         return &bool_type;
                     }
                     const target = try self.typeFromExpression(cast.target, self.scope_types);
@@ -2207,6 +2254,17 @@ pub const Checker = struct {
                 } else if (operand.* != .unknown) {
                     const rendered = try operand.render(self.arena);
                     try self.report(cast.operator.location, "'is' tests enum variants and interface objects; the subject is {s} (section 3.2)", .{rendered});
+                }
+                // the inline capture binds only where its success dominates
+                // every use: a direct '&&' conjunct of an if or while
+                // condition (section 3.2)
+                if (cast.capture) |capture| {
+                    if (self.condition_captures.contains(expression)) {
+                        try self.bindInlineCapture(cast, capture, operand);
+                    } else {
+                        try self.report(capture.name.location, "an 'is' capture is only valid on a direct '&&' conjunct of an 'if' or 'while' condition (section 3.2)", .{});
+                        try self.bind(capture.name, &unknown_type, false);
+                    }
                 }
                 return &bool_type;
             },
@@ -2310,15 +2368,31 @@ pub const Checker = struct {
                     return &unknown_type;
                 },
             };
-            // generic instantiation comes from the contextual type
-            // ('var v: Vec<u32> = Vec { ... }'); bare generic inits without
-            // context cannot bind their type parameters
+            // generic instantiation comes from explicit arguments
+            // ('Vec<u32> { ... }', section 3.7) or the contextual type
+            // ('var v: Vec<u32> = Vec { ... }'); a bare generic init with
+            // neither cannot bind its type parameters
             var arguments: []const *const Type = &.{};
-            if (type_def.type_parameters.len != 0) {
+            if (struct_init.type_arguments.len != 0) {
+                if (struct_init.type_arguments.len != type_def.type_parameters.len) {
+                    try self.report(name_token.location, "'{s}' expects {d} type argument{s}, found {d}", .{
+                        name,
+                        type_def.type_parameters.len,
+                        if (type_def.type_parameters.len == 1) "" else "s",
+                        struct_init.type_arguments.len,
+                    });
+                    return &unknown_type;
+                }
+                var explicit: std.ArrayList(*const Type) = .empty;
+                for (struct_init.type_arguments) |argument| {
+                    try explicit.append(self.arena, try self.typeFromExpression(argument, self.scope_types));
+                }
+                arguments = try explicit.toOwnedSlice(self.arena);
+            } else if (type_def.type_parameters.len != 0) {
                 if (expected != null and expected.?.* == .declared and expected.?.declared.definition == symbol.definition) {
                     arguments = expected.?.declared.arguments;
                 } else {
-                    try self.report(name_token.location, "cannot infer the type arguments of '{s}' here; annotate the target type", .{name});
+                    try self.report(name_token.location, "cannot infer the type arguments of '{s}' here; annotate the target type or bind them explicitly ('{s}<...>' before the braces)", .{ name, name });
                     return &unknown_type;
                 }
             }
@@ -2738,6 +2812,11 @@ pub const Checker = struct {
     }
 
     fn checkIf(self: *Checker, if_expr: ast.IfExpression, expression: *const ast.Expression, as_value: bool) Error!*const Type {
+        // the frame spans condition and then-branch: inline 'is' captures
+        // bind while the condition checks, visible to later '&&' conjuncts
+        // and the body (section 3.2)
+        try self.pushFrame(false);
+        try self.registerConditionCaptures(if_expr.condition);
         const condition_type = try self.checkExpression(if_expr.condition, null);
         if (!condition_type.isBool()) {
             try self.report(self.expressionSpan(if_expr.condition), "an if condition must be bool", .{});
@@ -2751,10 +2830,6 @@ pub const Checker = struct {
         // entry state, and only moves surviving every falling-through
         // path stay definite
         const entry_moved = try self.movedSnapshot();
-        try self.pushFrame(false);
-        if (if_expr.capture) |capture| {
-            try self.bindIsCapture(if_expr.condition, capture);
-        }
         try self.checkStatement(if_expr.then_branch);
         self.popFrame();
         const then_moved = try self.movedSnapshot();
@@ -2791,16 +2866,24 @@ pub const Checker = struct {
         return yielded;
     }
 
-    // 'if (subject is Enum::Variant) |capture|' binds the variant payload
-    fn bindIsCapture(self: *Checker, condition: *const ast.Expression, capture: ast.Capture) Error!void {
+    // marks the 'is' tests allowed to carry a capture: the direct '&&'
+    // conjuncts of an if or while condition, where a successful test
+    // dominates every use of its binding (section 3.2)
+    fn registerConditionCaptures(self: *Checker, condition: *const ast.Expression) Error!void {
         const unwrapped = unwrapGrouped(condition);
-        if (unwrapped.* != .cast or unwrapped.cast.operator.tag != .keyword_is) {
-            try self.report(capture.name.location, "a capture on 'if' requires an 'is' condition (section 3.2)", .{});
-            try self.bind(capture.name, &unknown_type, false);
+        if (unwrapped.* == .binary and unwrapped.binary.operator.tag == .ampersand_ampersand) {
+            try self.registerConditionCaptures(unwrapped.binary.left);
+            try self.registerConditionCaptures(unwrapped.binary.right);
             return;
         }
-        const cast = unwrapped.cast;
-        const subject_type = try self.checkExpression(cast.operand, null);
+        if (unwrapped.* == .cast and unwrapped.cast.operator.tag == .keyword_is and unwrapped.cast.capture != null) {
+            try self.condition_captures.put(self.arena, unwrapped, {});
+        }
+    }
+
+    // 'x is Enum::Variant |capture|' binds the variant payload (or the
+    // downcast value) inline; the subject type is already checked
+    fn bindInlineCapture(self: *Checker, cast: anytype, capture: ast.Capture, subject_type: *const Type) Error!void {
         if (try self.interfaceObject(subject_type)) |_| {
             const target = try self.typeFromExpression(cast.target, self.scope_types);
             const place = try self.lvalueOf(cast.operand);
@@ -2830,6 +2913,10 @@ pub const Checker = struct {
     }
 
     fn checkWhile(self: *Checker, while_expr: ast.WhileExpression, expression: *const ast.Expression, as_value: bool) Error!*const Type {
+        // condition captures are visible in the body, re-bound each
+        // iteration (section 3.2)
+        try self.pushFrame(false);
+        try self.registerConditionCaptures(while_expr.condition);
         const condition_type = try self.checkExpression(while_expr.condition, null);
         if (!condition_type.isBool()) {
             try self.report(self.expressionSpan(while_expr.condition), "a while condition must be bool", .{});
@@ -2839,6 +2926,7 @@ pub const Checker = struct {
         // both merge back against the entry state (section 4.2)
         const entry_moved = try self.movedSnapshot();
         try self.checkStatement(while_expr.body);
+        self.popFrame();
         const body_moved = try self.movedSnapshot();
         self.restoreMoved(entry_moved);
         var else_moved: ?[]const bool = null;
@@ -3126,9 +3214,9 @@ pub const Checker = struct {
         return declared.arguments[0];
     }
 
-    // every match must be exhaustive: an enum subject by covering all
-    // variants or an 'else' arm, every other subject by an 'else' arm
-    // (section 4.3)
+    // a value-yielding match must be exhaustive: an enum subject by
+    // covering all variants or an 'else' arm, every other subject by an
+    // 'else' arm (section 4.3)
     fn checkExhaustiveness(self: *Checker, match_expr: ast.MatchExpression, subject_enum: ?EnumBody, expression: *const ast.Expression) Error!void {
         const body = subject_enum orelse {
             try self.report(self.expressionSpan(expression), "a match over this subject can never cover every value: add an 'else' arm (section 4.3)", .{});
@@ -3202,7 +3290,9 @@ pub const Checker = struct {
                 try arm_states.append(self.arena, try self.movedSnapshot());
             }
         }
-        if (!has_else_arm and subject_type.* != .unknown) {
+        // only a value-yielding match must be exhaustive; a statement
+        // match with no matching arm simply does nothing (section 4.3)
+        if (as_value and !has_else_arm and subject_type.* != .unknown) {
             try self.checkExhaustiveness(match_expr, subject_enum, expression);
         }
         self.restoreMoved(entry_moved);
@@ -3733,6 +3823,8 @@ pub const Checker = struct {
         );
         machine.pierced_results = &self.pierced_results;
         machine.comptime_mode = true;
+        machine.comptime_io = self.comptime_io;
+        machine.comptime_root = self.comptime_root;
         machine.step_budget = 1_000_000;
         machine.current_view = view_index;
         machine.reflection = .{
@@ -4237,13 +4329,26 @@ pub const Checker = struct {
             try argument_types.append(self.arena, argument_type);
         }
 
+        // a macro may share its name with functions (section 6.3): '#name'
+        // selects the macro, a bare call resolves the functions
+        var has_function_candidate = false;
+        for (symbols.items) |symbol| {
+            switch (symbol.definition.kind) {
+                .fn_def, .extern_def => has_function_candidate = true,
+                else => {},
+            }
+        }
         for (symbols.items) |symbol| {
             switch (symbol.definition.kind) {
                 .macro_def => |macro_def| {
                     // macro calls evaluate at compile time (section 6.3)
                     if (self.comptime_depth == 0) {
+                        if (has_function_candidate) continue;
                         try self.report(span, "a macro call must be invoked with '#' (section 6.3)", .{});
                     }
+                    // the recorded target routes comptime evaluation to the
+                    // macro even when functions share the name
+                    try self.recordCallTarget(target_key, symbol, &.{});
                     if (call.arguments.len != macro_def.parameters.len) {
                         try self.report(span, "macro '{s}' expects {d} argument(s), found {d}", .{ name, macro_def.parameters.len, call.arguments.len });
                     } else {
@@ -4971,7 +5076,7 @@ pub const Checker = struct {
         {
             return try self.makeType(.type_description);
         }
-        if (std.mem.eql(u8, name, "name_of")) {
+        if (std.mem.eql(u8, name, "name_of") or std.mem.eql(u8, name, "read_file")) {
             return try self.stringSliceType();
         }
         if (std.mem.eql(u8, name, "implementers_of")) {
@@ -5078,8 +5183,14 @@ pub const Checker = struct {
     }
 
     fn report(self: *Checker, span: Token.Location, comptime format: []const u8, arguments: anytype) Error!void {
+        return self.reportIn(self.current_view, span, format, arguments);
+    }
+
+    // a report whose span belongs to a specific view, for diagnostics
+    // raised while checking ANOTHER view (lazily chased aliases)
+    fn reportIn(self: *Checker, view_index: usize, span: Token.Location, comptime format: []const u8, arguments: anytype) Error!void {
         if (self.tooling_only) return;
-        const view = self.views[self.current_view];
+        const view = self.views[view_index];
         try self.diagnostics.append(self.diagnostics_allocator, .{
             .path = view.path,
             .source = view.source,

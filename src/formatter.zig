@@ -181,8 +181,9 @@ fn pairSpace(before: Token, current: Token, before_was_prefix: bool) bool {
     switch (b) {
         .comma, .semicolon, .parenthesis_right, .bracket_right, .dot_dot, .colon => return false,
         // member access glues to a value; a struct-init '.field' after
-        // '{' or ',' and an implied '::Variant' keep their space
-        .dot, .colon_colon => return !endsValue(a),
+        // '{' or ',' and an implied '::Variant' keep their space, but an
+        // opening delimiter still glues ('f(::Some(1))', 'arr[::First]')
+        .dot, .colon_colon => return !endsValue(a) and a != .parenthesis_left and a != .bracket_left,
         else => {},
     }
     switch (a) {
@@ -198,6 +199,13 @@ fn pairSpace(before: Token, current: Token, before_was_prefix: bool) bool {
     // indexing glues to its subject
     if (b == .bracket_left) return !endsValue(a);
     return true;
+}
+
+test "implied variants glue to opening delimiters" {
+    const source = "fn f() { g( ::Some(1), x); h(y, ::None); }\n";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings("fn f() { g(::Some(1), x); h(y, ::None); }\n", formatted);
 }
 
 test "formatting normalizes spacing and preserves line structure" {
