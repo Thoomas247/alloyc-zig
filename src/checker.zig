@@ -315,10 +315,12 @@ pub const Checker = struct {
     // is suppressed and no comptime evaluation is scheduled - but the
     // recorded expression, place, and declaration types give macro bodies
     // hover and member completion in the editor
+    // a macro body is checked like a function body against its declared
+    // result, as compile-time context throughout: '#Type' values may be
+    // held and passed, nested '#' calls and inline layouts are plain
+    // expressions (section 7.3)
     fn checkMacroBody(self: *Checker, macro_def: ast.MacroDef) Error!void {
         const body = macro_def.body orelse return;
-        self.tooling_only = true;
-        defer self.tooling_only = false;
         try self.pushFrame(false);
         defer self.popFrame();
         for (macro_def.parameters) |parameter| {
@@ -328,15 +330,23 @@ pub const Checker = struct {
                 &unknown_type;
             try self.bind(parameter.name, parameter_type, false);
         }
+        const declared_return = try self.typeFromExpression(macro_def.return_type, &empty_type_environment);
         const saved_return = self.return_type;
         const saved_inferred = self.inferred_return;
-        self.return_type = null;
+        self.return_type = declared_return;
         self.inferred_return = null;
+        self.comptime_depth += 1;
         defer {
             self.return_type = saved_return;
             self.inferred_return = saved_inferred;
+            self.comptime_depth -= 1;
         }
         try self.checkStatement(body);
+        const return_resolved = try self.resolveAlias(declared_return);
+        if (return_resolved.* != .void_type and return_resolved.* != .unknown and !statementTerminates(body)) {
+            const rendered = try declared_return.render(self.arena);
+            try self.report(macro_def.name.location, "control can fall off the end of macro '{s}', which must return {s} on every path (section 7.3)", .{ macro_def.name.slice(self.source()), rendered });
+        }
     }
 
     // static verification that a marked type satisfies its interfaces
@@ -1123,6 +1133,12 @@ pub const Checker = struct {
         }
         if (from.* == .slice and to.* == .slice) {
             return (from.slice.mutable or !to.slice.mutable) and from.slice.child.eql(to.slice.child);
+        }
+        // a comptime result materializes into static data, so a fixed
+        // array fits a declared slice there (section 7.3)
+        if (self.comptime_depth > 0 and from.* == .fixed_array and to.* == .slice) {
+            if (from.fixed_array.element.eql(to.slice.child)) return true;
+            return self.coerce(from.fixed_array.element, to.slice.child);
         }
         if (from.* == .fixed_array and to.* == .fixed_array) {
             if (from.fixed_array.length != to.fixed_array.length) return false;
@@ -1986,6 +2002,8 @@ pub const Checker = struct {
             // inner type never reaches codegen
             if (self.comptime_depth > 0) {
                 if (primitiveByName(name) != null) return self.makeType(.type_description);
+                // '#void', the payload-less member marker (section 4.4)
+                if (std.mem.eql(u8, name, "void")) return self.makeType(.type_description);
                 if (self.firstVisible(name, self.current_view)) |symbol| {
                     switch (symbol.definition.kind) {
                         .type_def, .interface_def => return self.makeType(.type_description),
@@ -2945,8 +2963,9 @@ pub const Checker = struct {
                     if (!subject_mutable) {
                         try self.report(capture.name.location, "an owning capture moves out of its subject, which must be mutable (section 3.1)", .{});
                     }
-                    const pointer_mutable = subject_raw.* == .pointer and subject_raw.pointer.mutable;
-                    return .{ .name = name, .binding_type = subject_raw, .mutable = pointer_mutable };
+                    // the capture owns the allocation now: it moves on
+                    // like any owning 'var' binding (section 3.1)
+                    return .{ .name = name, .binding_type = subject_raw, .mutable = true };
                 },
             }
         }
@@ -3067,7 +3086,8 @@ pub const Checker = struct {
             return;
         };
         const place = try self.lvalueOf(cast.operand);
-        const subject_mutable = if (place) |info| info.mutable else false;
+        // a temporary subject is a fresh value: consumable (section 5.5)
+        const subject_mutable = if (place) |info| info.mutable else true;
         const binding = try self.captureBinding(capture, payload_type, subject_mutable, try self.pierce(payload_type));
         try self.bindComputed(capture.name, binding);
     }
@@ -3415,7 +3435,9 @@ pub const Checker = struct {
         const subject_enum = try self.enumBody(subject_type);
         const subject_interface = try self.interfaceObject(subject_type);
         const subject_place = try self.lvalueOf(match_expr.subject);
-        const subject_mutable = if (subject_place) |place| place.mutable else false;
+        // a temporary subject (a call result) is a fresh value nobody else
+        // owns, so an owning capture may consume it (section 5.5)
+        const subject_mutable = if (subject_place) |place| place.mutable else true;
         const subject_raw = if (subject_place) |place| place.raw else subject_type;
 
         if (as_value) try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .value_construct });

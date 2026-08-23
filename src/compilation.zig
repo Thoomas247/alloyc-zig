@@ -1374,18 +1374,52 @@ test "name_of yields an enum value's variant name" {
     , 4, "");
 }
 
-test "macro bodies never surface checker diagnostics" {
-    // section 7.3: bodies are not statically checked - the tooling pass
-    // that types them for the editor must swallow every complaint
-    try expectChecks(
+test "macro bodies are type-checked like function bodies" {
+    // section 7.3: a body is checked statically against every rule before
+    // it runs, as compile-time context ('#Type' locals are fine)
+    try expectCheckErrors(
         \\macro struct_type() -> #Type;
         \\type Point = struct { x: i32 };
         \\macro helper(width: i64) -> i64 {
         \\    var t = #struct_type();
-        \\    t.add_member(1, 2, 3, 4);
         \\    const wrong: bool = width + Point { .x = true };
         \\    return wrong + t.no_such_method();
         \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{
+        "expected i32, found bool",
+        "'+' requires numeric operands",
+        "'no_such_method' is not a '#Type' method",
+        "'+' requires numeric operands",
+    });
+    try expectCheckErrors(
+        \\type Entry = struct { name: &[u8] };
+        \\macro names(entries: &[Entry]) -> u64 {
+        \\    var total: u64 = 0;
+        \\    for (entries) |&entry| {
+        \\        total += entry.length();
+        \\    }
+        \\    return total;
+        \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{"no extension function 'length' for Entry"});
+    try expectCheckErrors(
+        \\macro falls(flag: bool) -> i64 {
+        \\    if (flag) { return 1; }
+        \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{"control can fall off the end of macro 'falls', which must return i64 on every path"});
+    try expectChecks(
+        \\macro struct_type() -> #Type;
+        \\macro vec2() -> #Type {
+        \\    var t = #struct_type();
+        \\    t.add_member("x", #f32);
+        \\    t.add_member("y", #struct { a: u8 });
+        \\    const names = &t.member_names();
+        \\    if (names.length() == 2) { return t; }
+        \\    return #u32;
+        \\}
+        \\type V = #vec2();
         \\fn main() -> i32 { return 0; }
     );
 }
@@ -1393,13 +1427,15 @@ test "macro bodies never surface checker diagnostics" {
 test "a comptime fault reports its call chain" {
     try expectCheckErrors(
         \\macro inner(text: &[u8]) -> u64 {
-        \\    return text.bogus.length();
+        \\    return 10 / text.length() - 1;
         \\}
         \\macro outer() -> u64 {
-        \\    return #inner("x");
+        \\    return #inner("");
         \\}
-        \\type Broken = #outer();
-        \\fn main() -> i32 { return 0; }
+        \\fn main() -> i32 {
+        \\    const v = #outer();
+        \\    return v to i32;
+        \\}
     , &.{"comptime call chain: outer -> inner"});
 }
 
@@ -1505,8 +1541,9 @@ test "a faulting type initializer is diagnosed even when unused" {
         \\macro enum_type() -> #Type;
         \\macro broken() -> #Type {
         \\    var t = #enum_type();
+        \\    return t;
         \\}
-        \\type Never = #broken();
+        \\type Never = #broken().member_names();
         \\fn main() -> i32 { return 0; }
     , &.{"must yield a '#Type'"});
 }
@@ -3665,10 +3702,10 @@ test "native executables drop owning interface objects" {
 
 test "native executables materialize comptime aggregate values" {
     try expectBuildsAndRuns("comptime_materialize",
-        \\macro symbols() -> &[&[u8]] {
+        \\macro symbols() -> [&[u8] : 4] {
         \\    return ["+", "-=", "::", "..."];
         \\}
-        \\macro numbers() -> &[i32] {
+        \\macro numbers() -> [i32 : 3] {
         \\    return [3, 5, 7];
         \\}
         \\fn main() -> i32 {
@@ -3717,7 +3754,7 @@ test "native executables materialize comptime struct arrays" {
         \\    symbol: &[u8],
         \\    weight: u8
         \\};
-        \\macro pairs() -> &[Pair] {
+        \\macro pairs() -> [Pair : 2] {
         \\    return [
         \\        Pair { .name = "plus", .symbol = "+", .weight = 1 },
         \\        Pair { .name = "arrow", .symbol = "->", .weight = 2 }
@@ -4471,7 +4508,7 @@ test "macros declare their result type and it governs the call" {
         \\macro twice(x: i64) -> i64 {
         \\    return helper(x) * 2;
         \\}
-        \\macro names() -> &[&[u8]] {
+        \\macro names() -> [&[u8] : 2] {
         \\    return ["a", "bc"];
         \\}
         \\type Pair = struct { left: i64, right: i64 };
@@ -4494,7 +4531,10 @@ test "macros declare their result type and it governs the call" {
         \\    const v = #mismatch();
         \\    return v;
         \\}
-    , &.{"this compile-time expression produced &[u8] but is declared i32"});
+    , &.{
+        "expected i32, found &[u8]",
+        "this compile-time expression produced &[u8] but is declared i32",
+    });
     try expectCheckErrors(
         \\macro layout() -> #Type;
         \\fn f(t: #Type) -> #Type { return t; }
@@ -4503,4 +4543,32 @@ test "macros declare their result type and it governs the call" {
         "'#Type' may only appear in a macro signature",
         "'#Type' may only appear in a macro signature",
     });
+}
+
+test "a return unwinding through a loop leaves the caller's frames intact" {
+    // 'return' inside a statement-if inside a 'for' unwinds on the error
+    // channel; the loop and if frames must drop with it, or the caller's
+    // own bindings vanish behind a stale barrier (the leaked-frame bug)
+    try expectBuildsAndRuns("frame_unwind",
+        \\type S = struct { count: i64 };
+        \\fn find(a: &[u8]) -> bool {
+        \\    for (a) |x| {
+        \\        if (x == 'b') {
+        \\            return true;
+        \\        }
+        \\    }
+        \\    return false;
+        \\}
+        \\fn bump(state: &var S) {
+        \\    const hit = find("abc");
+        \\    state.count += 1;
+        \\    if (hit) { state.count += 10; }
+        \\}
+        \\fn main() -> i32 {
+        \\    var s = S { .count = 0 };
+        \\    bump(&s);
+        \\    bump(&s);
+        \\    return s.count to i32;
+        \\}
+    , 22, "");
 }

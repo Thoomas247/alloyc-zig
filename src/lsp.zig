@@ -455,8 +455,26 @@ pub const Server = struct {
         };
     }
 
+    // the entry module of the current analysis, when the edited file is
+    // one of its views: the unit then keeps its shape while the user
+    // navigates, so whole-program diagnostics neither move nor vanish
+    // with the open file, and comptime evaluation keeps one entry root
+    fn stableEntryPath(self: *Server, path: []const u8) []const u8 {
+        const analysis = self.analysis orelse return path;
+        if (analysis.views.len == 0) return path;
+        const entry = analysis.views[0].path;
+        if (std.mem.eql(u8, entry, path)) return path;
+        for (analysis.views[1..]) |view| {
+            const absolute = self.resolved_paths.get(view.path) orelse continue;
+            if (std.mem.eql(u8, absolute, path)) return entry;
+        }
+        return path;
+    }
+
     // one full pipeline run for the edited document: diagnostics publish
-    // per file, and a merged unit replaces the previous analysis
+    // per file, and a merged unit replaces the previous analysis. The unit
+    // is rooted at the stable entry, not necessarily the edited file; the
+    // loader serves the edited buffer when the unit reaches it
     fn analyze(self: *Server, path: []const u8, document: Document) !void {
         const unit = try self.gpa.create(Compilation);
         unit.* = Compilation.init(self.gpa);
@@ -465,15 +483,27 @@ pub const Server = struct {
             unit.deinit();
             self.gpa.destroy(unit);
         }
+        const stable = self.stableEntryPath(path);
+        var entry_path = path;
+        var entry_source = document.text;
+        if (!std.mem.eql(u8, stable, path)) {
+            if (self.documents.get(stable)) |open| {
+                entry_path = stable;
+                entry_source = open.text;
+            } else if (Io.Dir.cwd().readFileAlloc(self.io, stable, self.message_arena.allocator(), .limited(10 * 1024 * 1024)) catch null) |from_disk| {
+                entry_path = stable;
+                entry_source = from_disk;
+            }
+        }
         // the unit outlives this message and the document buffer it came
         // from (an edit frees the old text), so it owns its entry module
-        const owned_path = try unit.arena.allocator().dupe(u8, path);
-        const owned_source = try unit.arena.allocator().dupe(u8, document.text);
+        const owned_path = try unit.arena.allocator().dupe(u8, entry_path);
+        const owned_source = try unit.arena.allocator().dupe(u8, entry_source);
         _ = try unit.addModule(owned_path, owned_source);
 
         var loader_context: LoaderContext = .{
             .server = self,
-            .base_directory = directoryOf(path),
+            .base_directory = directoryOf(owned_path),
         };
         const loader: ModuleLoader = .{
             .context = @ptrCast(&loader_context),
@@ -2462,4 +2492,60 @@ test "the server publishes diagnostics for an opened document" {
     try std.testing.expect(std.mem.indexOf(u8, transcript, "\"capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "textDocument/publishDiagnostics") != null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "use of undeclared identifier 'missing'") != null);
+}
+
+test "navigating to an imported module keeps the entry's diagnostics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // main has the only error; helper is clean. Editing helper must keep
+    // analyzing the unit rooted at main, so main's error survives
+    const main_source = "import helper;\nfn main() -> i32 { return twice(true); }\n";
+    const helper_source = "pub fn twice(x: i64) -> i64 { return x * 2; }\n";
+    const helper_edited = "pub fn twice(x: i64) -> i64 { return x + x; }\n";
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = "file:///c%3A/probe/helper.alloy", .languageId = "alloy", .version = 1, .text = helper_source } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = "file:///c%3A/probe/main.alloy", .languageId = "alloy", .version = 1, .text = main_source } },
+        }, .{}),
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = "file:///c%3A/probe/helper.alloy" },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = helper_edited }},
+            },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    // main's error appears when main opens, and AGAIN when helper is
+    // edited: the unit stays rooted at main instead of re-rooting at
+    // helper and clearing main's marker
+    const transcript = output.writer.buffered();
+    var count: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, transcript, index, "no overload of 'twice' matches these argument types")) |found| {
+        count += 1;
+        index = found + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }

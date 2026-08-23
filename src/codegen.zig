@@ -1168,7 +1168,7 @@ pub const Codegen = struct {
             },
             .float => |float| return .{ .scalar = try self.floatConstant(float.value, float.primitive orelse .f64) },
             .bool_value => |truth| return .{ .scalar = .{ .text = if (truth) "true" else "false", .llvm = "i1" } },
-            .slice, .array, .heap_array, .struct_value => {
+            .slice, .array, .heap_array, .struct_value, .enum_value => {
                 // materialization (section 7.2): the value becomes typed
                 // static program data shaped by the checker's recorded type
                 const resolved = try self.resolvedOf(try self.typeOf(expression));
@@ -1251,7 +1251,44 @@ pub const Codegen = struct {
                 const instance = staticElements(value) orelse return null;
                 return self.staticArrayConstant(instance, try self.resolvedOf(array.element));
             },
-            .structural, .declared => {
+            .structural, .declared, .inline_enum, .structural_enum => {
+                // an enum value: its tag, then the active payload at the
+                // frame's payload offset, padded to the full layout
+                if (try self.enumFrameQuery(resolved)) |frame| {
+                    if (value != .enum_value) return null;
+                    const variant_index = for (frame.variants, 0..) |variant, index| {
+                        if (std.mem.eql(u8, variant.name, value.enum_value.variant)) break index;
+                    } else return null;
+                    var type_text: std.ArrayList(u8) = .empty;
+                    var value_text: std.ArrayList(u8) = .empty;
+                    const tag_text = tagTypeText(frame.tag_size);
+                    try type_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, "<{{ {s}", .{tag_text}));
+                    try value_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, "<{{ {s} {d}", .{ tag_text, variant_index }));
+                    var cursor: u64 = frame.tag_size;
+                    if (frame.variants[variant_index].payload) |payload_type| {
+                        const payload_value = value.enum_value.payload orelse return null;
+                        const payload_resolved = try self.resolvedOf(payload_type);
+                        const payload_layout = (try self.layoutQuery(payload_resolved, 1)) orelse return null;
+                        const rendered = (try self.staticConstant(payload_value, payload_resolved)) orelse return null;
+                        if (frame.payload_offset > cursor) {
+                            try type_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", [{d} x i8]", .{frame.payload_offset - cursor}));
+                            try value_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", [{d} x i8] zeroinitializer", .{frame.payload_offset - cursor}));
+                        }
+                        try type_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", {s}", .{rendered.type_text}));
+                        try value_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", {s} {s}", .{ rendered.type_text, rendered.value_text }));
+                        cursor = frame.payload_offset + payload_layout.size;
+                    }
+                    if (frame.layout.size > cursor) {
+                        try type_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", [{d} x i8]", .{frame.layout.size - cursor}));
+                        try value_text.appendSlice(self.arena, try std.fmt.allocPrint(self.arena, ", [{d} x i8] zeroinitializer", .{frame.layout.size - cursor}));
+                    }
+                    try type_text.appendSlice(self.arena, " }>");
+                    try value_text.appendSlice(self.arena, " }>");
+                    return .{
+                        .type_text = try type_text.toOwnedSlice(self.arena),
+                        .value_text = try value_text.toOwnedSlice(self.arena),
+                    };
+                }
                 if (value != .struct_value) return null;
                 const slots = (try self.fieldSlotsQuery(resolved)) orelse return null;
                 const layout = (try self.layoutQuery(resolved, 0)) orelse return null;
@@ -1316,17 +1353,33 @@ pub const Codegen = struct {
 
     fn staticArrayConstant(self: *Codegen, elements: []const Interpreter.Value, element_type: *const Type) Error!?RenderedConstant {
         var values: std.ArrayList(u8) = .empty;
+        var type_texts: std.ArrayList(u8) = .empty;
         var type_text: ?[]const u8 = null;
-        try values.appendSlice(self.arena, "[");
+        var uniform = true;
         for (elements, 0..) |element, index| {
             const rendered = (try self.staticConstant(element, element_type)) orelse return null;
+            if (type_text) |previous| {
+                if (!std.mem.eql(u8, previous, rendered.type_text)) uniform = false;
+            }
             type_text = rendered.type_text;
-            if (index != 0) try values.appendSlice(self.arena, ", ");
+            if (index != 0) {
+                try values.appendSlice(self.arena, ", ");
+                try type_texts.appendSlice(self.arena, ", ");
+            }
             try values.appendSlice(self.arena, rendered.type_text);
             try values.appendSlice(self.arena, " ");
             try values.appendSlice(self.arena, rendered.value_text);
+            try type_texts.appendSlice(self.arena, rendered.type_text);
         }
-        try values.appendSlice(self.arena, "]");
+        // enum elements with different active payloads render as different
+        // LLVM types; every element is padded to the full layout, so a
+        // packed struct of them is byte-identical to the array
+        if (!uniform) {
+            return .{
+                .type_text = try std.fmt.allocPrint(self.arena, "<{{ {s} }}>", .{type_texts.items}),
+                .value_text = try std.fmt.allocPrint(self.arena, "<{{ {s} }}>", .{values.items}),
+            };
+        }
         // an empty array still needs its element type in the array type
         const element_text = type_text orelse text: {
             const rendered = (try self.staticConstant(.void_value, element_type)) orelse {
@@ -1338,7 +1391,7 @@ pub const Codegen = struct {
         };
         return .{
             .type_text = try std.fmt.allocPrint(self.arena, "[{d} x {s}]", .{ elements.len, element_text }),
-            .value_text = try values.toOwnedSlice(self.arena),
+            .value_text = try std.fmt.allocPrint(self.arena, "[{s}]", .{values.items}),
         };
     }
 

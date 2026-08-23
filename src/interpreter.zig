@@ -917,18 +917,23 @@ pub const Interpreter = struct {
                     if (value == .reference or value == .slice) return value;
                     return self.fault("'&' needs an addressable operand", .{});
                 };
+                // '&' on something already behind a reference borrows the
+                // pointee, not the reference cell: '&x' on a reference
+                // binding is the same borrow (section 5.2)
+                var cell = place;
+                while (cell.* == .reference) cell = cell.reference;
                 // borrowing a heap array yields a slice aliasing its
                 // elements in place (section 5.2)
-                if (place.* == .heap_array) {
-                    const instance = place.heap_array orelse return self.fault("use of a moved-from array", .{});
+                if (cell.* == .heap_array) {
+                    const instance = cell.heap_array orelse return self.fault("use of a moved-from array", .{});
                     return .{ .slice = instance };
                 }
                 // re-borrowing a place already holding a slice yields the
                 // same view (section 5.2)
-                if (place.* == .slice) {
-                    return place.*;
+                if (cell.* == .slice) {
+                    return cell.*;
                 }
-                return .{ .reference = place };
+                return .{ .reference = cell };
             },
             .keyword_new => return self.evalNew(unary.operand),
             .keyword_move => {
@@ -1115,8 +1120,28 @@ pub const Interpreter = struct {
                 if (self.cast_shapes.get(expression)) |shapes| {
                     return self.reinterpretShaped(operand, shapes);
                 }
-                const target = self.primitiveOf(expression) orelse return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});
-                return self.reinterpret(operand, target);
+                if (self.primitiveOf(expression)) |target| return self.reinterpret(operand, target);
+                // inside a macro body nothing is recorded: an integer
+                // reinterpreted as a named enum picks the variant by tag,
+                // through reflection (section 4.5)
+                if (operand == .integer and cast.target.* == .named) {
+                    const path = cast.target.named.path;
+                    if (try self.reflectName(path[path.len - 1].slice(self.source()))) |described| {
+                        const description = described.type_value;
+                        if (description.kind == .enum_kind) {
+                            const tag = operand.integer.value;
+                            if (tag < 0 or tag >= description.members.items.len) {
+                                return self.fault("tag {d} names no variant of '{s}'", .{ tag, description.name });
+                            }
+                            const member = description.members.items[@intCast(tag)];
+                            if (member.description.kind != .other_kind) {
+                                return self.fault("'as' cannot build the payload-carrying variant '{s}' of '{s}'", .{ member.name, description.name });
+                            }
+                            return self.makeEnum(member.name, null);
+                        }
+                    }
+                }
+                return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});
             },
             else => return self.fault("unsupported cast", .{}),
         }
@@ -2164,6 +2189,15 @@ pub const Interpreter = struct {
     // a statement-position if passes 'yield' through to the enclosing
     // value construct; only a value-position if consumes it (section 5.3)
     fn evalIf(self: *Interpreter, if_expr: ast.IfExpression, as_value: bool) Error!Value {
+        // 'return', 'break', and 'yield' unwind on the error channel and
+        // skip the in-line popFrame calls below: this guard drops whatever
+        // frames this construct still holds on ANY exit (the fix for the
+        // leaked-frame corruption where a caller's bindings vanish behind
+        // a stale barrier)
+        const frame_floor = self.scopes.items.len;
+        defer while (self.scopes.items.len > frame_floor) {
+            _ = self.scopes.pop();
+        };
         // the frame spans condition and then-branch: inline 'is' captures
         // bind during the condition (section 4.2)
         try self.pushFrame(false);
@@ -2336,6 +2370,15 @@ pub const Interpreter = struct {
     // statement loop passes 'yield' through to the enclosing value
     // construct (section 5.3)
     fn evalWhile(self: *Interpreter, while_expr: ast.WhileExpression, as_value: bool) Error!Value {
+        // 'return', 'break', and 'yield' unwind on the error channel and
+        // skip the in-line popFrame calls below: this guard drops whatever
+        // frames this construct still holds on ANY exit (the fix for the
+        // leaked-frame corruption where a caller's bindings vanish behind
+        // a stale barrier)
+        const frame_floor = self.scopes.items.len;
+        defer while (self.scopes.items.len > frame_floor) {
+            _ = self.scopes.pop();
+        };
         while (true) {
             // condition captures live for one iteration (section 4.2)
             try self.pushFrame(false);
@@ -2381,6 +2424,15 @@ pub const Interpreter = struct {
     }
 
     fn evalFor(self: *Interpreter, for_expr: ast.ForExpression, as_value: bool) Error!Value {
+        // 'return', 'break', and 'yield' unwind on the error channel and
+        // skip the in-line popFrame calls below: this guard drops whatever
+        // frames this construct still holds on ANY exit (the fix for the
+        // leaked-frame corruption where a caller's bindings vanish behind
+        // a stale barrier)
+        const frame_floor = self.scopes.items.len;
+        defer while (self.scopes.items.len > frame_floor) {
+            _ = self.scopes.pop();
+        };
         const Subject = union(enum) {
             counter: struct { next: i128, end: i128, primitive: types.Primitive },
             elements: *Value.ArrayInstance,
@@ -2521,6 +2573,15 @@ pub const Interpreter = struct {
 
     // a statement-position match passes 'yield' through like an if
     fn evalMatch(self: *Interpreter, match_expr: ast.MatchExpression, as_value: bool) Error!Value {
+        // 'return', 'break', and 'yield' unwind on the error channel and
+        // skip the in-line popFrame calls below: this guard drops whatever
+        // frames this construct still holds on ANY exit (the fix for the
+        // leaked-frame corruption where a caller's bindings vanish behind
+        // a stale barrier)
+        const frame_floor = self.scopes.items.len;
+        defer while (self.scopes.items.len > frame_floor) {
+            _ = self.scopes.pop();
+        };
         const subject_place = try self.evalPlace(match_expr.subject);
         var subject_storage: Value = undefined;
         const subject: *Value = if (subject_place) |place| try self.pierceCell(place) else subject: {
