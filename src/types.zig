@@ -50,7 +50,7 @@ pub const Primitive = enum {
     }
 };
 
-/// Nominal runtime identity of a struct value (section 5.2): the declaring
+/// Nominal runtime identity of a struct value (section 6.2): the declaring
 /// definition plus its view, so same-named types from different libraries
 /// never confuse dispatch, downcasts, or match arms.
 pub const TypeIdentity = struct {
@@ -58,8 +58,8 @@ pub const TypeIdentity = struct {
     view_index: usize,
 };
 
-/// A serialization shape for 'as' reinterpretation (section 3.5): the
-/// checker flattens a type's C-compatible layout (section 3.9) into byte
+/// A serialization shape for 'as' reinterpretation (section 4.5): the
+/// checker flattens a type's C-compatible layout (section 4.9) into byte
 /// offsets so the interpreter can reinterpret values without re-deriving
 /// type structure. Pointer-bearing types have no shape.
 pub const Shape = union(enum) {
@@ -125,7 +125,7 @@ pub const Type = union(enum) {
     unknown,
     // the absence of a value: a function without a return type
     void_type,
-    // literals without a contextual type (section 3.3 rules 2 and 3)
+    // literals without a contextual type (section 4.3 rules 2 and 3)
     untyped_integer,
     untyped_float,
     primitive: Primitive,
@@ -139,15 +139,15 @@ pub const Type = union(enum) {
     structural: []const Field,
     type_parameter: TypeParameter,
     // an interface used as a type; only valid behind an indirection, where
-    // it forms an interface object (section 5.2)
+    // it forms an interface object (section 6.2)
     interface: Interface,
     // an inline 'enum { ... }' in a type position; compared structurally
-    // against other enum types (section 3.3)
+    // against other enum types (section 4.3)
     inline_enum: InlineEnum,
-    // a synthesised enum ('type T = #...', section 3.4): a resolved variant
+    // a synthesised enum ('type T = #...', section 4.4): a resolved variant
     // list with no syntax behind it
     structural_enum: []const EnumVariant,
-    // the '#Type' reflection value (section 3.4): compile-time only, typed
+    // the '#Type' reflection value (section 4.4): compile-time only, typed
     // for tooling so macro bodies get hover and method completion
     type_description,
 
@@ -197,7 +197,7 @@ pub const Type = union(enum) {
         view_index: usize,
         name: []const u8,
         // the types binding a generic interface's own type parameters
-        // ('Iterable<u64, PacketCursor>', section 5.2); empty when the
+        // ('Iterable<u64, PacketCursor>', section 6.2); empty when the
         // interface is not generic
         arguments: []const *const Type = &.{},
 

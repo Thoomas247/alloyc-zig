@@ -1,7 +1,7 @@
 //! Native code generation, the execution stage behind 'alloyc build'. It
 //! lowers the checked merged unit into textual LLVM IR which an external
 //! clang turns into an executable. Like the interpreter it consumes the
-//! checker's side tables, and it queries the live checker for section 3.9
+//! checker's side tables, and it queries the live checker for section 4.9
 //! layouts so byte offsets have a single source of truth.
 //!
 //! Lowering model: aggregates (structs, enums, fixed arrays, slices) are
@@ -9,12 +9,12 @@
 //! (opaque pointers, no LLVM struct types); locals live in allocas; value
 //! yielding control flow writes through result slots instead of phi nodes.
 //! Checked builds fault on integer overflow, division by zero, out-of-range
-//! shifts, index bounds, and lockstep mismatches (section 4.2) by printing
+//! shifts, index bounds, and lockstep mismatches (section 5.2) by printing
 //! the fault and executing 'llvm.trap'; release builds wrap arithmetic and
 //! skip the checks, keeping only division-by-zero faults. Enum tags count
 //! variants in declaration order, matching the 'as' serialization shapes.
 //!
-//! Ownership (section 4.2) is lowered through per-type helper functions:
+//! Ownership (section 5.2) is lowered through per-type helper functions:
 //! 'alloy.copy.N' deep-copies a value (cloning every owned allocation) and
 //! 'alloy.drop.N' recursively frees what a value owns. Operands track
 //! freshness: a temporary transfers its bits to its consumer, a place-backed
@@ -23,20 +23,20 @@
 //! its length in a malloc prefix at user_ptr - 8.
 //!
 //! Generic functions monomorphize: each distinct set of resolved type
-//! bindings (section 3.7) becomes one IR function, and every recorded type
+//! bindings (section 4.7) becomes one IR function, and every recorded type
 //! substitutes through the active instance's bindings before any layout
 //! question.
 //!
-//! Interface objects (section 5.2) are fat pairs of a data pointer and a
+//! Interface objects (section 6.2) are fat pairs of a data pointer and a
 //! per-type identity global; calls without a static target dispatch through
 //! a closed-world chain over the interface's implementers, falling back to
 //! the default implementation, which receives the fat pair itself. 'is'
 //! tests, downcasts, and match arms compare type identities. An owning
 //! '*I' drops and clones virtually: the identity selects the concrete
 //! helper over the same closed world. Custom iterables drive the cursor
-//! protocol (section 4.3), and string subjects match through memcmp.
+//! protocol (section 5.3), and string subjects match through memcmp.
 //!
-//! Closures (section 4.4) are heap blocks headed by call, drop, and copy
+//! Closures (section 5.4) are heap blocks headed by call, drop, and copy
 //! function pointers with the captured environment behind them; a function
 //! value is one pointer everywhere. Named functions used as values share a
 //! constant block whose null drop and copy slots mark it static. Calls
@@ -66,7 +66,7 @@ pub const Codegen = struct {
     expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
     call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
     call_type_bindings: *const std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding),
-    // per-instance targets for constraint-dispatched calls (section 5.2),
+    // per-instance targets for constraint-dispatched calls (section 6.2),
     // filled during emission by constraintCallTarget
     constraint_call_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding) = .empty,
     // the labels of the inline-capture bind diamond under construction
@@ -93,7 +93,7 @@ pub const Codegen = struct {
     // deep-copy and drop helper functions, memoized by canonical type key
     helper_names: std.StringHashMapUnmanaged([]const u8),
     // runtime type identity globals, one per concrete declared type; the
-    // address is the identity an interface object carries (section 5.2)
+    // address is the identity an interface object carries (section 6.2)
     type_descriptors: std.AutoHashMapUnmanaged(*const ast.Definition, []const u8),
     // per-instantiation identities for generic types behind generic
     // interface objects, keyed by definition pointer + canonical type key
@@ -117,12 +117,12 @@ pub const Codegen = struct {
     scopes: std.ArrayList(Frame),
     // 'break' targets the innermost loop, 'yield' the innermost value
     // if or match; separate stacks make each transparent to the other
-    // (section 4.3)
+    // (section 5.3)
     break_targets: std.ArrayList(BreakTarget),
     yield_targets: std.ArrayList(BreakTarget),
     return_type: *const Type,
     return_slot: ?[]const u8,
-    // the active instance's resolved type parameters (section 3.7); every
+    // the active instance's resolved type parameters (section 4.7); every
     // recorded type substitutes through these before any layout question
     current_bindings: ?*const Checker.TypeEnvironment,
     // debug info (checked builds only): DWARF metadata nodes accumulate
@@ -195,7 +195,7 @@ pub const Codegen = struct {
         exit_label: []const u8,
         slot: ?Slot,
         // scope depth at construct entry: 'break' drops every owning local
-        // in frames deeper than this before branching out (section 4.2)
+        // in frames deeper than this before branching out (section 5.2)
         frame_depth: usize,
     };
 
@@ -225,7 +225,7 @@ pub const Codegen = struct {
         layout: Checker.Layout,
         // a fresh operand is a temporary that owns its bits: consuming it
         // transfers ownership; consuming a place-backed operand must deep
-        // copy any heap it owns (section 4.2)
+        // copy any heap it owns (section 5.2)
         fresh: bool = false,
     };
 
@@ -306,7 +306,7 @@ pub const Codegen = struct {
     }
 
     // a recorded type inside a generic body may name type parameters; the
-    // active instance's bindings make it concrete (section 3.7)
+    // active instance's bindings make it concrete (section 4.7)
     fn substituted(self: *Codegen, candidate: *const Type) Error!*const Type {
         const bindings = self.current_bindings orelse return candidate;
         return self.checker.substitute(candidate, bindings);
@@ -374,7 +374,7 @@ pub const Codegen = struct {
         return module.writer.buffered();
     }
 
-    // the std::process::arguments lang item (section 5.1a), recognized by
+    // the std::process::arguments lang item (section 6.1a), recognized by
     // its canonical module key and name like the checker's lang items
     fn processArgumentsLangItem(self: *const Codegen, symbol: resolution.Symbol) bool {
         const key = self.views[symbol.view_index].key orelse return false;
@@ -392,7 +392,7 @@ pub const Codegen = struct {
     }
 
     // the process entry adapts the Alloy 'main' result to the C 'int' and
-    // captures argv as slices for std::process::arguments (section 5.1a)
+    // captures argv as slices for std::process::arguments (section 6.1a)
     fn emitMainWrapper(self: *Codegen, info: *FunctionInfo) Error!void {
         const writer = &self.functions.writer;
         try self.declareMalloc();
@@ -538,7 +538,7 @@ pub const Codegen = struct {
         return info;
     }
 
-    // a C-facing type: slices decay to their data pointer (section 5.3)
+    // a C-facing type: slices decay to their data pointer (section 6.3)
     fn externTypeText(self: *Codegen, candidate: *const Type, location: Token.Location) Error![]const u8 {
         const resolved = try self.resolvedOf(candidate);
         return switch (resolved.*) {
@@ -668,7 +668,7 @@ pub const Codegen = struct {
     }
 
     // the checker's path-termination analysis rejects typed functions that
-    // can fall through (section 4.3); this default return remains as the
+    // can fall through (section 5.3); this default return remains as the
     // structural safety net for void functions and conservative cases
     fn emitDefaultReturn(self: *Codegen) Error!void {
         try self.emitDropsDownTo(0, null);
@@ -726,28 +726,12 @@ pub const Codegen = struct {
                 try self.instruction("br label %{s}", .{target.exit_label});
                 self.terminated = true;
             },
-            .yield_stmt => |yield_stmt| {
-                const target = if (self.yield_targets.items.len != 0)
-                    self.yield_targets.items[self.yield_targets.items.len - 1]
-                else
-                    return self.report(yield_stmt.keyword.location, "'yield' outside an if or match used as a value", .{});
-                const value = try self.evalExpression(yield_stmt.value);
-                if (target.slot) |slot| {
-                    var coerced = try self.coerceOperand(value, try self.typeOf(yield_stmt.value), slot.value_type, yield_stmt.keyword.location);
-                    coerced = try self.copyOwnedScalarRead(yield_stmt.value, coerced, yield_stmt.keyword.location);
-                    try self.storeOperand(slot.pointer, coerced, slot.value_type, yield_stmt.keyword.location);
-                } else {
-                    try self.dropDiscarded(value, try self.typeOf(yield_stmt.value), yield_stmt.keyword.location);
-                }
-                try self.emitDropsDownTo(target.frame_depth, null);
-                try self.instruction("br label %{s}", .{target.exit_label});
-                self.terminated = true;
-            },
+            .yield_stmt => |yield_stmt| try self.emitYield(yield_stmt.value, yield_stmt.keyword.location),
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value_expression| {
                     const value = try self.evalExpression(value_expression);
                     var coerced = try self.coerceOperand(value, try self.typeOf(value_expression), self.return_type, return_stmt.keyword.location);
-                    // no implicit move (section 4.2): a bare read of an
+                    // no implicit move (section 5.2): a bare read of an
                     // owning heap-array local returns by value, so its
                     // allocation clones before the scope-end drops below
                     // free the original; 'return move v' transfers instead
@@ -804,13 +788,13 @@ pub const Codegen = struct {
         const span = assign.operator.location;
         if (assign.operator.tag == .equal) {
             // plain '=' targets the raw place: a pointer or reference place
-            // rebinds rather than writing the pointee (section 4.2)
+            // rebinds rather than writing the pointee (section 5.2)
             const place = (try self.evalPlaceRaw(assign.target)) orelse
                 return self.report(span, "assignment to a non-assignable expression", .{});
             const value = try self.evalExpression(assign.value);
             var coerced = try self.coerceOperand(value, try self.typeOf(assign.value), place.value_type, span);
             if (try self.ownsHeap(place.value_type, 0)) {
-                // free-on-reassign (section 4.2): the value is staged first
+                // free-on-reassign (section 5.2): the value is staged first
                 // because it may read through the old one, then the old
                 // allocation drops, then the staged bits transfer
                 if (coerced == .memory and !coerced.memory.fresh) {
@@ -826,7 +810,7 @@ pub const Codegen = struct {
             try self.storeOperand(place.pointer, coerced, place.value_type, span);
             return;
         }
-        // compound assignment writes through to the pointee (section 4.2)
+        // compound assignment writes through to the pointee (section 5.2)
         const place = (try self.evalPlace(assign.target)) orelse
             return self.report(span, "assignment to a non-assignable expression", .{});
         const operator: Token.Tag = switch (assign.operator.tag) {
@@ -859,7 +843,7 @@ pub const Codegen = struct {
     }
 
     // the place without the final pierce: 'move' reads the pointer slot
-    // itself, and assignment targets store into the raw place (section 4.2)
+    // itself, and assignment targets store into the raw place (section 5.2)
     fn evalPlaceRaw(self: *Codegen, expression: *const ast.Expression) Error!?Place {
         switch (expression.*) {
             .grouped => |inner| return self.evalPlaceRaw(inner),
@@ -924,7 +908,7 @@ pub const Codegen = struct {
                 if (!self.release_mode) {
                     const in_bounds = try self.freshTemp();
                     try self.instruction("{s} = icmp ult i64 {s}, {s}", .{ in_bounds, wide, length_text });
-                    try self.faultUnless(in_bounds, "runtime fault: index out of bounds (section 5.1)");
+                    try self.faultUnless(in_bounds, "runtime fault: index out of bounds (section 6.1)");
                 }
                 const scaled = try self.freshTemp();
                 try self.instruction("{s} = mul i64 {s}, {d}", .{ scaled, wide, element_layout.size });
@@ -937,7 +921,7 @@ pub const Codegen = struct {
     }
 
     // 'arr[start..end]' borrows a slice fat pair viewing the subject's
-    // element range in place (section 3.2); checked builds fault on
+    // element range in place (section 4.2); checked builds fault on
     // bounds that escape the subject
     fn evalSubslice(self: *Codegen, expression: *const ast.Expression) Error!Operand {
         const subslice = expression.subslice;
@@ -985,10 +969,10 @@ pub const Codegen = struct {
         if (!self.release_mode) {
             const ordered = try self.freshTemp();
             try self.instruction("{s} = icmp ule i64 {s}, {s}", .{ ordered, start_text, end_text });
-            try self.faultUnless(ordered, "runtime fault: subslice bounds out of order (section 3.2)");
+            try self.faultUnless(ordered, "runtime fault: subslice bounds out of order (section 4.2)");
             const within = try self.freshTemp();
             try self.instruction("{s} = icmp ule i64 {s}, {s}", .{ within, end_text, length_text });
-            try self.faultUnless(within, "runtime fault: subslice out of bounds (section 3.2)");
+            try self.faultUnless(within, "runtime fault: subslice out of bounds (section 4.2)");
         }
         const scaled = try self.freshTemp();
         try self.instruction("{s} = mul i64 {s}, {d}", .{ scaled, start_text, element_layout.size });
@@ -1009,14 +993,14 @@ pub const Codegen = struct {
     };
 
     // loads a heap array's data pointer from its place and the length from
-    // the prefix at data - 8 (section 4.2); checked builds reject null
+    // the prefix at data - 8 (section 5.2); checked builds reject null
     fn heapArrayView(self: *Codegen, place_pointer: []const u8) Error!HeapArrayView {
         const data = try self.freshTemp();
         try self.instruction("{s} = load ptr, ptr {s}", .{ data, place_pointer });
         if (!self.release_mode) {
             const live = try self.freshTemp();
             try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, data });
-            try self.faultUnless(live, "runtime fault: use of a moved-from array (section 4.2)");
+            try self.faultUnless(live, "runtime fault: use of a moved-from array (section 5.2)");
         }
         const base = try self.freshTemp();
         try self.instruction("{s} = getelementptr inbounds i8, ptr {s}, i64 -8", .{ base, data });
@@ -1025,7 +1009,7 @@ pub const Codegen = struct {
         return .{ .data = data, .length = length };
     }
 
-    // pointee transparency (section 4.2): a reference or pointer place
+    // pointee transparency (section 5.2): a reference or pointer place
     // reads through to its pointee; checked builds verify a pierced pointer
     // is not null (a use after move)
     fn piercePlace(self: *Codegen, place: Place) Error!Place {
@@ -1036,7 +1020,7 @@ pub const Codegen = struct {
             switch (resolved.*) {
                 .reference => |indirection| {
                     // an interface object is the fat pair itself, not a
-                    // pointer to pierce through (section 3.2)
+                    // pointer to pierce through (section 4.2)
                     if ((try self.resolvedOf(indirection.child)).* == .interface) return current;
                     const loaded = try self.freshTemp();
                     try self.instruction("{s} = load ptr, ptr {s}", .{ loaded, current.pointer });
@@ -1049,7 +1033,7 @@ pub const Codegen = struct {
                     if (!self.release_mode) {
                         const live = try self.freshTemp();
                         try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, loaded });
-                        try self.faultUnless(live, "runtime fault: null pointer dereference, a use after 'move' (section 4.2)");
+                        try self.faultUnless(live, "runtime fault: null pointer dereference, a use after 'move' (section 5.2)");
                     }
                     current = .{ .pointer = loaded, .value_type = indirection.child };
                 },
@@ -1062,6 +1046,8 @@ pub const Codegen = struct {
     fn evalExpression(self: *Codegen, expression: *const ast.Expression) Error!Operand {
         switch (expression.*) {
             .grouped => |inner| return self.evalExpression(inner),
+            // a '#Type' never reaches runtime code (section 7.2)
+            .type_literal => return self.report(self.spanOf(expression), "an inline layout's '#Type' exists only during compile-time evaluation (section 4.4)", .{}),
             .integer_literal => |token| return self.integerLiteralOperand(expression, token),
             .float_literal => |token| {
                 const value = std.fmt.parseFloat(f64, token.slice(self.source())) catch 0;
@@ -1115,7 +1101,7 @@ pub const Codegen = struct {
             .call => {
                 const result = try self.evalCall(expression);
                 // a bare '&T' result at a use site pierces to a copy of the
-                // pointee (section 4.2): scalars load, aggregates hand back
+                // pointee (section 5.2): scalars load, aggregates hand back
                 // a place-backed operand that consumers deep-copy
                 if (self.checker.pierced_results.contains(expression)) {
                     // the recorded type is already the pointee: the callee
@@ -1182,8 +1168,8 @@ pub const Codegen = struct {
             },
             .float => |float| return .{ .scalar = try self.floatConstant(float.value, float.primitive orelse .f64) },
             .bool_value => |truth| return .{ .scalar = .{ .text = if (truth) "true" else "false", .llvm = "i1" } },
-            .slice, .array, .heap_array => {
-                // materialization (section 6.2): the value becomes typed
+            .slice, .array, .heap_array, .struct_value => {
+                // materialization (section 7.2): the value becomes typed
                 // static program data shaped by the checker's recorded type
                 const resolved = try self.resolvedOf(try self.typeOf(expression));
                 const rendered = (try self.staticConstant(value, resolved)) orelse
@@ -1270,7 +1256,7 @@ pub const Codegen = struct {
                 const slots = (try self.fieldSlotsQuery(resolved)) orelse return null;
                 const layout = (try self.layoutQuery(resolved, 0)) orelse return null;
                 // a packed struct with explicit padding reproduces the
-                // section 3.9 byte layout exactly, so the field slots the
+                // section 4.9 byte layout exactly, so the field slots the
                 // generated code reads through line up
                 var type_text: std.ArrayList(u8) = .empty;
                 var value_text: std.ArrayList(u8) = .empty;
@@ -1395,7 +1381,7 @@ pub const Codegen = struct {
             },
             .ampersand => {
                 // '&' on a reference-typed call result keeps the borrow
-                // (section 4.2): the operand already carries the pointer
+                // (section 5.2): the operand already carries the pointer
                 if (unwrapGrouped(unary.operand).* == .call) {
                     const operand_type = try self.resolvedOf(try self.typeOf(unary.operand));
                     if (operand_type.* == .reference or operand_type.* == .slice) {
@@ -1405,7 +1391,7 @@ pub const Codegen = struct {
                 const place = (try self.evalPlace(unary.operand)) orelse
                     return self.report(span, "'&' needs an addressable operand", .{});
                 // borrowing a heap array yields a slice fat pair viewing
-                // its elements in place (section 4.2)
+                // its elements in place (section 5.2)
                 if ((try self.resolvedOf(place.value_type)).* == .heap_array) {
                     const view = try self.heapArrayView(place.pointer);
                     const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
@@ -1415,7 +1401,7 @@ pub const Codegen = struct {
                     return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
                 }
                 // re-borrowing a slice-typed place yields the same view:
-                // the fat pair itself is the value (section 4.2)
+                // the fat pair itself is the value (section 5.2)
                 if ((try self.resolvedOf(place.value_type)).* == .slice) {
                     return .{ .memory = .{ .pointer = place.pointer, .layout = .{ .size = 16, .alignment = 8 } } };
                 }
@@ -1424,12 +1410,12 @@ pub const Codegen = struct {
             .keyword_new => return self.evalNew(expression),
             .keyword_move => {
                 // 'move' reads the pointer slot itself and clears the
-                // source, transferring ownership (section 4.2)
+                // source, transferring ownership (section 5.2)
                 const place = (try self.evalPlaceRaw(unary.operand)) orelse
                     return self.report(span, "'move' needs an addressable operand", .{});
                 // an owning interface object is a 16-byte fat pair: the
                 // whole pair transfers, and nulling the data half marks
-                // the source moved-from (section 5.2)
+                // the source moved-from (section 6.2)
                 if ((try self.classify(place.value_type, span)) == .aggregate) {
                     const layout = (try self.layoutQuery(place.value_type, 0)) orelse
                         return self.report(span, "this type has no defined runtime layout", .{});
@@ -1457,12 +1443,12 @@ pub const Codegen = struct {
                 // 'new' under an interface-typed expectation allocates the
                 // concrete operand and yields an owning interface object:
                 // the fat pair carries the identity for the virtual drop
-                // (section 5.2)
+                // (section 6.2)
                 if ((try self.resolvedOf(indirection.child)).* == .interface) {
                     const interface = (try self.resolvedOf(indirection.child)).interface;
                     const concrete = try self.resolvedOf(try self.typeOf(operand));
                     if (concrete.* != .declared) {
-                        return self.report(span, "only named types convert to interface objects (section 5.2)", .{});
+                        return self.report(span, "only named types convert to interface objects (section 6.2)", .{});
                     }
                     const concrete_layout = (try self.layoutQuery(concrete, 0)) orelse
                         return self.report(span, "this pointee type has no defined layout", .{});
@@ -1488,7 +1474,7 @@ pub const Codegen = struct {
     }
 
     // 'new [value : count]' and friends: the allocation carries its length
-    // in a prefix at user_ptr - 8 (section 4.2)
+    // in a prefix at user_ptr - 8 (section 5.2)
     fn evalNewArray(self: *Codegen, operand: *const ast.Expression, element_type: *const Type, span: Token.Location) Error!Operand {
         const element_layout = (try self.layoutQuery(element_type, 0)) orelse
             return self.report(span, "this element type has no defined layout", .{});
@@ -1500,7 +1486,7 @@ pub const Codegen = struct {
                 if (!self.release_mode) {
                     const non_negative = try self.freshTemp();
                     try self.instruction("{s} = icmp sge i64 {s}, 0", .{ non_negative, wide });
-                    try self.faultUnless(non_negative, "runtime fault: array fill count is negative (section 4.2)");
+                    try self.faultUnless(non_negative, "runtime fault: array fill count is negative (section 5.2)");
                 }
                 const data = try self.allocateHeapArray(wide, element_layout.size);
                 const fill_value = try self.evalExpression(array_fill.value);
@@ -1525,7 +1511,7 @@ pub const Codegen = struct {
                 if (!self.release_mode) {
                     const ordered = try self.freshTemp();
                     try self.instruction("{s} = icmp sle i64 {s}, {s}", .{ ordered, start_wide, end_wide });
-                    try self.faultUnless(ordered, "runtime fault: the range end is below its start (section 4.3)");
+                    try self.faultUnless(ordered, "runtime fault: the range end is below its start (section 5.3)");
                 }
                 const length = try self.freshTemp();
                 try self.instruction("{s} = sub i64 {s}, {s}", .{ length, end_wide, start_wide });
@@ -1586,7 +1572,7 @@ pub const Codegen = struct {
     }
 
     // malloc(8 + length * stride): the length lands in the prefix and the
-    // returned pointer addresses the first element (section 4.2)
+    // returned pointer addresses the first element (section 5.2)
     fn allocateHeapArray(self: *Codegen, length: []const u8, stride: u64) Error![]const u8 {
         const data_size = try self.freshTemp();
         try self.instruction("{s} = mul i64 {s}, {d}", .{ data_size, length, stride });
@@ -1647,7 +1633,7 @@ pub const Codegen = struct {
         const right_recorded = try self.typeOf(binary.right);
         const left_type = try self.resolvedOf(left_recorded);
         const right_type = try self.resolvedOf(right_recorded);
-        // an untyped literal adopts the typed side (section 3.3 rule 2)
+        // an untyped literal adopts the typed side (section 4.3 rule 2)
         const operand_type = operand: {
             if (isUntyped(left_recorded) and !isUntyped(right_recorded)) break :operand right_type;
             if (isUntyped(right_recorded) and !isUntyped(left_recorded)) break :operand left_type;
@@ -1669,7 +1655,7 @@ pub const Codegen = struct {
         }
     }
 
-    // logical operators short-circuit (section 4.1) through a result slot
+    // logical operators short-circuit (section 5.1) through a result slot
     fn evalShortCircuit(self: *Codegen, binary: anytype) Error!Operand {
         const slot = try self.scalarSlot("i1");
         const left = try self.evalExpression(binary.left);
@@ -1765,14 +1751,14 @@ pub const Codegen = struct {
                 try self.instruction("{s} = extractvalue {{ {s}, i1 }} {s}, 1", .{ overflowed, llvm, pair });
                 const safe = try self.freshTemp();
                 try self.instruction("{s} = xor i1 {s}, true", .{ safe, overflowed });
-                try self.faultUnless(safe, "runtime fault: integer overflow (section 4.2)");
+                try self.faultUnless(safe, "runtime fault: integer overflow (section 5.2)");
                 return .{ .text = value, .llvm = llvm };
             },
             .slash, .percent => {
-                // division by zero faults in every build mode (section 4.2)
+                // division by zero faults in every build mode (section 5.2)
                 const nonzero = try self.freshTemp();
                 try self.instruction("{s} = icmp ne {s} {s}, 0", .{ nonzero, llvm, right.text });
-                try self.faultUnless(nonzero, "runtime fault: division by zero (section 4.2)");
+                try self.faultUnless(nonzero, "runtime fault: division by zero (section 5.2)");
                 if (signed and !self.release_mode) {
                     const minimum = try self.freshTemp();
                     try self.instruction("{s} = icmp eq {s} {s}, {d}", .{ minimum, llvm, left.text, signedMinimum(primitive) });
@@ -1782,7 +1768,7 @@ pub const Codegen = struct {
                     try self.instruction("{s} = and i1 {s}, {s}", .{ overflow, minimum, negative_one });
                     const safe = try self.freshTemp();
                     try self.instruction("{s} = xor i1 {s}, true", .{ safe, overflow });
-                    try self.faultUnless(safe, "runtime fault: integer overflow (section 4.2)");
+                    try self.faultUnless(safe, "runtime fault: integer overflow (section 5.2)");
                 }
                 const opcode: []const u8 = if (operator == .slash)
                     (if (signed) "sdiv" else "udiv")
@@ -1796,7 +1782,7 @@ pub const Codegen = struct {
                 if (!self.release_mode) {
                     const in_range = try self.freshTemp();
                     try self.instruction("{s} = icmp ult {s} {s}, {d}", .{ in_range, llvm, right.text, primitive.width() * 8 });
-                    try self.faultUnless(in_range, "runtime fault: shift amount out of range (section 4.2)");
+                    try self.faultUnless(in_range, "runtime fault: shift amount out of range (section 5.2)");
                 }
                 const opcode: []const u8 = if (operator == .shift_left)
                     "shl"
@@ -1857,15 +1843,21 @@ pub const Codegen = struct {
                     break :place Place{ .pointer = memory.pointer, .value_type = operand_type };
                 };
                 // an interface-object subject tests its concrete type
-                // identity (section 3.2)
+                // identity (section 4.2)
                 if (try self.interfaceOfPlace(place)) |_| {
                     const descriptor = try self.downcastDescriptor(cast.target, span);
                     const type_id = try self.loadPointerField(place.pointer, 8);
                     const result = try self.freshTemp();
                     try self.instruction("{s} = icmp eq ptr {s}, @\"{s}\"", .{ result, type_id, descriptor.name });
                     if (cast.capture) |capture| {
-                        const data = try self.loadPointerField(place.pointer, 0);
-                        try self.emitInlineCaptureBind(capture, result, data, descriptor.concrete, true, span);
+                        if (captureMode(capture) == .owning) {
+                            // '|move c|' takes the object's owning data
+                            // pointer out of the fat pair (section 4.2)
+                            try self.emitInlineCaptureBind(capture, result, place.pointer, try self.owningPointerType(descriptor.concrete), false, span);
+                        } else {
+                            const data = try self.loadPointerField(place.pointer, 0);
+                            try self.emitInlineCaptureBind(capture, result, data, descriptor.concrete, true, span);
+                        }
                     }
                     return .{ .scalar = .{ .text = result, .llvm = "i1" } };
                 }
@@ -1919,7 +1911,7 @@ pub const Codegen = struct {
         return .{ .text = result, .llvm = target_llvm };
     }
 
-    // 'as' between same-width primitives reuses the bits (section 3.5)
+    // 'as' between same-width primitives reuses the bits (section 4.5)
     fn reinterpretPrimitive(self: *Codegen, operand: Scalar, origin: types.Primitive, target: types.Primitive) Error!Scalar {
         const target_llvm = scalarTypeText(target);
         if (std.mem.eql(u8, operand.llvm, target_llvm)) return .{ .text = operand.text, .llvm = target_llvm };
@@ -1936,7 +1928,7 @@ pub const Codegen = struct {
         return .{ .text = result, .llvm = target_llvm };
     }
 
-    // a shaped 'as' (section 3.5) reads the same bytes as the target type;
+    // a shaped 'as' (section 4.5) reads the same bytes as the target type;
     // checked builds verify a reinterpreted enum tag still names a variant
     fn reinterpretShaped(self: *Codegen, expression: *const ast.Expression, operand_expression: *const ast.Expression, shapes: types.CastShapes, span: Token.Location) Error!Operand {
         const operand = try self.evalExpression(operand_expression);
@@ -1949,7 +1941,7 @@ pub const Codegen = struct {
             const tag = try self.loadTag(memory.pointer, frame);
             const valid = try self.freshTemp();
             try self.instruction("{s} = icmp ult {s} {s}, {d}", .{ valid, tagTypeText(frame.tag_size), tag, frame.variants.len });
-            try self.faultUnless(valid, "runtime fault: 'as' produced a tag that names no variant (section 3.5)");
+            try self.faultUnless(valid, "runtime fault: 'as' produced a tag that names no variant (section 4.5)");
         }
         switch (try self.classify(target_type, span)) {
             .void_class => return .none,
@@ -1969,7 +1961,7 @@ pub const Codegen = struct {
             return self.enumConstruction(expression, callee.implied_variant.slice(self.source()), call.arguments);
         }
         if (self.call_targets.get(expression)) |symbol| {
-            // std::process::arguments is compiler-provided (section 5.1a):
+            // std::process::arguments is compiler-provided (section 6.1a):
             // the main wrapper captured argv as slices at startup
             if (symbol.definition.kind == .fn_def and self.processArgumentsLangItem(symbol)) {
                 const data = try self.freshTemp();
@@ -1997,14 +1989,14 @@ pub const Codegen = struct {
                 return self.lengthCall(callee.member.object, span);
             }
             // a call through a generic constraint has no static target
-            // (the checker typed it against the interface, section 5.2);
+            // (the checker typed it against the interface, section 6.2);
             // the monomorphized receiver resolves the extension here
             if (try self.constraintCallTarget(expression, callee.member)) |symbol| {
                 return self.callFunction(expression, symbol, callee);
             }
             // the receiver place evaluates exactly once: a second walk
             // would re-run subscript side effects; a temporary receiver
-            // materializes and drops after the call (section 4.5)
+            // materializes and drops after the call (section 5.5)
             var receiver_cleanup: ?Place = null;
             const object_place = (try self.evalPlace(callee.member.object)) orelse object: {
                 const value = try self.evalExpression(callee.member.object);
@@ -2016,8 +2008,8 @@ pub const Codegen = struct {
                 break :object try self.piercePlace(.{ .pointer = memory.pointer, .value_type = object_type });
             };
             // a call with no static target dispatches at runtime through
-            // the interface object's type identity (section 5.2), or calls
-            // through a function-typed field (section 4.4)
+            // the interface object's type identity (section 6.2), or calls
+            // through a function-typed field (section 5.4)
             const result = if (try self.interfaceOfPlace(object_place)) |interface|
                 try self.interfaceDispatch(expression, callee.member, object_place, interface)
             else result: {
@@ -2042,7 +2034,7 @@ pub const Codegen = struct {
             return result;
         }
         // a function-typed place (a local) calls indirectly through its
-        // closure block (section 4.4)
+        // closure block (section 5.4)
         if (try self.evalPlace(callee)) |place| {
             if ((try self.resolvedOf(place.value_type)).* == .function) {
                 return self.indirectCall(expression, place);
@@ -2052,7 +2044,7 @@ pub const Codegen = struct {
         const callee_type = try self.resolvedOf(try self.typeOf(callee));
         if (callee_type.* == .function) {
             // an immediately invoked function value: a fresh closure drops
-            // once the call returns (section 4.2)
+            // once the call returns (section 5.2)
             const operand = try self.evalExpression(callee);
             const memory = try self.ensureMemory(operand, try self.typeOf(callee), span);
             const result = try self.indirectCall(expression, .{ .pointer = memory.pointer, .value_type = try self.typeOf(callee) });
@@ -2065,7 +2057,7 @@ pub const Codegen = struct {
         return self.report(span, "this call form is not yet supported by native code generation", .{});
     }
 
-    // '.length()' on the built-in array forms (section 5.1); the checker
+    // '.length()' on the built-in array forms (section 6.1); the checker
     // resolves this receiver without recording its type, so the place's
     // binding type is the source of truth
     fn lengthCall(self: *Codegen, object: *const ast.Expression, span: Token.Location) Error!Operand {
@@ -2122,7 +2114,7 @@ pub const Codegen = struct {
 
     // resolves a member call whose receiver the checker typed as a
     // constrained type parameter: the target only exists per instance,
-    // where the current bindings make the receiver concrete (section 5.2)
+    // where the current bindings make the receiver concrete (section 6.2)
     fn constraintCallTarget(self: *Codegen, expression: *const ast.Expression, member: anytype) Error!?resolution.Symbol {
         const object = unwrapGrouped(member.object);
         const recorded = self.checker.expression_types.get(object) orelse local: {
@@ -2149,7 +2141,7 @@ pub const Codegen = struct {
     fn callFunction(self: *Codegen, expression: *const ast.Expression, symbol: resolution.Symbol, callee: *const ast.Expression) Error!Operand {
         const call = expression.call;
         const span = self.spanOf(expression);
-        // the call site's inferred bindings (section 3.7) substitute through
+        // the call site's inferred bindings (section 4.7) substitute through
         // the caller's own bindings, so nested generics chain concretely
         // a constraint-dispatched call resolved per instance overrides the
         // checker's recorded (generic) bindings; instances emit one at a
@@ -2180,7 +2172,7 @@ pub const Codegen = struct {
             if (self_type.* == .reference) {
                 const place = (try self.evalPlace(callee.member.object)) orelse place: {
                     // a temporary receiver materializes for the call's
-                    // duration and drops afterwards (section 4.5)
+                    // duration and drops afterwards (section 5.5)
                     const value = try self.evalExpression(callee.member.object);
                     const object_type = try self.typeOf(callee.member.object);
                     const memory = try self.ensureMemory(value, object_type, span);
@@ -2192,7 +2184,7 @@ pub const Codegen = struct {
                 try lowered.append(self.arena, try std.fmt.allocPrint(self.arena, "ptr {s}", .{place.pointer}));
             } else {
                 // a by-value or pointer 'self' follows parameter semantics
-                // (section 4.5): the callee owns it
+                // (section 5.5): the callee owns it
                 const value = try self.evalExpression(callee.member.object);
                 const coerced = try self.coerceOperand(value, try self.typeOf(callee.member.object), info.parameter_types[0], span);
                 try lowered.append(self.arena, try self.lowerArgument(coerced, info.parameter_types[0], span));
@@ -2244,7 +2236,7 @@ pub const Codegen = struct {
             .aggregate => |layout| {
                 const memory = try self.ensureMemory(operand, parameter_type, span);
                 // a by-value parameter owns its copy and drops it at the
-                // callee's scope end (section 4.2): a place-backed owning
+                // callee's scope end (section 5.2): a place-backed owning
                 // argument clones, a temporary transfers
                 if (!memory.fresh and try self.ownsHeap(parameter_type, 0)) {
                     const slot = try self.aggregateSlot(layout);
@@ -2298,7 +2290,7 @@ pub const Codegen = struct {
     }
 
     // a slice argument decays to its data pointer at the extern boundary
-    // (section 5.3)
+    // (section 6.3)
     fn lowerExternArgument(self: *Codegen, operand: Operand, parameter_type: *const Type, span: Token.Location) Error![]const u8 {
         const resolved = try self.resolvedOf(parameter_type);
         if (resolved.* == .slice) {
@@ -2348,7 +2340,7 @@ pub const Codegen = struct {
     }
 
     // a closure is a heap block: the call, drop, and copy function pointers
-    // head the block, the captured environment follows (section 4.4)
+    // head the block, the captured environment follows (section 5.4)
     const closure_header_size: u64 = 24;
 
     const ClosureCapture = struct {
@@ -2378,7 +2370,7 @@ pub const Codegen = struct {
             if (try self.unsupportedReason(binding_type, 0)) |reason| {
                 return self.report(capture.name.location, "{s} are not yet supported by native code generation", .{reason});
             }
-            // the mode mirrors the checker's captureBinding (section 2.1):
+            // the mode mirrors the checker's captureBinding (section 3.1):
             // a prefix modifier borrows or takes ownership; an annotation
             // borrows only when the checker typed it as a reference, and
             // otherwise deep-copies (an annotation like '&[u8]' names a
@@ -2448,12 +2440,12 @@ pub const Codegen = struct {
         try self.instruction("store ptr @\"{s}\", ptr {s}", .{ copy_name, copy_slot });
 
         // capture values come from the enclosing scope at construction
-        // (section 4.4): copies clone, references alias the place, owning
+        // (section 5.4): copies clone, references alias the place, owning
         // captures take the owning value and null its source
         for (shape.captures) |closure_capture| {
             const capture_name = closure_capture.capture.name.slice(self.source());
             const local = self.lookupLocal(capture_name) orelse
-                return self.report(closure_capture.capture.name.location, "a capture must name a local variable (section 4.4)", .{});
+                return self.report(closure_capture.capture.name.location, "a capture must name a local variable (section 5.4)", .{});
             const raw = Place{ .pointer = local.pointer, .value_type = local.declared_type };
             const environment_slot = try self.byteOffset(block, closure_capture.offset);
             switch (closure_capture.mode) {
@@ -2470,7 +2462,7 @@ pub const Codegen = struct {
                 .owning => {
                     // the whole owning value transfers (a thin pointer or
                     // an interface fat pair); nulling the leading pointer
-                    // marks the source moved-from (section 4.2)
+                    // marks the source moved-from (section 5.2)
                     try self.copyBytes(environment_slot, raw.pointer, closure_capture.layout.size);
                     try self.instruction("store ptr null, ptr {s}", .{raw.pointer});
                 },
@@ -2570,7 +2562,7 @@ pub const Codegen = struct {
 
     // a named function used as a value: a constant block whose null drop
     // and copy slots mark it static, with a thunk absorbing the closure
-    // argument (section 4.4); the checker recorded exactly which symbol
+    // argument (section 5.4); the checker recorded exactly which symbol
     // this path resolved to
     fn functionValue(self: *Codegen, expression: *const ast.Expression) Error!Operand {
         const span = self.spanOf(expression);
@@ -2649,7 +2641,7 @@ pub const Codegen = struct {
         if (!self.release_mode) {
             const live = try self.freshTemp();
             try self.instruction("{s} = icmp ne ptr {s}, null", .{ live, block });
-            try self.faultUnless(live, "runtime fault: call through an absent function value (section 4.4)");
+            try self.faultUnless(live, "runtime fault: call through an absent function value (section 5.4)");
         }
         const call_pointer = try self.freshTemp();
         try self.instruction("{s} = load ptr, ptr {s}", .{ call_pointer, block });
@@ -2702,7 +2694,7 @@ pub const Codegen = struct {
         const resolved = try self.resolvedOf(try self.typeOf(expression));
         if (resolved.* == .slice and elements.len == 0) {
             // '[]' in slice position: the canonical empty view - null
-            // data pointer, zero length (section 3.2)
+            // data pointer, zero length (section 4.2)
             const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
             try self.zeroFill(pair, 16);
             return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
@@ -2753,7 +2745,7 @@ pub const Codegen = struct {
         drop_after: bool,
     };
 
-    // every element of a fill owns its own deep copy (section 5.1): an
+    // every element of a fill owns its own deep copy (section 6.1): an
     // owning fill value is pinned as a non-fresh memory operand so each
     // element store clones instead of aliasing one allocation
     fn fillSource(self: *Codegen, operand: Operand, element_type: *const Type, span: Token.Location) Error!FillSource {
@@ -2881,6 +2873,35 @@ pub const Codegen = struct {
         }
     }
 
+    // 'yield value', explicit or the implicit yield of a bare-expression
+    // branch: store into the innermost value construct's slot and leave
+    fn emitYield(self: *Codegen, value_expression: *const ast.Expression, span: Token.Location) Error!void {
+        const target = if (self.yield_targets.items.len != 0)
+            self.yield_targets.items[self.yield_targets.items.len - 1]
+        else
+            return self.report(span, "'yield' outside an if, match, or loop used as a value", .{});
+        const value = try self.evalExpression(value_expression);
+        if (target.slot) |slot| {
+            var coerced = try self.coerceOperand(value, try self.typeOf(value_expression), slot.value_type, span);
+            coerced = try self.copyOwnedScalarRead(value_expression, coerced, span);
+            try self.storeOperand(slot.pointer, coerced, slot.value_type, span);
+        } else {
+            try self.dropDiscarded(value, try self.typeOf(value_expression), span);
+        }
+        try self.emitDropsDownTo(target.frame_depth, null);
+        try self.instruction("br label %{s}", .{target.exit_label});
+        self.terminated = true;
+    }
+
+    // a branch or arm of a value construct: a bare expression yields
+    // implicitly, a block runs as a statement (section 3.1)
+    fn execBranch(self: *Codegen, branch: *const ast.Statement, as_value: bool) Error!void {
+        if (as_value and branch.* == .expression) {
+            return self.emitYield(branch.expression, self.spanOf(branch.expression));
+        }
+        return self.execStatement(branch);
+    }
+
     fn evalIf(self: *Codegen, expression: *const ast.Expression, if_expr: ast.IfExpression) Error!Operand {
         const span = self.spanOf(expression);
         const slot = try self.resultSlot(expression);
@@ -2903,7 +2924,7 @@ pub const Codegen = struct {
         }
         try self.startBlock(then_label);
         try self.pushFrame();
-        try self.execStatement(if_expr.then_branch);
+        try self.execBranch(if_expr.then_branch, slot != null);
         try self.closeFrame();
         if (!self.terminated) {
             try self.instruction("br label %{s}", .{exit_label});
@@ -2912,7 +2933,7 @@ pub const Codegen = struct {
         if (if_expr.else_branch) |else_branch| {
             try self.startBlock(else_label.?);
             try self.pushFrame();
-            try self.execStatement(else_branch);
+            try self.execBranch(else_branch, slot != null);
             try self.closeFrame();
             if (!self.terminated) {
                 try self.instruction("br label %{s}", .{exit_label});
@@ -2936,12 +2957,18 @@ pub const Codegen = struct {
         const target_type = try self.checker.typeFromExpressionIn(target, self.current_bindings orelse &empty_type_environment, self.current_view);
         const resolved = try self.resolvedOf(target_type);
         if (resolved.* != .declared) {
-            return self.report(span, "a downcast target must be a named type (section 3.2)", .{});
+            return self.report(span, "a downcast target must be a named type (section 4.2)", .{});
         }
         return .{
             .name = try self.typeDescriptor(resolved.declared.definition),
             .concrete = resolved,
         };
+    }
+
+    fn owningPointerType(self: *Codegen, child_type: *const Type) Error!*const Type {
+        const pointer_type = try self.arena.create(Type);
+        pointer_type.* = .{ .pointer = .{ .mutable = true, .child = child_type } };
+        return pointer_type;
     }
 
     fn bindBorrowed(self: *Codegen, name: []const u8, pointer_value: []const u8, child_type: *const Type) Error!void {
@@ -2955,7 +2982,7 @@ pub const Codegen = struct {
     // 'x is ::Variant |v|': the binding slot allocates and zeroes at
     // function entry (a moved-from state, so scope-end drops are safe on
     // every path), re-zeroes per evaluation for loop re-binding, and
-    // fills only on the matched path (section 3.2)
+    // fills only on the matched path (section 4.2)
     fn emitInlineCaptureBind(self: *Codegen, capture: ast.Capture, matches: []const u8, payload_pointer: []const u8, payload_type: *const Type, borrowed: bool, span: Token.Location) Error!void {
         const name = capture.name.slice(self.source());
         const mode = captureMode(capture);
@@ -3009,7 +3036,7 @@ pub const Codegen = struct {
             .owning => {
                 const resolved = try self.resolvedOf(payload_type);
                 if (resolved.* != .pointer and resolved.* != .heap_array) {
-                    return self.report(span, "an owning capture needs a pointer payload (section 2.1)", .{});
+                    return self.report(span, "an owning capture needs a pointer payload (section 3.1)", .{});
                 }
                 const layout = (try self.layoutQuery(payload_type, 0)) orelse
                     return self.report(span, "this payload type has no defined layout", .{});
@@ -3080,6 +3107,9 @@ pub const Codegen = struct {
         // 'break' also drops the condition-capture frame, so the target
         // records the depth outside it
         try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // a value loop also receives 'yield' from its body and its else
+        // (section 5.3)
+        if (slot != null) try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         try self.startBlock(header);
         // condition captures re-bind each iteration: their bind sites drop
         // and re-zero the slots, and the frame closes on the exit path
@@ -3097,12 +3127,15 @@ pub const Codegen = struct {
         }
         try self.startBlock(after);
         try self.closeFrame();
+        // a 'break' inside the else belongs to an outer loop; a 'yield'
+        // there produces this loop's value (section 5.3)
+        _ = self.break_targets.pop();
         if (while_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
             try self.closeFrame();
         }
-        _ = self.break_targets.pop();
+        if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit);
         return self.slotOperand(slot, span);
     }
@@ -3121,7 +3154,7 @@ pub const Codegen = struct {
     };
 
     // array forms and ranges lower to a counting loop; any other single
-    // subject drives the cursor protocol (section 4.3)
+    // subject drives the cursor protocol (section 5.3)
     fn evalFor(self: *Codegen, expression: *const ast.Expression, for_expr: ast.ForExpression) Error!Operand {
         const span = self.spanOf(expression);
         if (for_expr.subjects.len == 1 and for_expr.subjects[0].* != .array_range) {
@@ -3144,7 +3177,7 @@ pub const Codegen = struct {
             for (subjects.items[1..]) |subject| {
                 const equal = try self.freshTemp();
                 try self.instruction("{s} = icmp eq i64 {s}, {s}", .{ equal, subjects.items[0].length, subject.length });
-                try self.faultUnless(equal, "runtime fault: for subjects disagree on length (section 4.3)");
+                try self.faultUnless(equal, "runtime fault: for subjects disagree on length (section 5.3)");
             }
         }
         const index_slot = try self.scalarSlot("i64");
@@ -3161,6 +3194,9 @@ pub const Codegen = struct {
         try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ continues, body, after });
         self.terminated = true;
         try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // a value loop also receives 'yield' from its body and its else
+        // (section 5.3)
+        if (slot != null) try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         try self.startBlock(body);
         try self.pushFrame();
         const capture_count = @min(for_expr.captures.len, subjects.items.len);
@@ -3201,12 +3237,13 @@ pub const Codegen = struct {
         try self.instruction("br label %{s}", .{header});
         self.terminated = true;
         try self.startBlock(after);
+        _ = self.break_targets.pop();
         if (for_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
             try self.closeFrame();
         }
-        _ = self.break_targets.pop();
+        if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit);
         // both the break path and the normal path pass through the exit
         // block, so the loop frame drops exactly once here
@@ -3214,13 +3251,13 @@ pub const Codegen = struct {
         return self.slotOperand(slot, span);
     }
 
-    // the cursor protocol (section 4.3): 'subject.iterator()' yields a
+    // the cursor protocol (section 5.3): 'subject.iterator()' yields a
     // cursor advanced by 'next()' until it reports 'None'
     fn evalForCursor(self: *Codegen, expression: *const ast.Expression, for_expr: ast.ForExpression, subject_type: *const Type) Error!Operand {
         const span = self.spanOf(expression);
         const slot = try self.resultSlot(expression);
         const protocol = (try self.checker.cursorProtocolOf(subject_type)) orelse
-            return self.report(span, "this subject is not iterable: provide 'iterator()' and 'next()' extension functions (section 4.3)", .{});
+            return self.report(span, "this subject is not iterable: provide 'iterator()' and 'next()' extension functions (section 5.3)", .{});
         // the loop frame owns the cursor state and any materialized
         // subject temporary: 'break' leaves it intact and it drops once
         // at the shared exit block; 'return' unwinds it like any frame
@@ -3240,7 +3277,7 @@ pub const Codegen = struct {
         const iterator_info = try self.functionInfo(protocol.iterator, span, protocol.iterator_bindings);
         const cursor_type = iterator_info.return_type;
         const cursor_slot = switch (try self.classify(cursor_type, span)) {
-            .void_class => return self.report(span, "'iterator()' must yield a cursor value (section 4.3)", .{}),
+            .void_class => return self.report(span, "'iterator()' must yield a cursor value (section 5.3)", .{}),
             .scalar => |llvm| try self.scalarSlot(llvm),
             .aggregate => |layout| try self.aggregateSlot(layout),
         };
@@ -3272,11 +3309,11 @@ pub const Codegen = struct {
 
         const next_info = try self.functionInfo(protocol.next, span, protocol.next_bindings);
         if ((try self.resolvedOf(next_info.parameter_types[0])).* != .reference) {
-            return self.report(span, "'next()' must take its cursor by reference (section 4.3)", .{});
+            return self.report(span, "'next()' must take its cursor by reference (section 5.3)", .{});
         }
         const option_type = next_info.return_type;
         const frame = (try self.enumFrameQuery(option_type)) orelse
-            return self.report(span, "'next()' must yield an 'Option' value (section 4.3)", .{});
+            return self.report(span, "'next()' must yield an 'Option' value (section 5.3)", .{});
         const some_index = try self.variantIndex(frame, "Some", span);
         const option_slot = try self.aggregateSlot(frame.layout);
         const option_owns = try self.ownsHeap(option_type, 0);
@@ -3291,6 +3328,9 @@ pub const Codegen = struct {
         const after = try self.freshLabel("cursor.after");
         const exit = try self.freshLabel("cursor.exit");
         try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // a value loop also receives 'yield' from its body and its else
+        // (section 5.3)
+        if (slot != null) try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         try self.startBlock(header);
         try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ next_info.name, option_slot, cursor_slot });
         const tag = try self.loadTag(option_slot, frame);
@@ -3320,12 +3360,13 @@ pub const Codegen = struct {
             self.terminated = true;
         }
         try self.startBlock(after);
+        _ = self.break_targets.pop();
         if (for_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
             try self.closeFrame();
         }
-        _ = self.break_targets.pop();
+        if (slot != null) _ = self.yield_targets.pop();
         try self.startBlock(exit);
         // both the break path and the normal path pass through the exit
         // block, so the loop frame drops exactly once here
@@ -3350,11 +3391,11 @@ pub const Codegen = struct {
             if (!self.release_mode) {
                 const ordered = try self.freshTemp();
                 try self.instruction("{s} = icmp sle i64 {s}, {s}", .{ ordered, start_wide, end_wide });
-                try self.faultUnless(ordered, "runtime fault: the range end is below its start (section 4.3)");
+                try self.faultUnless(ordered, "runtime fault: the range end is below its start (section 5.3)");
             }
             const length = try self.freshTemp();
             try self.instruction("{s} = sub i64 {s}, {s}", .{ length, end_wide, start_wide });
-            // a range subject never materializes (section 4.3), so the
+            // a range subject never materializes (section 5.3), so the
             // checker records no type for it; the counter is an i32
             const capture_type: *const Type = capture: {
                 const recorded = self.expression_types.get(subject_expression) orelse break :capture &integer_type;
@@ -3369,7 +3410,7 @@ pub const Codegen = struct {
             const value = try self.evalExpression(subject_expression);
             const memory = try self.ensureMemory(value, subject_type, span);
             // a fresh owning temporary joins the loop frame, which drops
-            // it on every exit path (section 4.2)
+            // it on every exit path (section 5.2)
             if (memory.fresh and try self.ownsHeap(subject_type, 0)) {
                 try self.bindLocal("", memory.pointer, subject_type);
             }
@@ -3426,7 +3467,7 @@ pub const Codegen = struct {
         integer: Scalar,
         bytes: ByteView,
         // an interface object matches arms naming its concrete type
-        interface_object: struct { data: []const u8, type_id: []const u8 },
+        interface_object: struct { data: []const u8, type_id: []const u8, pair: []const u8 },
     };
 
     fn evalMatch(self: *Codegen, expression: *const ast.Expression, match_expr: ast.MatchExpression) Error!Operand {
@@ -3467,6 +3508,7 @@ pub const Codegen = struct {
                         break :subject .{ .interface_object = .{
                             .data = try self.loadPointerField(place.pointer, 0),
                             .type_id = try self.loadPointerField(place.pointer, 8),
+                            .pair = place.pointer,
                         } };
                     }
                     return self.report(span, "matching on this subject is not yet supported by native code generation", .{});
@@ -3475,7 +3517,7 @@ pub const Codegen = struct {
             }
         };
 
-        // only a value-position match receives 'yield' (section 4.3)
+        // only a value-position match receives 'yield' (section 5.3)
         if (slot != null) {
             try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         }
@@ -3543,20 +3585,25 @@ pub const Codegen = struct {
                         }
                     },
                     .interface_object => |object| {
-                        // the arm borrows the concrete value (section 4.3)
+                        // the arm borrows the concrete value, or takes the
+                        // owning data pointer out with '|move c|' (section 4.2)
                         if (arm.pattern) |pattern| {
                             const descriptor = try self.patternDescriptor(pattern);
-                            try self.bindBorrowed(capture.name.slice(self.source()), object.data, descriptor.concrete);
+                            if (captureMode(capture) == .owning) {
+                                try self.bindCapture(capture, object.pair, try self.owningPointerType(descriptor.concrete), span);
+                            } else {
+                                try self.bindBorrowed(capture.name.slice(self.source()), object.data, descriptor.concrete);
+                            }
                         }
                     },
                     else => return self.report(span, "a capture needs an enum or interface-object subject", .{}),
                 }
             }
-            try self.execStatement(arm.body);
+            try self.execBranch(arm.body, slot != null);
             try self.closeFrame();
             if (!self.terminated) {
                 // an arm that completes without 'break' runs the external
-                // else (section 4.3)
+                // else (section 5.3)
                 try self.instruction("br label %{s}", .{arm_complete});
                 self.terminated = true;
             }
@@ -3591,7 +3638,7 @@ pub const Codegen = struct {
         };
     }
 
-    // unqualified visibility from one view (section 5.4): own library plus
+    // unqualified visibility from one view (section 6.4): own library plus
     // the 'exp' symbols of libraries the view imported without an alias,
     // mirroring the checker's rule
     fn firstVisible(self: *const Codegen, name: []const u8, view_index: usize) ?resolution.Symbol {
@@ -3605,13 +3652,13 @@ pub const Codegen = struct {
         return null;
     }
 
-    // an interface-object arm names a concrete type (section 4.3); the
+    // an interface-object arm names a concrete type (section 5.3); the
     // checker recorded which definition the pattern resolved to
     fn patternDescriptor(self: *Codegen, pattern: *const ast.Expression) Error!Descriptor {
         const span = self.spanOf(pattern);
         const unwrapped = unwrapGrouped(pattern);
         if (unwrapped.* != .path) {
-            return self.report(span, "this arm must name a concrete type (section 4.3)", .{});
+            return self.report(span, "this arm must name a concrete type (section 5.3)", .{});
         }
         const name = unwrapped.path[unwrapped.path.len - 1].slice(self.source());
         if (self.checker.type_targets.get(pattern)) |target| {
@@ -3637,7 +3684,7 @@ pub const Codegen = struct {
 
     const ByteView = HeapArrayView;
 
-    // the byte sequence behind any string-like subject (section 4.3)
+    // the byte sequence behind any string-like subject (section 5.3)
     fn byteViewOf(self: *Codegen, expression: *const ast.Expression) Error!ByteView {
         const span = self.spanOf(expression);
         const value_type = try self.typeOf(expression);
@@ -3661,7 +3708,7 @@ pub const Codegen = struct {
         }
     }
 
-    // strings compare by length, then content through memcmp (section 4.3)
+    // strings compare by length, then content through memcmp (section 5.3)
     fn bytesMatch(self: *Codegen, subject: ByteView, pattern: *const ast.Expression) Error![]const u8 {
         if (!self.extern_declarations.contains("memcmp")) {
             try self.extern_declarations.put(self.arena, "memcmp", "declare i32 @\"memcmp\"(ptr, ptr, i64)");
@@ -3685,14 +3732,14 @@ pub const Codegen = struct {
         return self.loadScalar(slot, "i1");
     }
 
-    // capture typing (section 2.1): deep copy by default, '&' borrows the
+    // capture typing (section 3.1): deep copy by default, '&' borrows the
     // payload in place; owning captures need heap support
     fn bindCapture(self: *Codegen, capture: ast.Capture, payload_pointer: []const u8, payload_type: *const Type, span: Token.Location) Error!void {
         const name = capture.name.slice(self.source());
         switch (captureMode(capture)) {
             .copy => {
                 // a copy capture deep-copies an owning payload, so the
-                // binding and the subject own separate heap (section 2.1)
+                // binding and the subject own separate heap (section 3.1)
                 const owns = try self.ownsHeap(payload_type, 0);
                 const slot = switch (try self.classify(payload_type, span)) {
                     .void_class => return,
@@ -3719,11 +3766,11 @@ pub const Codegen = struct {
             .reference => try self.bindBorrowed(name, payload_pointer, payload_type),
             .owning => {
                 // an owning capture takes the owning payload out, leaving
-                // the source moved-from (section 2.1); an interface fat
-                // pair moves whole, its data half nulled (section 5.2)
+                // the source moved-from (section 3.1); an interface fat
+                // pair moves whole, its data half nulled (section 6.2)
                 const resolved = try self.resolvedOf(payload_type);
                 if (resolved.* != .pointer and resolved.* != .heap_array) {
-                    return self.report(span, "an owning capture needs a pointer payload (section 2.1)", .{});
+                    return self.report(span, "an owning capture needs a pointer payload (section 3.1)", .{});
                 }
                 const layout = (try self.layoutQuery(payload_type, 0)) orelse
                     return self.report(span, "this payload type has no defined layout", .{});
@@ -3762,7 +3809,7 @@ pub const Codegen = struct {
             .void_type, .unknown => .void_class,
             .primitive => |primitive| .{ .scalar = scalarTypeText(primitive) },
             .reference, .pointer => |indirection| {
-                // an interface object is the fat pair itself (section 3.2)
+                // an interface object is the fat pair itself (section 4.2)
                 if ((try self.resolvedOf(indirection.child)).* == .interface) {
                     return .{ .aggregate = .{ .size = 16, .alignment = 8 } };
                 }
@@ -3772,7 +3819,7 @@ pub const Codegen = struct {
             // a function value is one block pointer, but it OWNS the block:
             // classifying it as an 8-byte aggregate routes every consumer
             // through the memory machinery, whose clone-versus-transfer
-            // rules already handle ownership (section 4.2)
+            // rules already handle ownership (section 5.2)
             .function => .{ .aggregate = .{ .size = 8, .alignment = 8 } },
             else => {
                 const layout = (try self.layoutQuery(resolved, 0)) orelse
@@ -3811,13 +3858,13 @@ pub const Codegen = struct {
     }
 
     // a value owns heap when it is a pointer or heap array, or transitively
-    // contains an owning member, element, or variant payload (section 4.2)
+    // contains an owning member, element, or variant payload (section 5.2)
     fn ownsHeap(self: *Codegen, candidate: *const Type, depth: usize) Error!bool {
         if (depth > 16) return false;
         const resolved = try self.resolvedOf(candidate);
         switch (resolved.*) {
             .pointer, .heap_array => return true,
-            // a closure owns its captured environment (section 4.2)
+            // a closure owns its captured environment (section 5.2)
             .function => return true,
             .fixed_array => |array| return self.ownsHeap(array.element, depth + 1),
             .structural, .declared, .inline_enum, .structural_enum => {
@@ -3961,7 +4008,7 @@ pub const Codegen = struct {
     }
 
     /// The drop helper for a type: recursively frees the heap owned by the
-    /// value at the given place (section 4.2). Memoized; self-referential
+    /// value at the given place (section 5.2). Memoized; self-referential
     /// types terminate through the memo entry and runtime null checks.
     fn dropHelper(self: *Codegen, candidate: *const Type, span: Token.Location) Error![]const u8 {
         const resolved = try self.resolvedOf(candidate);
@@ -4072,7 +4119,7 @@ pub const Codegen = struct {
     }
 
     /// The deep-copy helper for a type: copies the bytes, then clones every
-    /// owned allocation so the copy owns fresh heap (section 4.2).
+    /// owned allocation so the copy owns fresh heap (section 5.2).
     fn copyHelper(self: *Codegen, candidate: *const Type, span: Token.Location) Error![]const u8 {
         const resolved = try self.resolvedOf(candidate);
         const key = try std.fmt.allocPrint(self.arena, "copy:{s}", .{try self.typeKey(resolved, 0)});
@@ -4299,7 +4346,7 @@ pub const Codegen = struct {
     }
 
     // whether a place holds an interface object: a reference (or pointer)
-    // whose pointee is an interface (section 5.2)
+    // whose pointee is an interface (section 6.2)
     fn interfaceOfPlace(self: *Codegen, place: Place) Error!?Type.Interface {
         const resolved = try self.resolvedOf(place.value_type);
         const child = switch (resolved.*) {
@@ -4384,7 +4431,7 @@ pub const Codegen = struct {
     }
 
     // the interface-object fat pair: the data pointer at offset 0 and the
-    // per-type identity at offset 8 (section 5.2); a generic interface's
+    // per-type identity at offset 8 (section 6.2); a generic interface's
     // identity is per instantiation, a non-generic one stays per
     // definition so downcasts keep matching
     fn interfacePair(self: *Codegen, data_pointer: []const u8, concrete: *const Type, generic_interface: bool) Error!Operand {
@@ -4413,7 +4460,7 @@ pub const Codegen = struct {
 
     // the identity for one concrete instantiation: a generic type gets a
     // descriptor per instantiation, so 'Cursor<u64>' and 'Cursor<u8>'
-    // behind '&Iterator<...>' objects never confuse dispatch (section 5.2)
+    // behind '&Iterator<...>' objects never confuse dispatch (section 6.2)
     fn typeDescriptorFor(self: *Codegen, concrete: *const Type) Error![]const u8 {
         const resolved = try self.resolvedOf(concrete);
         if (resolved.* != .declared) return self.report(.{ .start = 0, .end = 0 }, "internal: an interface object needs a declared concrete type", .{});
@@ -4427,7 +4474,7 @@ pub const Codegen = struct {
         return name;
     }
 
-    // the drop body for an owning interface object '*I' (section 5.2):
+    // the drop body for an owning interface object '*I' (section 6.2):
     // the type identity selects the concrete drop before the data frees,
     // a virtual drop over the closed world of implementers
     fn emitInterfaceDrop(self: *Codegen, interface: Type.Interface, span: Token.Location) Error!void {
@@ -4513,7 +4560,7 @@ pub const Codegen = struct {
     }
 
     // the extension implementing 'name' for the concrete type, mirroring
-    // the interpreter's runtime dispatch by receiver type (section 5.2)
+    // the interpreter's runtime dispatch by receiver type (section 6.2)
     fn findTypeExtension(self: *Codegen, type_definition: *const ast.Definition, name: []const u8) Error!?resolution.Symbol {
         const symbols = self.globals.get(name) orelse return null;
         for (symbols.items) |symbol| {
@@ -4536,7 +4583,7 @@ pub const Codegen = struct {
     }
 
     // the default implementation: an extension whose receiver is the
-    // interface itself (section 5.2)
+    // interface itself (section 6.2)
     fn findInterfaceDefault(self: *Codegen, interface: Type.Interface, name: []const u8) Error!?resolution.Symbol {
         const symbols = self.globals.get(name) orelse return null;
         for (symbols.items) |symbol| {
@@ -4609,12 +4656,12 @@ pub const Codegen = struct {
         }
         if (try self.findInterfaceDefault(interface, name)) |default_symbol| {
             // the default implementation's receiver is the interface
-            // object: the fat pair passes whole (section 5.2)
+            // object: the fat pair passes whole (section 6.2)
             try self.emitDispatchArm(default_symbol, &.{}, "ptr", place.pointer, argument_operands.items, argument_types.items, slot, span);
             try self.instruction("br label %{s}", .{exit});
             self.terminated = true;
         } else {
-            try self.emitFault("runtime fault: no implementation reachable for this interface call (section 5.2)");
+            try self.emitFault("runtime fault: no implementation reachable for this interface call (section 6.2)");
         }
         try self.startBlock(exit);
         return self.slotOperand(slot, span);
@@ -4669,7 +4716,7 @@ pub const Codegen = struct {
         }
         // a reference or pointer to a concrete implementer converts to an
         // interface object: the fat pair carries the data pointer and the
-        // type identity; an owning '*T' yields an owning '*I' (section 5.2)
+        // type identity; an owning '*T' yields an owning '*I' (section 6.2)
         const to_child: ?*const Type = switch (to_resolved.*) {
             .reference => |indirection| indirection.child,
             .pointer => |indirection| indirection.child,
@@ -4685,7 +4732,7 @@ pub const Codegen = struct {
                 const pointee = try self.resolvedOf(child);
                 if (pointee.* == .interface) return operand;
                 if (pointee.* != .declared) {
-                    return self.report(span, "only named types convert to interface objects (section 5.2)", .{});
+                    return self.report(span, "only named types convert to interface objects (section 6.2)", .{});
                 }
                 if (operand != .scalar) {
                     return self.report(span, "internal: this indirection operand has no scalar pointer", .{});
@@ -4757,7 +4804,7 @@ pub const Codegen = struct {
             .memory => |memory| {
                 if (std.mem.eql(u8, pointer, memory.pointer)) return;
                 // a temporary transfers its bits; a place-backed value deep
-                // copies the heap it owns (section 4.2)
+                // copies the heap it owns (section 5.2)
                 if (!memory.fresh and try self.ownsHeap(value_type, 0)) {
                     const helper = try self.copyHelper(value_type, span);
                     try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, pointer, memory.pointer });
@@ -4769,7 +4816,7 @@ pub const Codegen = struct {
         }
     }
 
-    // booleans are 'i1' in registers and one byte in memory (section 3.9)
+    // booleans are 'i1' in registers and one byte in memory (section 4.9)
     fn loadScalar(self: *Codegen, pointer: []const u8, llvm: []const u8) Error![]const u8 {
         if (std.mem.eql(u8, llvm, "i1")) {
             const wide = try self.freshTemp();
@@ -4994,7 +5041,7 @@ pub const Codegen = struct {
         return .{ .line = line, .column = clamped - line_start + 1 };
     }
 
-    // renders a DWARF type for a checked type, mirroring the section 3.9
+    // renders a DWARF type for a checked type, mirroring the section 4.9
     // layouts; null when the type has no meaningful runtime description
     fn debugType(self: *Codegen, candidate: *const Type, depth: usize) Error!?usize {
         if (depth > 8) return null;
@@ -5107,7 +5154,7 @@ pub const Codegen = struct {
                 const id = self.nextMetadata();
                 try self.debug_types.put(self.arena, key, id);
                 // enums render as tag + a union of variant payloads,
-                // mirroring the section 3.9 frame
+                // mirroring the section 4.9 frame
                 if ((self.enumFrameQuery(resolved) catch null) != null) {
                     const frame = (self.enumFrameQuery(resolved) catch null).?;
                     try self.debugEnumType(id, type_name, layout, frame, depth);
@@ -5270,7 +5317,7 @@ pub const Codegen = struct {
         return global;
     }
 
-    // a string literal is a slice over static bytes (section 1.6): the
+    // a string literal is a slice over static bytes (section 2.6): the
     // 16-byte slice header itself lives in a constant
     fn sliceGlobal(self: *Codegen, bytes: []const u8) Error![]const u8 {
         if (self.slice_globals.get(bytes)) |existing| return existing;
@@ -5307,7 +5354,7 @@ pub const Codegen = struct {
         if (frame.debug_scope_pushed) _ = self.debug_scopes.pop();
     }
 
-    // reading an owning place yields a deep copy (section 4.2, no implicit
+    // reading an owning place yields a deep copy (section 5.2, no implicit
     // move): a bare heap-array local flowing out of 'return', 'break', or
     // 'yield' clones its allocation before the scope-end drops free the
     // original; 'move v' transfers explicitly and needs no copy
@@ -5329,7 +5376,7 @@ pub const Codegen = struct {
         return .{ .scalar = .{ .text = try self.loadScalar(copied_slot, "ptr"), .llvm = "ptr" } };
     }
 
-    // scope-end drop (section 4.2): owning locals release their heap when
+    // scope-end drop (section 5.2): owning locals release their heap when
     // the frame closes normally; a terminated frame already dropped on its
     // break or return path
     fn closeFrame(self: *Codegen) Error!void {
@@ -5356,7 +5403,7 @@ pub const Codegen = struct {
     }
 
     // 'break' and 'return' leave several frames at once; every owning local
-    // in the abandoned frames drops before the branch (section 4.2)
+    // in the abandoned frames drops before the branch (section 5.2)
     fn emitDropsDownTo(self: *Codegen, depth: usize, skip_pointer: ?[]const u8) Error!void {
         var frame_index = self.scopes.items.len;
         while (frame_index > depth) {
@@ -5366,7 +5413,7 @@ pub const Codegen = struct {
     }
 
     // a discarded temporary that owns heap drops immediately: an expression
-    // statement or unconsumed receiver would otherwise leak (section 4.2)
+    // statement or unconsumed receiver would otherwise leak (section 5.2)
     fn dropDiscarded(self: *Codegen, operand: Operand, value_type: *const Type, span: Token.Location) Error!void {
         if (!try self.ownsHeap(value_type, 0)) return;
         switch (operand) {
@@ -5483,14 +5530,6 @@ fn captureMode(capture: ast.Capture) CaptureMode {
             .reference, .reference_var => .reference,
             .pointer, .pointer_var => .owning,
         };
-    }
-    if (capture.annotation) |annotation| {
-        if (annotation.* == .modified) {
-            return switch (annotation.modified.modifier) {
-                .reference, .reference_var => .reference,
-                .pointer, .pointer_var => .owning,
-            };
-        }
     }
     return .copy;
 }

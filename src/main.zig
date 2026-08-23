@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (lib_mode) {
         // the standalone check above already gated on errors; publishing
-        // packs the checked unit's own sources (section 5.4)
+        // packs the checked unit's own sources (section 6.4)
         const arena = init.arena.allocator();
         const stem = std.fs.path.stem(entrypoint_file_path);
         const library_path = output_path orelse try std.fmt.allocPrint(arena, "{s}.alloylib", .{stem});
@@ -242,7 +242,7 @@ fn reportDiagnostics(compilation: *const alloyc.Compilation) void {
 }
 
 // writes the IR next to the output and hands it to clang, which compiles
-// and links in one step (section 5.4)
+// and links in one step (section 6.4)
 fn buildExecutable(
     init: std.process.Init,
     entrypoint_file_path: []const u8,
@@ -357,7 +357,7 @@ fn executableDirectory(arena: std.mem.Allocator) ?[]const u8 {
 const DiskLoaderContext = struct {
     io: Io,
     // the entry module's directory: imports resolve relative to the program,
-    // not the shell's location (section 5.4)
+    // not the shell's location (section 6.4)
     base_directory: []const u8,
     search_bases: []const []const u8,
 
@@ -368,7 +368,7 @@ const DiskLoaderContext = struct {
 };
 
 // import loader: the entry module's directory first, then - for std::
-// modules - the standard search bases (section 5.4)
+// modules - the standard search bases (section 6.4)
 fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
     const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
     const local_path = try loader.resolve(allocator, file_path);
@@ -388,7 +388,7 @@ fn loadImportedModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_p
 }
 
 // 'pkg::name' resolves to the entry module's 'pkg' folder first; the
-// trusted registry download (section 5.4) is still to come
+// trusted registry download (section 6.4) is still to come
 fn loadPackageContainer(context: ?*anyopaque, allocator: std.mem.Allocator, package_name: []const u8) anyerror!?[]const u8 {
     const loader: *DiskLoaderContext = @ptrCast(@alignCast(context.?));
     var buffer: [512]u8 = undefined;

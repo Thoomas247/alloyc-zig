@@ -1,5 +1,5 @@
 //! Name resolution, the first whole-program stage after the merge point.
-//! All module definitions merge into one global symbol table (section 5.4):
+//! All module definitions merge into one global symbol table (section 6.4):
 //! unqualified names see their own library plus every 'exp' symbol of other
 //! libraries in the unit, while module-qualified paths (`std::vec::Vec`)
 //! additionally pass a pub/exp visibility check. The
@@ -29,7 +29,7 @@ pub const Symbol = struct {
 };
 
 /// All symbols sharing one name. More than one entry only ever holds
-/// functions, which may overload (section 3.6).
+/// functions, which may overload (section 4.6).
 pub const SymbolList = std.ArrayList(Symbol);
 
 /// Import alias to canonical module key, one map per module view.
@@ -70,7 +70,7 @@ pub const MergedUnit = struct {
     references: []const NameReference,
     locals: []const LocalReference,
     // qualified functions ('fn Vector::empty'), living in their type's
-    // namespace keyed by the type's definition identity (section 5.4)
+    // namespace keyed by the type's definition identity (section 6.4)
     associated: []const AssociatedFunction,
 };
 
@@ -81,7 +81,7 @@ pub const AssociatedFunction = struct {
 };
 
 /// Whether two modules belong to the same library; null marks the
-/// executable's own compilation unit (section 5.4).
+/// executable's own compilation unit (section 6.4).
 pub fn sameLibrary(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null and right == null) return true;
     if (left == null or right == null) return false;
@@ -89,7 +89,7 @@ pub fn sameLibrary(left: ?[]const u8, right: ?[]const u8) bool {
 }
 
 // 'void' is not a value type, but '#void' marks a payload-less enum
-// variant in 'add_member' (section 3.4)
+// variant in 'add_member' (section 4.4)
 const primitive_types = std.StaticStringMap(void).initComptime(.{
     .{"u8"},  .{"u16"}, .{"u32"}, .{"u64"},
     .{"i8"},  .{"i16"}, .{"i32"}, .{"i64"},
@@ -109,7 +109,7 @@ pub const Resolver = struct {
     alias_maps: []AliasMap,
     // libraries injected into each view's unqualified namespace: imports
     // without an explicit 'as' inject their library's 'exp' names; an
-    // aliased import is reachable through the alias only (section 5.4)
+    // aliased import is reachable through the alias only (section 6.4)
     injected_maps: []InjectedMap,
     // every resolved use of a global definition, for tooling
     references: std.ArrayList(NameReference),
@@ -122,7 +122,7 @@ pub const Resolver = struct {
 
     const Frame = struct {
         bindings: std.ArrayList(Binding),
-        // a lambda boundary: lookups for locals stop here (section 4.4)
+        // a lambda boundary: lookups for locals stop here (section 5.4)
         barrier: bool,
     };
 
@@ -189,7 +189,7 @@ pub const Resolver = struct {
 
     // qualified functions ('fn Vector::empty') attach to any type visible
     // to the defining module, like extension functions; the qualifier
-    // resolves through normal unqualified visibility (section 5.4)
+    // resolves through normal unqualified visibility (section 6.4)
     fn collectAssociated(self: *Resolver) Error!void {
         for (self.views, 0..) |view, view_index| {
             self.current_view = view_index;
@@ -204,14 +204,14 @@ pub const Resolver = struct {
                     if (!self.visibleUnqualified(candidate)) continue;
                     break candidate;
                 } else {
-                    try self.report(qualifier.location, "'{s}' does not name a visible type here (section 5.4)", .{type_name});
+                    try self.report(qualifier.location, "'{s}' does not name a visible type here (section 6.4)", .{type_name});
                     continue;
                 };
                 // a qualified function is a plain free function: 'self'
                 // receivers belong to extension functions, which already
-                // reach the type through dot dispatch (section 4.5)
+                // reach the type through dot dispatch (section 5.5)
                 if (fn_def.function.parameters.len != 0 and fn_def.function.parameters[0].is_self) {
-                    try self.report(fn_def.name.location, "'{s}::{s}' cannot take 'self': a qualified function is not an extension (section 5.4)", .{ type_name, fn_def.name.slice(view.source) });
+                    try self.report(fn_def.name.location, "'{s}::{s}' cannot take 'self': a qualified function is not an extension (section 6.4)", .{ type_name, fn_def.name.slice(view.source) });
                     continue;
                 }
                 const fn_name = fn_def.name.slice(view.source);
@@ -221,7 +221,7 @@ pub const Resolver = struct {
                     const enum_source = self.views[type_symbol.view_index].source;
                     for (base.enum_type) |member| {
                         if (std.mem.eql(u8, member.name.slice(enum_source), fn_name)) {
-                            try self.report(fn_def.name.location, "'{s}::{s}' collides with the enum's variant '{s}' (section 5.4)", .{ type_name, fn_name, fn_name });
+                            try self.report(fn_def.name.location, "'{s}::{s}' collides with the enum's variant '{s}' (section 6.4)", .{ type_name, fn_name, fn_name });
                         }
                     }
                 }
@@ -258,7 +258,7 @@ pub const Resolver = struct {
 
     // registers each import's alias and, when the import has no explicit
     // 'as', injects its library's 'exp' names into this module's
-    // unqualified namespace (section 5.4)
+    // unqualified namespace (section 6.4)
     fn registerImports(self: *Resolver, view: ModuleView) Error!void {
         for (view.module.imports) |import| {
             // every import gets an alias: the explicit 'as' name, or the
@@ -282,7 +282,7 @@ pub const Resolver = struct {
     }
 
     // a name visible unqualified from two different libraries in one module
-    // is an error resolved by aliasing an import (section 5.4)
+    // is an error resolved by aliasing an import (section 6.4)
     fn checkInjectedCollisions(self: *Resolver) Error!void {
         var iterator = self.globals.iterator();
         while (iterator.next()) |entry| {
@@ -304,7 +304,7 @@ pub const Resolver = struct {
                         // point at an offending import of this module
                         const token = self.injected_maps[view_index].get(if (own) previous else display).?;
                         self.current_view = view_index;
-                        try self.report(token.location, "'{s}' is visible from both '{s}' and '{s}'; alias the import ('import ... as name') to disambiguate (section 5.4)", .{ entry.key_ptr.*, previous, display });
+                        try self.report(token.location, "'{s}' is visible from both '{s}' and '{s}'; alias the import ('import ... as name') to disambiguate (section 6.4)", .{ entry.key_ptr.*, previous, display });
                         reported = true;
                     } else {
                         first_library = display;
@@ -338,9 +338,9 @@ pub const Resolver = struct {
                     continue;
                 }
                 // only fn definitions may share a name within one library
-                // (overloading, section 3.6), and a macro may share a name
+                // (overloading, section 4.6), and a macro may share a name
                 // with functions - '#name' always selects the macro, a bare
-                // 'name' never does (section 6.3); different libraries
+                // 'name' never does (section 7.3); different libraries
                 // reuse names freely, clashes surface at unqualified use
                 // sites instead
                 var conflict: ?Symbol = null;
@@ -417,6 +417,7 @@ pub const Resolver = struct {
                     }
                     try self.bind(parameter.name, .parameter);
                 }
+                try self.resolveTypeExpression(macro_def.return_type, false);
                 if (macro_def.body) |body| try self.resolveStatement(body);
                 self.popFrame();
             },
@@ -438,7 +439,7 @@ pub const Resolver = struct {
     fn bindTypeParameters(self: *Resolver, type_parameters: []const ast.TypeParameter) Error!void {
         for (type_parameters) |type_parameter| {
             // a constraint's type arguments may reference the parameters
-            // declared to its left ('<T, It: Iterator<T>>', section 3.7)
+            // declared to its left ('<T, It: Iterator<T>>', section 4.7)
             if (type_parameter.constraint) |constraint| {
                 try self.resolveInterfaceMarker(constraint);
             }
@@ -465,7 +466,7 @@ pub const Resolver = struct {
         const lookup = self.lookupUnqualified(name);
         const symbol = lookup.visible orelse {
             if (lookup.hidden != null) {
-                return self.report(name_token.location, "interface '{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{name});
+                return self.report(name_token.location, "interface '{s}' is not exported; mark it 'exp' to allow use outside its library (section 6.4)", .{name});
             }
             return self.report(name_token.location, "use of undeclared interface '{s}'", .{name});
         };
@@ -522,7 +523,7 @@ pub const Resolver = struct {
             },
             .cast => |cast| {
                 try self.resolveExpression(cast.operand);
-                // an 'is' target may name an enum variant (section 3.2)
+                // an 'is' target may name an enum variant (section 4.2)
                 const allow_variant = cast.operator.tag == .keyword_is;
                 try self.resolveTypeExpression(cast.target, allow_variant);
                 // an inline 'is' capture binds into the enclosing condition
@@ -549,6 +550,8 @@ pub const Resolver = struct {
                 if (subslice.start) |start| try self.resolveExpression(start);
                 try self.resolveExpression(subslice.end);
             },
+            // an inline layout's members resolve like any type expression
+            .type_literal => |layout| try self.resolveTypeExpression(layout, false),
             .struct_init => |struct_init| {
                 if (struct_init.path) |path| {
                     try self.resolvePath(path, .type);
@@ -573,7 +576,7 @@ pub const Resolver = struct {
             },
             .if_expr => |if_expr| {
                 // the frame spans condition and then-branch: inline 'is'
-                // captures bind during the condition (section 3.2)
+                // captures bind during the condition (section 4.2)
                 try self.pushFrame(false);
                 try self.resolveExpression(if_expr.condition);
                 try self.resolveStatement(if_expr.then_branch);
@@ -621,12 +624,9 @@ pub const Resolver = struct {
                 }
             },
             .lambda => |lambda| {
-                // captures name variables of the enclosing scope (section 4.4)
+                // captures name variables of the enclosing scope (section 5.4)
                 for (lambda.captures) |capture| {
                     try self.resolveCapturedVariable(capture.name);
-                    if (capture.annotation) |annotation| {
-                        try self.resolveTypeExpression(annotation, false);
-                    }
                 }
                 try self.pushFrame(true);
                 for (lambda.captures) |capture| {
@@ -639,9 +639,6 @@ pub const Resolver = struct {
     }
 
     fn bindCapture(self: *Resolver, capture: ast.Capture) Error!void {
-        if (capture.annotation) |annotation| {
-            try self.resolveTypeExpression(annotation, false);
-        }
         try self.bind(capture.name, .variable);
     }
 
@@ -690,6 +687,7 @@ pub const Resolver = struct {
                 }
             },
             .comptime_type => |expression| try self.resolveExpression(expression),
+            .type_description => {},
         }
     }
 
@@ -723,9 +721,9 @@ pub const Resolver = struct {
             if (lookup.hidden) |hidden| {
                 if (hidden.visibility == .exported) {
                     const library = self.views[hidden.view_index].library orelse "the program";
-                    return self.report(span, "'{s}' is exported by '{s}' but not imported unqualified here; use qualified access or import it without 'as' (section 5.4)", .{ first, library });
+                    return self.report(span, "'{s}' is exported by '{s}' but not imported unqualified here; use qualified access or import it without 'as' (section 6.4)", .{ first, library });
                 }
-                return self.report(span, "'{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{first});
+                return self.report(span, "'{s}' is not exported; mark it 'exp' to allow use outside its library (section 6.4)", .{first});
             }
             return self.report(span, "use of undeclared identifier '{s}'", .{first});
         }
@@ -739,7 +737,7 @@ pub const Resolver = struct {
                 return self.resolveQualified(span, key, view_index, path[prefix_length..]);
             }
             // inside a library, relative module keys live under the
-            // package namespace (section 5.4)
+            // package namespace (section 6.4)
             if (self.views[self.current_view].library) |package_name| {
                 const prefixed = try std.fmt.allocPrint(self.arena, "pkg::{s}::{s}", .{ package_name, key });
                 if (self.module_keys.get(prefixed)) |view_index| {
@@ -771,7 +769,7 @@ pub const Resolver = struct {
         try self.report(span, "use of undeclared name '{s}'", .{full});
     }
 
-    // resolves the remainder of a module-qualified path (section 5.4):
+    // resolves the remainder of a module-qualified path (section 6.4):
     // qualified access reaches pub/exp definitions within one compilation
     // unit, but only 'exp' definitions across a library boundary
     fn resolveQualified(self: *Resolver, span: Token.Location, key: []const u8, view_index: usize, remainder: []const Token) Error!void {
@@ -794,7 +792,7 @@ pub const Resolver = struct {
         }
         if (!found_visible) {
             if (cross_library) {
-                return self.report(span, "'{s}' in module '{s}' is not exported; mark it 'exp' to allow use outside its library (section 5.4)", .{ definition_name, key });
+                return self.report(span, "'{s}' in module '{s}' is not exported; mark it 'exp' to allow use outside its library (section 6.4)", .{ definition_name, key });
             }
             return self.report(span, "'{s}' in module '{s}' is private; mark it 'pub' to allow qualified access", .{ definition_name, key });
         }
@@ -810,7 +808,7 @@ pub const Resolver = struct {
 
     // the canonical module key of an import, mirroring the loader's
     // namespacing: a library's relative imports resolve under its own
-    // package prefix (section 5.4)
+    // package prefix (section 6.4)
     fn importKey(self: *Resolver, import: ast.Import, view: ModuleView) Error![]const u8 {
         const joined = try self.joinPath(import.path, view.source);
         if (view.library) |package_name| {
@@ -836,7 +834,7 @@ pub const Resolver = struct {
         return joined;
     }
 
-    // unqualified lookup (section 5.4): a name sees every symbol of its own
+    // unqualified lookup (section 6.4): a name sees every symbol of its own
     // library plus the 'exp' symbols of libraries this module imported
     // without an alias
     fn visibleUnqualified(self: *const Resolver, symbol: Symbol) bool {

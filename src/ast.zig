@@ -53,7 +53,7 @@ pub const TypeDef = struct {
 
 /// A conformance marker ('type V<T> : Iterable<T, VectorCursor<T>>') or a
 /// generic constraint ('It: Iterator<T>'): an interface name plus the type
-/// arguments binding the interface's own type parameters (section 5.2).
+/// arguments binding the interface's own type parameters (section 6.2).
 pub const InterfaceMarker = struct {
     name: Token,
     type_arguments: []const *const TypeExpression,
@@ -98,8 +98,13 @@ pub const InterfaceDef = struct {
     functions: []const InterfaceFn,
 };
 
+// an interface function declares its receiver indirection ('self: &',
+// 'self: &var', 'self: *', 'self: *var') as a nameless first parameter;
+// 'parameters' holds the ordinary ones after it (section 6.2)
 pub const InterfaceFn = struct {
     name: Token,
+    receiver: TypeModifier,
+    receiver_token: Token,
     parameters: []const Parameter,
     return_type: ?*const TypeExpression,
 };
@@ -107,6 +112,9 @@ pub const InterfaceFn = struct {
 pub const MacroDef = struct {
     name: Token,
     parameters: []const MacroParameter,
+    // the declared result type, required: nothing is inferred from the
+    // body; may be a comptime type ('#Type', '&[#Type]') (section 7.3)
+    return_type: *const TypeExpression,
     // null marks a declaration-only macro ('macro type_of(value);'):
     // implemented by the compiler, like an interface's functions
     body: ?*const Statement,
@@ -146,6 +154,9 @@ pub const TypeExpression = union(enum) {
         return_type: ?*const TypeExpression,
     },
     comptime_type: *const Expression,
+    // '#Type' written as a type: the comptime descriptor itself, valid
+    // only in a macro signature (section 4.4)
+    type_description: Token,
 };
 
 pub const NamedType = struct {
@@ -170,7 +181,7 @@ pub const Statement = union(enum) {
     block: []const *const Statement,
     break_stmt: struct { keyword: Token, value: ?*const Expression },
     // 'yield value' produces the value of the innermost value-position
-    // 'if' or 'match' (section 4.3)
+    // 'if' or 'match' (section 5.3)
     yield_stmt: struct { keyword: Token, value: *const Expression },
     return_stmt: struct { keyword: Token, value: ?*const Expression },
     assign: struct {
@@ -209,7 +220,7 @@ pub const Expression = union(enum) {
         target: *const TypeExpression,
         // 'x is ::Some |v|': the capture binds the payload inline, valid
         // only as a direct '&&' conjunct of an if or while condition
-        // (section 3.2); always null for 'as' and 'to'
+        // (section 4.2); always null for 'as' and 'to'
         capture: ?Capture = null,
     },
     call: struct {
@@ -220,7 +231,7 @@ pub const Expression = union(enum) {
     member: struct { object: *const Expression, name: Token },
     index: struct { object: *const Expression, subscript: *const Expression },
     // 'arr[start..end]' borrows a slice viewing the element range
-    // start..end-1 in place (section 3.2); a null start means 0
+    // start..end-1 in place (section 4.2); a null start means 0
     subslice: struct {
         object: *const Expression,
         operator: Token,
@@ -232,6 +243,9 @@ pub const Expression = union(enum) {
     // bind a generic type's parameters explicitly ('Vector<T> { ... }')
     struct_init: struct { path: ?[]const Token, type_arguments: []const *const TypeExpression = &.{}, members: []const MemberInit },
     array_literal: []const *const Expression,
+    // an inline layout written in place under '#' ('#struct { id: u32 }',
+    // '#enum { A, B: u8 }'): its '#Type', compile time only (section 4.4)
+    type_literal: *const TypeExpression,
     array_fill: struct { value: *const Expression, count: *const Expression },
     // '[start..end]' integer range generator; a null start means 0
     array_range: struct { operator: Token, start: ?*const Expression, end: *const Expression },
@@ -249,10 +263,11 @@ pub const MemberInit = struct {
     value: *const Expression,
 };
 
+// '|x|' copies, '|&x|' / '|&var x|' borrow, '|move x|' (modifier
+// 'pointer') takes ownership; captures carry no annotation (section 3.1)
 pub const Capture = struct {
     modifier: ?TypeModifier,
     name: Token,
-    annotation: ?*const TypeExpression,
 };
 
 pub const IfExpression = struct {

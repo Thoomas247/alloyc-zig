@@ -1,4 +1,4 @@
-//! The .alloylib container (section 5.4): a library ships its complete
+//! The .alloylib container (section 6.4): a library ships its complete
 //! source, version-stamped so a future compiler can always fall back to
 //! recompiling the embedded source. Precompiled cache sections join the
 //! format later; the source is the artifact, caches are an optimization.

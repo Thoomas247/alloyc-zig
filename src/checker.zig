@@ -1,25 +1,25 @@
 //! Type checking, the whole-program stage after name resolution. Implements
 //! section 3 of LANGUAGE_SPEC.md (type compatibility, casting, overloading,
 //! inference, mutability) together with the typing consequences of pointee
-//! transparency (section 4.2): reading a pointer or reference always yields
+//! transparency (section 5.2): reading a pointer or reference always yields
 //! its pointee, so only 'move', 'new', and unary '&' see the address itself.
 //!
 //! Also covered: extension function calls and receiver resolution (section
 //! 4.5), interface objects, verification, default implementations, and
 //! downcasting via 'is' and 'match' (sections 3.2 and 5.2), generic
-//! constraint enforcement (section 3.7), the cursor protocol for custom
-//! iterables (section 4.3), and compile-time evaluation (section 6):
+//! constraint enforcement (section 4.7), the cursor protocol for custom
+//! iterables (section 5.3), and compile-time evaluation (section 6):
 //! '#' expressions are collected during checking with a snapshot of the
 //! visible constants and evaluated through the interpreter in sandboxed
 //! mode once every side table is complete. Macro calls and '#Type'
 //! reflection (sections 6.3 and 3.4) instead evaluate eagerly at the
 //! invocation site, so they may only use earlier definitions.
 //!
-//! Data layout (section 3.9) is computed by layoutOf: C-compatible struct
+//! Data layout (section 4.9) is computed by layoutOf: C-compatible struct
 //! layout and tag-plus-payload enums, which gives 'as' reinterpretation
-//! (section 3.5) its width check on every type.
+//! (section 4.5) its width check on every type.
 //!
-//! Path-termination analysis (section 4.3) closes the flow rules: a typed
+//! Path-termination analysis (section 5.3) closes the flow rules: a typed
 //! function or lambda must return on every path, every branch of a value
 //! 'if' and every arm of a value 'match' (or its external 'else') must
 //! yield or leave the construct, and a value loop's 'else' must break with
@@ -52,7 +52,7 @@ pub const Checker = struct {
     return_type: ?*const Type,
     inferred_return: ?*const Type,
     // the enclosing function's type parameters, visible to every type
-    // expression written inside the body (section 3.7)
+    // expression written inside the body (section 4.7)
     scope_types: *const TypeEnvironment,
     // innermost-first stack of value-yielding constructs 'break' can target
     yield_frames: std.ArrayList(YieldFrame),
@@ -60,19 +60,19 @@ pub const Checker = struct {
     // overload each call site resolved to (keyed by the call expression)
     expression_types: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
     // the 'is' tests allowed to carry an inline capture: direct '&&'
-    // conjuncts of an if or while condition (section 3.2)
+    // conjuncts of an if or while condition (section 4.2)
     condition_captures: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
-    // the host facilities behind '#read_file' (section 6.4), wired by the
+    // the host facilities behind '#read_file' (section 7.4), wired by the
     // compilation; null keeps compile-time evaluation filesystem-free
     comptime_io: ?std.Io = null,
     comptime_root: []const u8 = ".",
     call_targets: std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol) = .empty,
     call_type_bindings: std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding) = .empty,
-    // values computed by compile-time evaluation (section 6.1), keyed by the
+    // values computed by compile-time evaluation (section 7.1), keyed by the
     // '#' expression node; evaluation runs after checking so every side
     // table is complete (see runPendingComptime)
     comptime_values: std.AutoHashMapUnmanaged(*const ast.Expression, Interpreter.Value) = .empty,
-    // serialization shapes per non-primitive 'as' cast (section 3.5), so the
+    // serialization shapes per non-primitive 'as' cast (section 4.5), so the
     // interpreter reinterprets values without re-deriving type structure
     cast_shapes: std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes) = .empty,
     // the capture bindings computed for every lambda expression (section
@@ -82,7 +82,7 @@ pub const Checker = struct {
     // 4.4), keyed by the path expression, so codegen never re-resolves
     value_targets: std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol) = .empty,
     // the concrete type an 'is' test or a match arm on an interface object
-    // resolved to (section 3.2), keyed by the cast or pattern expression,
+    // resolved to (section 4.2), keyed by the cast or pattern expression,
     // so runtime identity never re-resolves by name
     type_targets: std.AutoHashMapUnmanaged(*const ast.Expression, types.TypeIdentity) = .empty,
     // binding types of path expressions resolved as PLACES (receivers,
@@ -99,16 +99,16 @@ pub const Checker = struct {
     // share names across types)
     call_name_targets: std.ArrayList(CallNameTarget) = .empty,
     // call expressions whose bare '&T' result pierces to a deep copy at
-    // its use site (section 4.2 reference-binding explicitness); both
+    // its use site (section 5.2 reference-binding explicitness); both
     // engines copy the pointee when the node is marked here
     pierced_results: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
-    // synthesised types per 'type T = #...' expression (section 3.4)
+    // synthesised types per 'type T = #...' expression (section 4.4)
     comptime_type_cache: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
     // nonzero while checking inside a '#' expression: macro calls are only
-    // legal there (section 6.3)
+    // legal there (section 7.3)
     comptime_depth: usize = 0,
-    // set during the best-effort pass over macro bodies (section 6.3:
+    // set during the best-effort pass over macro bodies (section 7.3:
     // bodies are not statically checked): diagnostics are suppressed and
     // comptime evaluation never scheduled - only the tooling tables fill
     tooling_only: bool = false,
@@ -135,7 +135,7 @@ pub const Checker = struct {
         binding_type: *const Type,
         mutable: bool,
         // a const binding's initializer, the source of compile-time
-        // constants visible to '#' expressions (section 6.1)
+        // constants visible to '#' expressions (section 7.1)
         initializer: ?*const ast.Expression = null,
         // definitely moved-from on every path reaching this point (section
         // 4.2); using the binding here is a compile-time error, while a
@@ -158,12 +158,16 @@ pub const Checker = struct {
 
     // 'break' targets the innermost loop frame and 'yield' the innermost
     // value-position if or match frame; each passes through the other's
-    // frames (section 4.3)
+    // frames (section 5.3)
     const YieldKind = enum { loop, value_construct };
 
     const YieldFrame = struct {
         yielded: ?*const Type,
         kind: YieldKind,
+        // a loop in value position (one with an 'else') receives 'yield'
+        // and 'break value' from its body; a statement loop is transparent
+        // to 'yield' and rejects 'break value' (section 5.3)
+        value_loop: bool = false,
     };
 
     pub const Error = error{OutOfMemory};
@@ -201,7 +205,7 @@ pub const Checker = struct {
     }
 
     pub fn run(self: *Checker) Error!void {
-        // eager macros evaluate MID-CHECK (section 6.3) and their bodies
+        // eager macros evaluate MID-CHECK (section 7.3) and their bodies
         // call imported code, which must already carry its side tables by
         // then: views are checked in import dependency order (post-order
         // walk). Reverse discovery order is NOT enough - a module
@@ -249,12 +253,18 @@ pub const Checker = struct {
                 const environment = try self.typeParameterEnvironment(fn_def.type_parameters, self.current_view);
                 for (fn_def.function.parameters) |parameter| {
                     const parameter_type = try self.typeFromExpression(parameter.parameter_type, environment);
+                    if (try self.holdsTypeDescription(parameter_type, 0)) {
+                        try self.report(parameter.name.location, "'#Type' may only appear in a macro signature; a function cannot take or return a comptime type (section 4.4)", .{});
+                    }
                     try self.bind(parameter.name, parameter_type, false);
                 }
                 const declared_return: *const Type = if (fn_def.function.return_type) |return_expression|
                     try self.typeFromExpression(return_expression, environment)
                 else
                     &void_type;
+                if (try self.holdsTypeDescription(declared_return, 0)) {
+                    try self.report(fn_def.name.location, "'#Type' may only appear in a macro signature; a function cannot take or return a comptime type (section 4.4)", .{});
+                }
                 const saved_return = self.return_type;
                 self.return_type = declared_return;
                 defer self.return_type = saved_return;
@@ -262,12 +272,12 @@ pub const Checker = struct {
                 self.scope_types = environment;
                 defer self.scope_types = saved_scope_types;
                 try self.checkStatement(fn_def.function.body);
-                // definite return (section 4.3): a typed function must
+                // definite return (section 5.3): a typed function must
                 // return on every path
                 const return_resolved = try self.resolveAlias(declared_return);
                 if (return_resolved.* != .void_type and return_resolved.* != .unknown and !statementTerminates(fn_def.function.body)) {
                     const rendered = try declared_return.render(self.arena);
-                    try self.report(fn_def.name.location, "control can fall off the end of '{s}', which must return {s} on every path (section 4.3)", .{ fn_def.name.slice(self.source()), rendered });
+                    try self.report(fn_def.name.location, "control can fall off the end of '{s}', which must return {s} on every path (section 5.3)", .{ fn_def.name.slice(self.source()), rendered });
                 }
             },
             .macro_def => |macro_def| try self.checkMacroBody(macro_def),
@@ -276,7 +286,7 @@ pub const Checker = struct {
                 // is never used: a faulting macro is diagnosed at the
                 // declaration, not silently deferred until first use.
                 // Generic types are excluded - they only reflect as
-                // instances (section 3.4)
+                // instances (section 4.4)
                 if (type_def.base.* == .comptime_type and type_def.type_parameters.len == 0) {
                     _ = try self.comptimeType(type_def.base.comptime_type, self.current_view);
                 }
@@ -285,12 +295,23 @@ pub const Checker = struct {
             // extern and interface declarations carry no bodies; their type
             // expressions were validated during name resolution and are
             // materialized on use
-            .extern_def, .interface_def => {},
+            // an extern never returns an owning pointer: the drop machinery
+            // would free memory Alloy never allocated (section 6.3)
+            .extern_def => |extern_def| {
+                const return_expression = extern_def.return_type orelse return;
+                const return_type = try self.typeFromExpression(return_expression, &empty_type_environment);
+                const resolved = try self.resolveAlias(return_type);
+                if (resolved.* == .pointer or resolved.* == .heap_array) {
+                    const rendered = try return_type.render(self.arena);
+                    try self.report(extern_def.name.location, "'extern {s}' may not return the owning type {s}: model a C pointer result as '&T' / '&var T' or an integer handle (section 6.3)", .{ extern_def.name.slice(self.source()), rendered });
+                }
+            },
+            .interface_def => {},
         }
     }
 
     // best-effort typing over a macro body, purely for tooling: macro
-    // bodies are not statically checked (section 6.3), so every diagnostic
+    // bodies are not statically checked (section 7.3), so every diagnostic
     // is suppressed and no comptime evaluation is scheduled - but the
     // recorded expression, place, and declaration types give macro bodies
     // hover and member completion in the editor
@@ -319,8 +340,8 @@ pub const Checker = struct {
     }
 
     // static verification that a marked type satisfies its interfaces
-    // (section 5.2, compilation and verification mechanics)
-    // requester-aware symbol selection (section 5.4): an unqualified name
+    // (section 6.2, compilation and verification mechanics)
+    // requester-aware symbol selection (section 6.4): an unqualified name
     // sees its own library plus the 'exp' symbols of libraries the view
     // imported without an alias, while a module-qualified path pins the
     // symbols of one view
@@ -428,14 +449,14 @@ pub const Checker = struct {
             if (symbol.definition.kind != .interface_def) continue;
             try self.validateMarkerArity(marker, self.current_view);
             // the marker's type arguments bind the interface's own type
-            // parameters ('Iterable<T, VectorCursor<T>>', section 5.2)
+            // parameters ('Iterable<T, VectorCursor<T>>', section 6.2)
             const instantiated = (try self.interfaceOfConstraint(marker, environment, self.current_view)).?;
             try self.verifyInterface(concrete, instantiated, marker.name.location);
         }
     }
 
     // binds a generic interface's type parameters to one instantiation's
-    // arguments, for resolving the declared signatures (section 5.2)
+    // arguments, for resolving the declared signatures (section 6.2)
     fn interfaceEnvironment(self: *Checker, interface: Type.Interface) Error!*TypeEnvironment {
         const environment = try self.arena.create(TypeEnvironment);
         environment.* = .empty;
@@ -459,7 +480,7 @@ pub const Checker = struct {
             if (index >= interface.arguments.len) break;
             const constraint = (try self.interfaceOfConstraint(type_parameter.constraint, interface_environment, interface.view_index)) orelse continue;
             if (!try self.implements(interface.arguments[index], constraint)) {
-                try self.report(span, "'{s}' does not satisfy the '{s}' constraint on '{s}''s type parameter '{s}' (section 5.2)", .{
+                try self.report(span, "'{s}' does not satisfy the '{s}' constraint on '{s}''s type parameter '{s}' (section 6.2)", .{
                     try interface.arguments[index].render(self.arena),
                     constraint.name,
                     interface.name,
@@ -480,7 +501,7 @@ pub const Checker = struct {
                             std.mem.eql(u8, entry.name, function_name)) break true;
                     } else false;
                     if (associated) {
-                        try self.report(span, "'{s}' does not implement '{s}': '{s}::{s}' is an associated function, not an extension; an interface function takes a 'self' receiver ('fn {s}(self value: &{s}, ...)', section 4.5)", .{
+                        try self.report(span, "'{s}' does not implement '{s}': '{s}::{s}' is an associated function, not an extension; an interface function takes a 'self' receiver ('fn {s}(self value: &{s}, ...)', section 5.5)", .{
                             concrete.declared.name,
                             interface.name,
                             concrete.declared.name,
@@ -489,34 +510,68 @@ pub const Checker = struct {
                             concrete.declared.name,
                         });
                     } else {
-                        try self.report(span, "'{s}' does not implement '{s}': no extension function '{s}' is visible (section 5.2)", .{
+                        try self.report(span, "'{s}' does not implement '{s}': no extension function '{s}' is visible (section 6.2)", .{
                             concrete.declared.name,
                             interface.name,
                             function_name,
                         });
                     }
                 },
-                .mismatched => try self.report(span, "the extension '{s}' for '{s}' does not match the signature declared by '{s}' (section 5.2)", .{
+                .mismatched => try self.report(span, "the extension '{s}' for '{s}' does not match the signature declared by '{s}' (section 6.2)", .{
                     function.name.slice(interface_source),
                     concrete.declared.name,
                     interface.name,
+                }),
+                .receiver_mismatched => try self.report(span, "the extension '{s}' for '{s}' takes the wrong receiver: '{s}' declares 'self: {s}', and the receiver indirection is fixed by the interface (section 6.2)", .{
+                    function.name.slice(interface_source),
+                    concrete.declared.name,
+                    interface.name,
+                    function.receiver.lexeme(),
                 }),
             }
         }
     }
 
-    const SatisfactionVerdict = enum { satisfied, missing, mismatched };
+    const SatisfactionVerdict = enum { satisfied, missing, mismatched, receiver_mismatched };
+
+    // whether a receiver indirection matches the declared interface
+    // receiver exactly (section 6.2 verification rule 3)
+    fn receiverMatchesDeclared(self_type: *const Type, declared: ast.TypeModifier) bool {
+        return switch (self_type.*) {
+            .reference => |indirection| (declared == .reference and !indirection.mutable) or (declared == .reference_var and indirection.mutable),
+            .pointer => |indirection| (declared == .pointer and !indirection.mutable) or (declared == .pointer_var and indirection.mutable),
+            else => false,
+        };
+    }
+
+    // whether an interface object's own indirection is at least as
+    // permissive as a function's declared receiver (section 6.2)
+    fn objectPermitsReceiver(object_raw: *const Type, declared: ast.TypeModifier) bool {
+        const mutable = switch (object_raw.*) {
+            .reference => |indirection| indirection.mutable,
+            .pointer => |indirection| indirection.mutable,
+            else => return true,
+        };
+        const owning = object_raw.* == .pointer;
+        return switch (declared) {
+            .reference => true,
+            .reference_var => mutable,
+            .pointer => owning,
+            .pointer_var => owning and mutable,
+        };
+    }
 
     // searches the merged unit for an extension satisfying one interface
     // function: a type-specific extension or an interface default, with the
-    // parameter sequence and return type matching precisely (section 5.2).
+    // parameter sequence and return type matching precisely (section 6.2).
     // deliberately closed-world: even a library-internal extension
-    // satisfies, since vtables span the whole unit (section 5.4)
+    // satisfies, since vtables span the whole unit (section 6.4)
     fn findSatisfyingExtension(self: *Checker, concrete: *const Type, interface: Type.Interface, interface_environment: *const TypeEnvironment, function: ast.InterfaceFn) Error!SatisfactionVerdict {
         const interface_source = self.views[interface.view_index].source;
         const function_name = function.name.slice(interface_source);
         const symbols = self.globals.get(function_name) orelse return .missing;
         var found_receiver = false;
+        var receiver_wrong = false;
         for (symbols.items) |symbol| {
             if (symbol.definition.kind != .fn_def) continue;
             const fn_def = symbol.definition.kind.fn_def;
@@ -544,6 +599,12 @@ pub const Checker = struct {
             };
             if (!receiver_matches) continue;
             found_receiver = true;
+            // the receiver indirection is fixed by the interface, not the
+            // implementer (section 6.2 rule 3)
+            if (!receiverMatchesDeclared(self_type, function.receiver)) {
+                receiver_wrong = true;
+                continue;
+            }
             if (parameters.len - 1 != function.parameters.len) continue;
             var matches = true;
             for (parameters[1..], function.parameters) |candidate_parameter, declared_parameter| {
@@ -567,6 +628,7 @@ pub const Checker = struct {
             }
             if (matches) return .satisfied;
         }
+        if (receiver_wrong) return .receiver_mismatched;
         return if (found_receiver) .mismatched else .missing;
     }
 
@@ -580,7 +642,7 @@ pub const Checker = struct {
             const name = type_parameter.name.slice(view_source);
             // built sequentially: a constraint's type arguments resolve
             // against the parameters declared to its left
-            // ('<T, It: Iterator<T>>', section 3.7)
+            // ('<T, It: Iterator<T>>', section 4.7)
             const constraint = try self.interfaceOfConstraint(type_parameter.constraint, environment, view_index);
             const parameter = try self.makeType(.{ .type_parameter = .{ .name = name, .constraint = constraint } });
             try environment.put(self.arena, name, parameter);
@@ -626,7 +688,7 @@ pub const Checker = struct {
     }
 
     // reports a marker or constraint whose argument count does not match
-    // the interface's declared type parameters (section 5.2); separated
+    // the interface's declared type parameters (section 6.2); separated
     // from interfaceOfConstraint so quiet probing never reports
     fn validateMarkerArity(self: *Checker, marker: ast.InterfaceMarker, view_index: usize) Error!void {
         const name = marker.name.slice(self.views[view_index].source);
@@ -634,7 +696,7 @@ pub const Checker = struct {
         if (symbol.definition.kind != .interface_def) return;
         const expected = symbol.definition.kind.interface_def.type_parameters.len;
         if (marker.type_arguments.len != expected) {
-            try self.report(marker.name.location, "'{s}' expects {d} type argument{s}, found {d} (section 5.2)", .{
+            try self.report(marker.name.location, "'{s}' expects {d} type argument{s}, found {d} (section 6.2)", .{
                 name,
                 expected,
                 if (expected == 1) "" else "s",
@@ -643,7 +705,7 @@ pub const Checker = struct {
         }
     }
 
-    // builds a Type from a syntactic type expression (section 3.2)
+    // builds a Type from a syntactic type expression (section 4.2)
     fn typeFromExpression(self: *Checker, expression: *const ast.TypeExpression, environment: *const TypeEnvironment) Error!*const Type {
         return self.typeFromExpressionIn(expression, environment, self.current_view);
     }
@@ -653,7 +715,7 @@ pub const Checker = struct {
         switch (expression.*) {
             .modified => |modified| {
                 // '&[T]' is a slice and '*[T]' a heap array, not an
-                // indirection onto an unsized array (section 3.2)
+                // indirection onto an unsized array (section 4.2)
                 if (modified.child.* == .array and modified.child.array.length == null) {
                     const element = try self.typeFromExpressionIn(modified.child.array.element, environment, view_index);
                     return switch (modified.modifier) {
@@ -664,7 +726,7 @@ pub const Checker = struct {
                     };
                 }
                 // an interface behind an indirection is an interface object
-                // (section 5.2); bare interface types are rejected below
+                // (section 6.2); bare interface types are rejected below
                 const child = if (try self.interfaceOfNamed(modified.child, environment, view_index)) |interface_type|
                     interface_type
                 else
@@ -714,7 +776,7 @@ pub const Checker = struct {
                         } });
                     },
                     .interface_def => {
-                        try self.report(named.path[0].location, "interface '{s}' can only be used behind an indirection ('&{s}', '*{s}') or as a constraint (section 5.2)", .{ last, last, last });
+                        try self.report(named.path[0].location, "interface '{s}' can only be used behind an indirection ('&{s}', '*{s}') or as a constraint (section 6.2)", .{ last, last, last });
                         return &unknown_type;
                     },
                     else => {
@@ -734,21 +796,21 @@ pub const Checker = struct {
                 return self.makeType(.{ .structural = try fields.toOwnedSlice(self.arena) });
             },
             // an inline enum in a type position, compared structurally
-            // against other enum types (section 3.3)
+            // against other enum types (section 4.3)
             .enum_type => |members| return self.makeType(.{ .inline_enum = .{ .members = members, .view_index = view_index } }),
             .array => |array| {
                 const element = try self.typeFromExpressionIn(array.element, environment, view_index);
                 const length_token = array.length orelse {
                     // a bare unsized array only exists behind & or * above
                     if (typeExpressionToken(expression)) |token| {
-                        try self.report(token.location, "a bare '[T]' has no size; write '&[T]' for a slice, '*[T]' for a heap array, or '[T : N]' for a fixed array (section 3.2)", .{});
+                        try self.report(token.location, "a bare '[T]' has no size; write '&[T]' for a slice, '*[T]' for a heap array, or '[T : N]' for a fixed array (section 4.2)", .{});
                     }
                     return &unknown_type;
                 };
                 const length = parseIntegerLiteral(length_token.slice(view_source)) catch 0;
-                // a fixed array's length is positive (section 3.2)
+                // a fixed array's length is positive (section 4.2)
                 if (length == 0) {
-                    try self.report(length_token.location, "a fixed array needs at least one element (section 3.2)", .{});
+                    try self.report(length_token.location, "a fixed array needs at least one element (section 4.2)", .{});
                 }
                 return self.makeType(.{ .fixed_array = .{ .element = element, .length = length } });
             },
@@ -766,12 +828,30 @@ pub const Checker = struct {
                     .return_type = return_type,
                 } });
             },
-            // a type synthesised by compile-time evaluation (section 3.4)
+            // a type synthesised by compile-time evaluation (section 4.4)
             .comptime_type => |inner| return self.comptimeType(inner, view_index),
+            // the descriptor type itself, as in a macro signature
+            .type_description => return self.makeType(.type_description),
         }
     }
 
-    // evaluates 'type T = #...' (section 3.4): the expression must yield a
+    // whether a type holds a '#Type' anywhere ('#Type', '&[#Type]'): such a
+    // type lives only in macro signatures and comptime code (section 4.4)
+    fn holdsTypeDescription(self: *Checker, candidate: *const Type, depth: usize) Error!bool {
+        if (depth > 16) return false;
+        const resolved = try self.resolveAlias(candidate);
+        return switch (resolved.*) {
+            .type_description => true,
+            .slice => |slice| self.holdsTypeDescription(slice.child, depth + 1),
+            .fixed_array => |array| self.holdsTypeDescription(array.element, depth + 1),
+            .heap_array => |heap| self.holdsTypeDescription(heap.child, depth + 1),
+            .reference => |indirection| self.holdsTypeDescription(indirection.child, depth + 1),
+            .pointer => |indirection| self.holdsTypeDescription(indirection.child, depth + 1),
+            else => false,
+        };
+    }
+
+    // evaluates 'type T = #...' (section 4.4): the expression must yield a
     // '#Type'; the result is cached per node so repeated uses agree
     fn comptimeType(self: *Checker, expression: *const ast.Expression, view_index: usize) Error!*const Type {
         if (self.comptime_type_cache.get(expression)) |cached| return cached;
@@ -784,12 +864,12 @@ pub const Checker = struct {
                     // the initializer may live in ANOTHER view than the one
                     // being checked (an alias chased lazily): the report
                     // must pair the span with the owning view's source
-                    try self.reportIn(view_index, span, "comptime evaluation failed: {s} (section 6.1)", .{machine.fault_message orelse "unspecified fault"});
+                    try self.reportIn(view_index, span, "comptime evaluation failed: {s} (section 7.1)", .{machine.fault_message orelse "unspecified fault"});
                     break :result &unknown_type;
                 },
             };
             if (value != .type_value) {
-                try self.reportIn(view_index, span, "a '#' expression in type position must yield a '#Type' (section 3.4)", .{});
+                try self.reportIn(view_index, span, "a '#' expression in type position must yield a '#Type' (section 4.4)", .{});
                 break :result &unknown_type;
             }
             break :result try self.descriptionToType(value.type_value, span);
@@ -799,7 +879,7 @@ pub const Checker = struct {
     }
 
     // recognizes a named type expression denoting an interface, yielding the
-    // interface type used inside interface objects (section 5.2)
+    // interface type used inside interface objects (section 6.2)
     fn interfaceOfNamed(self: *Checker, expression: *const ast.TypeExpression, environment: *const TypeEnvironment, view_index: usize) Error!?*const Type {
         if (expression.* != .named) return null;
         const named = expression.named;
@@ -814,10 +894,10 @@ pub const Checker = struct {
         if (symbol.definition.kind != .interface_def) return null;
         // a generic interface object requires every type parameter
         // instantiated ('&Iterator<u64>'): the object type pins the
-        // signatures, so dispatch has a fixed ABI (section 5.2)
+        // signatures, so dispatch has a fixed ABI (section 6.2)
         const interface_def = symbol.definition.kind.interface_def;
         if (named.type_arguments.len != interface_def.type_parameters.len) {
-            try self.report(named.path[0].location, "'{s}' expects {d} type argument{s}, found {d} (section 5.2)", .{
+            try self.report(named.path[0].location, "'{s}' expects {d} type argument{s}, found {d} (section 6.2)", .{
                 last,
                 interface_def.type_parameters.len,
                 if (interface_def.type_parameters.len == 1) "" else "s",
@@ -839,6 +919,19 @@ pub const Checker = struct {
 
     // resolves a named alias one level: 'type Meters = u32' yields u32; a
     // struct or enum bodied definition is nominal and resolves to itself
+    // one step down a named type's chain: its underlying type, or null
+    // when the type is nominal (a struct or enum body) or not named
+    fn aliasUnderlying(self: *Checker, candidate: *const Type) Error!?*const Type {
+        if (candidate.* != .declared) return null;
+        const type_def = candidate.declared.definition.kind.type_def;
+        switch (type_def.base.*) {
+            .struct_type, .enum_type => return null,
+            else => {},
+        }
+        const environment = try self.declaredEnvironment(candidate.declared);
+        return try self.typeFromExpressionIn(type_def.base, environment, candidate.declared.view_index);
+    }
+
     pub fn resolveAlias(self: *Checker, candidate: *const Type) Error!*const Type {
         var current = candidate;
         var depth: usize = 0;
@@ -947,7 +1040,7 @@ pub const Checker = struct {
         return variants.toOwnedSlice(self.arena);
     }
 
-    // structural enum compatibility (section 3.3 rule 7): identical ordered
+    // structural enum compatibility (section 4.3 rule 7): identical ordered
     // variant lists with identical payload types
     fn enumLayoutsMatch(self: *Checker, left: *const Type, right: *const Type) Error!bool {
         const left_body = try self.enumBody(left) orelse return false;
@@ -963,7 +1056,7 @@ pub const Checker = struct {
         return true;
     }
 
-    // type compatibility (section 3.3)
+    // type compatibility (section 4.3)
     fn coerce(self: *Checker, from: *const Type, to: *const Type) Error!bool {
         if (from.* == .unknown or to.* == .unknown) return true;
         if (from.eql(to)) return true;
@@ -979,14 +1072,18 @@ pub const Checker = struct {
             return resolved.* == .primitive and resolved.primitive.isFloat();
         }
 
-        // rule 4: named alias transparency, both directions
+        // rule 4: named type transparency is ONE WAY - a named type converts
+        // down its own chain (to its underlying type, that type's underlying
+        // type, ... to the base), never up into a named type (section 4.3)
         if (from.* == .declared) {
-            const resolved = try self.resolveAlias(from);
-            if (resolved.* != .declared) return self.coerce(resolved, to);
-        }
-        if (to.* == .declared) {
-            const resolved = try self.resolveAlias(to);
-            if (resolved.* != .declared) return self.coerce(from, resolved);
+            var current = from;
+            var depth: usize = 0;
+            while (depth < 64) : (depth += 1) {
+                const below = (try self.aliasUnderlying(current)) orelse break;
+                if (below.eql(to)) return true;
+                if (below.* != .declared) return self.coerce(below, to);
+                current = below;
+            }
         }
 
         // rule 5: numeric widening within one sign class
@@ -1002,7 +1099,7 @@ pub const Checker = struct {
         }
 
         // a type converts to an interface it implements; behind an
-        // indirection this forms an interface object (section 5.2)
+        // indirection this forms an interface object (section 6.2)
         if (to.* == .interface) {
             return self.implements(from, to.interface);
         }
@@ -1040,7 +1137,7 @@ pub const Checker = struct {
         // rule 7: an inline or synthesised enum compares structurally with
         // any enum type whose ordered variant list matches exactly (section
         // 3.3); synthesised enums have no syntax, so structural is all they
-        // have (section 3.4)
+        // have (section 4.4)
         if (from.* == .inline_enum or to.* == .inline_enum or from.* == .structural_enum or to.* == .structural_enum) {
             return self.enumLayoutsMatch(from, to);
         }
@@ -1062,14 +1159,14 @@ pub const Checker = struct {
         return false;
     }
 
-    // the interface behind an interface-object value (section 5.2)
+    // the interface behind an interface-object value (section 6.2)
     pub fn interfaceObject(self: *Checker, candidate: *const Type) Error!?Type.Interface {
         const resolved = try self.resolveAlias(try self.pierce(candidate));
         if (resolved.* == .interface) return resolved.interface;
         return null;
     }
 
-    // whether a type satisfies an interface (section 5.2): the declared
+    // whether a type satisfies an interface (section 6.2): the declared
     // type's marker list, the lang items' implicit implementers (section
     // 5.1), and generic parameters constrained by the same interface
     fn implements(self: *Checker, candidate: *const Type, interface: Type.Interface) Error!bool {
@@ -1110,7 +1207,7 @@ pub const Checker = struct {
     }
 
     /// The instantiation of one conforming type behind a generic interface
-    /// object (section 5.2): unifies the type's conformance marker against
+    /// object (section 6.2): unifies the type's conformance marker against
     /// the required interface arguments and returns the type's own argument
     /// list ('VectorCursor<E> : Iterator<E>' against 'Iterator<u64>' yields
     /// '[u64]'), or null when the type cannot conform at that instantiation.
@@ -1140,8 +1237,10 @@ pub const Checker = struct {
 
     // a type parameter constrained by the Number lang item behaves
     // numerically inside the generic body (sections 3.1, 5.2)
-    fn isNumericOperand(self: *const Checker, candidate: *const Type) bool {
-        if (candidate.isNumeric()) return true;
+    fn isNumericOperand(self: *Checker, candidate: *const Type) Error!bool {
+        // a named type reads as its base ('type Meters = f32', section 4.3)
+        const resolved = try self.resolveAlias(candidate);
+        if (resolved.isNumeric()) return true;
         if (candidate.* != .type_parameter) return false;
         const constraint = candidate.type_parameter.constraint orelse return false;
         return self.langItem(constraint) == .number;
@@ -1150,7 +1249,7 @@ pub const Checker = struct {
     const LangItem = enum { number, iterable };
 
     // the two standard interfaces are recognized by canonical path
-    // (section 5.1a), not by name alone
+    // (section 6.1a), not by name alone
     fn langItem(self: *const Checker, interface: Type.Interface) ?LangItem {
         const key = self.views[interface.view_index].key orelse return null;
         if (std.mem.eql(u8, key, "std::number") and std.mem.eql(u8, interface.name, "Number")) return .number;
@@ -1160,7 +1259,7 @@ pub const Checker = struct {
 
     pub fn structuralFieldsOf(self: *Checker, candidate: *const Type) Error!?[]const Type.Field {
         const resolved = try self.resolveAlias(candidate);
-        // synthesised types ('type T = #...', section 3.4) resolve straight
+        // synthesised types ('type T = #...', section 4.4) resolve straight
         // to a structural field list
         if (resolved.* == .structural) return resolved.structural;
         const body = try self.structBody(candidate) orelse return null;
@@ -1184,7 +1283,7 @@ pub const Checker = struct {
         return (value + alignment - 1) / alignment * alignment;
     }
 
-    // C-compatible data layout (section 3.9): declaration order, natural
+    // C-compatible data layout (section 4.9): declaration order, natural
     // alignment, size rounded up to the largest member alignment; null when
     // the type has no defined runtime layout (unknown, type parameters, ...)
     pub fn layoutOf(self: *Checker, candidate: *const Type, depth: usize) Error!?Layout {
@@ -1195,7 +1294,7 @@ pub const Checker = struct {
                 const width: u64 = primitive.width();
                 return .{ .size = width, .alignment = width };
             },
-            // an interface object is a fat pointer (section 3.2)
+            // an interface object is a fat pointer (section 4.2)
             .pointer => |indirection| return if (indirection.child.* == .interface)
                 .{ .size = 16, .alignment = 8 }
             else
@@ -1232,7 +1331,7 @@ pub const Checker = struct {
         field_type: *const Type,
     };
 
-    /// The byte offset of every struct field under the section 3.9 layout
+    /// The byte offset of every struct field under the section 4.9 layout
     /// rules; null when the candidate is not a struct or a field has no
     /// defined layout. Code generation reads aggregates through these slots.
     pub fn fieldSlots(self: *Checker, candidate: *const Type) Error!?[]const FieldSlot {
@@ -1257,7 +1356,7 @@ pub const Checker = struct {
         variants: []const Type.EnumVariant,
     };
 
-    /// The runtime frame of any enum type (section 3.9): tag width, payload
+    /// The runtime frame of any enum type (section 4.9): tag width, payload
     /// offset, full layout, and the resolved variant list whose order is the
     /// tag numbering. Code generation builds and matches enums through this.
     pub fn enumFrame(self: *Checker, candidate: *const Type) Error!?EnumFrame {
@@ -1280,7 +1379,7 @@ pub const Checker = struct {
     }
 
     // a tag sized to the variant count, then the payload area sized and
-    // aligned for the largest payload (section 3.9)
+    // aligned for the largest payload (section 4.9)
     fn enumLayout(self: *Checker, body: EnumBody, depth: usize) Error!?Layout {
         const tag_size: u64 = if (body.variants.len <= 1 << 8) 1 else if (body.variants.len <= 1 << 16) 2 else 4;
         var payload_size: u64 = 0;
@@ -1302,8 +1401,8 @@ pub const Checker = struct {
         return stored;
     }
 
-    // flattens a type's layout (section 3.9) into byte offsets for 'as'
-    // reinterpretation (section 3.5); null when the type carries pointers,
+    // flattens a type's layout (section 4.9) into byte offsets for 'as'
+    // reinterpretation (section 4.5); null when the type carries pointers,
     // references, or closures, which have no portable byte image
     fn shapeOf(self: *Checker, candidate: *const Type, depth: usize) Error!?*const types.Shape {
         if (depth > 16) return null;
@@ -1414,7 +1513,7 @@ pub const Checker = struct {
                 }
                 try self.bind(var_def.name, binding_type, var_def.mutable);
                 // a const binding's initializer feeds compile-time
-                // evaluation (section 6.1)
+                // evaluation (section 7.1)
                 if (!var_def.mutable) {
                     const frame = &self.scopes.items[self.scopes.items.len - 1];
                     frame.bindings.items[frame.bindings.items.len - 1].initializer = var_def.value;
@@ -1436,10 +1535,14 @@ pub const Checker = struct {
                     }
                     break :target info.pierced;
                 } else try self.checkExpression(assign.target, null);
+                // a rebind needs a mutable binding; a write through a
+                // reference or pointer needs a mutable pointee (section 4.8)
+                const rebinds = place != null and target_type == place.?.raw and place.?.raw != place.?.pierced;
+                const target_mutable = if (place) |info| (if (rebinds) info.mutable else piercedMutability(info)) else false;
                 if (place == null) {
                     try self.report(self.statementSpan(statement), "the assignment target is not an assignable location", .{});
-                } else if (!place.?.mutable) {
-                    try self.report(self.statementSpan(statement), "cannot assign through an immutable binding; declare it 'var' or reach it through '&var'/'*var' (section 3.8)", .{});
+                } else if (!target_mutable) {
+                    try self.report(self.statementSpan(statement), "cannot assign through an immutable binding; declare it 'var' or reach it through '&var'/'*var' (section 4.8)", .{});
                 }
                 // writing through a moved-from variable is a use; a plain
                 // '=' to the bare variable is the rebind that revives it
@@ -1449,7 +1552,7 @@ pub const Checker = struct {
                     if (rootPathToken(assign.target)) |root_token| {
                         if (self.lookupPointer(root_token.slice(self.source()))) |binding| {
                             if (binding.moved) {
-                                try self.report(assign.operator.location, "use of '{s}' after 'move' (section 4.2)", .{root_token.slice(self.source())});
+                                try self.report(assign.operator.location, "use of '{s}' after 'move' (section 5.2)", .{root_token.slice(self.source())});
                             }
                         }
                     }
@@ -1510,17 +1613,22 @@ pub const Checker = struct {
             },
             .break_stmt => |break_stmt| {
                 const frame = self.innermostYieldFrame(.loop) orelse {
-                    try self.report(break_stmt.keyword.location, "'break' must be inside a loop; an if or match produces its value with 'yield' (section 4.3)", .{});
+                    try self.report(break_stmt.keyword.location, "'break' must be inside a loop; an if or match produces its value with 'yield' (section 5.3)", .{});
                     if (break_stmt.value) |value| _ = try self.checkExpression(value, null);
                     return;
                 };
                 if (break_stmt.value) |value| {
+                    if (!frame.value_loop) {
+                        try self.report(break_stmt.keyword.location, "'break value' needs a loop used as a value (one with an 'else'); a statement loop has nothing to receive the value (section 5.3)", .{});
+                        _ = try self.checkExpression(value, null);
+                        return;
+                    }
                     try self.recordYield(frame, value, break_stmt.keyword.location, "break");
                 }
             },
             .yield_stmt => |yield_stmt| {
-                const frame = self.innermostYieldFrame(.value_construct) orelse {
-                    try self.report(yield_stmt.keyword.location, "'yield' must be inside an if or match used as a value (section 4.3)", .{});
+                const frame = self.innermostValueFrame() orelse {
+                    try self.report(yield_stmt.keyword.location, "'yield' must be inside an if, a match, or a loop with an 'else' used as a value (section 5.3)", .{});
                     _ = try self.checkExpression(yield_stmt.value, null);
                     return;
                 };
@@ -1532,7 +1640,7 @@ pub const Checker = struct {
         }
     }
 
-    // conservative path-termination analysis (section 4.3): a statement
+    // conservative path-termination analysis (section 5.3): a statement
     // terminates when control cannot fall out of it normally; conditions
     // are never assumed, so an if without else and every ordinary loop
     // count as falling through
@@ -1652,6 +1760,7 @@ pub const Checker = struct {
                 }
                 return false;
             },
+            .type_literal => return false,
             .array_fill => |array_fill| return expressionBreaksLoop(array_fill.value, depth) or expressionBreaksLoop(array_fill.count, depth),
             .array_range => |array_range| {
                 if (array_range.start) |start| {
@@ -1672,6 +1781,18 @@ pub const Checker = struct {
             .lambda => return false,
             .integer_literal, .float_literal, .string_literal, .character_literal, .bool_literal, .path, .implied_variant => return false,
         }
+    }
+
+    // the innermost value-position construct: an if or match used as a
+    // value, or a loop with an 'else'; statement loops pass 'yield' through
+    fn innermostValueFrame(self: *Checker) ?*YieldFrame {
+        var index = self.yield_frames.items.len;
+        while (index > 0) {
+            index -= 1;
+            const frame = &self.yield_frames.items[index];
+            if (frame.kind == .value_construct or frame.value_loop) return frame;
+        }
+        return null;
     }
 
     fn innermostYieldFrame(self: *Checker, kind: YieldKind) ?*YieldFrame {
@@ -1700,26 +1821,26 @@ pub const Checker = struct {
         }
     }
 
-    // section 4.3: loop 'else' and the external match 'else' are only
+    // section 5.3: loop 'else' and the external match 'else' are only
     // permitted when the construct is evaluated as an expression
     fn checkExpressionAsStatement(self: *Checker, expression: *const ast.Expression) Error!*const Type {
         switch (expression.*) {
             .if_expr => |if_expr| return self.checkIf(if_expr, expression, false),
             .while_expr => |while_expr| {
                 if (while_expr.else_branch != null) {
-                    try self.report(self.expressionSpan(expression), "a loop 'else' is only permitted when the loop is used as an expression (section 4.3)", .{});
+                    try self.report(self.expressionSpan(expression), "a loop 'else' is only permitted when the loop is used as an expression (section 5.3)", .{});
                 }
                 return self.checkWhile(while_expr, expression, false);
             },
             .for_expr => |for_expr| {
                 if (for_expr.else_branch != null) {
-                    try self.report(self.expressionSpan(expression), "a loop 'else' is only permitted when the loop is used as an expression (section 4.3)", .{});
+                    try self.report(self.expressionSpan(expression), "a loop 'else' is only permitted when the loop is used as an expression (section 5.3)", .{});
                 }
                 return self.checkFor(for_expr, expression, false);
             },
             .match_expr => |match_expr| {
                 if (match_expr.else_branch != null) {
-                    try self.report(self.expressionSpan(expression), "an external match 'else' is only permitted when the match is used as an expression (section 4.3)", .{});
+                    try self.report(self.expressionSpan(expression), "an external match 'else' is only permitted when the match is used as an expression (section 5.3)", .{});
                 }
                 return self.checkMatch(match_expr, expression, false);
             },
@@ -1749,7 +1870,17 @@ pub const Checker = struct {
             .integer_literal => return &untyped_integer_type,
             .float_literal => return &untyped_float_type,
             .bool_literal => return &bool_type,
-            // a string literal is a static '&[u8]' slice (section 1.6)
+            // '#struct { ... }' / '#enum { ... }': the layout's '#Type',
+            // which exists only during compile-time evaluation (section 4.4)
+            .type_literal => |layout| {
+                if (self.comptime_depth == 0) {
+                    try self.report(self.expressionSpan(expression), "an inline layout's '#Type' exists only during compile-time evaluation: prefix the whole expression with '#' (section 4.4)", .{});
+                    return &unknown_type;
+                }
+                _ = try self.typeFromExpression(layout, self.scope_types);
+                return self.makeType(.type_description);
+            },
+            // a string literal is a static '&[u8]' slice (section 2.6)
             .string_literal => |token| {
                 try self.validateEscapes(token);
                 return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.{ .primitive = .u8 }) } });
@@ -1770,6 +1901,13 @@ pub const Checker = struct {
                 // outer expression, never on its own
                 if (self.comptime_depth > 0) return result;
                 if (self.tooling_only) return result;
+                // a '#Type'-holding result cannot cross into runtime: a
+                // macro declared '-> #Type' is only for type position or a
+                // surrounding '#' expression (section 7.3)
+                if (try self.holdsTypeDescription(result, 0)) {
+                    try self.report(self.expressionSpan(expression), "a '#Type' cannot be retained in a runtime declaration (section 4.4)", .{});
+                    return &unknown_type;
+                }
                 if (self.needsEagerComptime(inner)) {
                     const environment = try self.snapshotComptimeEnvironment();
                     if (try self.runValueComptime(expression, inner, self.current_view, environment)) |value| {
@@ -1792,14 +1930,14 @@ pub const Checker = struct {
                 if (elements.len == 0) {
                     // '[]' is the canonical empty view and only exists in
                     // slice context - a fixed array needs at least one
-                    // element (section 3.2)
+                    // element (section 4.2)
                     if (expected) |expectation| {
                         const contextual = try self.resolveAlias(expectation);
                         // the resolved slice, so both engines see '.slice'
                         // without chasing aliases
                         if (contextual.* == .slice) return contextual;
                     }
-                    try self.report(self.expressionSpan(expression), "an empty array literal '[]' is only valid where a '&[T]' slice is expected (section 3.2)", .{});
+                    try self.report(self.expressionSpan(expression), "an empty array literal '[]' is only valid where a '&[T]' slice is expected (section 4.2)", .{});
                     return &unknown_type;
                 }
                 var element_type: *const Type = &unknown_type;
@@ -1836,13 +1974,13 @@ pub const Checker = struct {
             const name = path[0].slice(self.source());
             if (self.lookup(name)) |binding| {
                 if (binding.moved) {
-                    try self.report(path[0].location, "use of '{s}' after 'move' (section 4.2)", .{name});
+                    try self.report(path[0].location, "use of '{s}' after 'move' (section 5.2)", .{name});
                 }
                 // pointee transparency: reading a pointer or reference yields
-                // a copy of the pointee (section 4.2)
+                // a copy of the pointee (section 5.2)
                 return self.pierce(binding.binding_type);
             }
-            // '#T' reflects a type (section 3.4): typed as '#Type' inside
+            // '#T' reflects a type (section 4.4): typed as '#Type' inside
             // any comptime context so hover and '#Point.' completion work;
             // evaluation substitutes the outer expression, so the recorded
             // inner type never reaches codegen
@@ -1892,7 +2030,7 @@ pub const Checker = struct {
                     return &unknown_type;
                 }
                 if (fn_def.type_parameters.len != 0) {
-                    try self.report(span, "a generic function cannot become a function value; its type parameters are unbound (section 4.4)", .{});
+                    try self.report(span, "a generic function cannot become a function value; its type parameters are unbound (section 5.4)", .{});
                     return &unknown_type;
                 }
                 // recorded so later stages call exactly this symbol
@@ -1900,7 +2038,7 @@ pub const Checker = struct {
                 return self.functionType(symbol);
             },
             .extern_def => {
-                try self.report(span, "an extern function cannot be used as a function value yet (section 5.3)", .{});
+                try self.report(span, "an extern function cannot be used as a function value yet (section 6.3)", .{});
                 return &unknown_type;
             },
             // a bare type or interface name is not a value; '#T' reflection
@@ -1942,7 +2080,7 @@ pub const Checker = struct {
         switch (unary.operator.tag) {
             .minus => {
                 const operand = try self.checkExpression(unary.operand, expected);
-                if (!self.isNumericOperand(operand)) {
+                if (!try self.isNumericOperand(operand)) {
                     try self.report(unary.operator.location, "'-' requires a numeric operand", .{});
                     return &unknown_type;
                 }
@@ -1968,17 +2106,17 @@ pub const Checker = struct {
             },
             .ampersand => {
                 // '&' on a reference-typed call result keeps the borrow
-                // verbatim (section 4.2); no addressable place is needed
+                // verbatim (section 5.2); no addressable place is needed
                 if (unwrapGrouped(unary.operand).* == .call) {
                     const operand_type = try self.checkExpression(unary.operand, null);
                     const operand_resolved = try self.resolveAlias(operand_type);
                     if (operand_resolved.* == .reference or operand_resolved.* == .slice) {
                         return operand_type;
                     }
-                    try self.report(unary.operator.location, "'&' requires an addressable value or a call already yielding a reference (section 4.2)", .{});
+                    try self.report(unary.operator.location, "'&' requires an addressable value or a call already yielding a reference (section 5.2)", .{});
                     return &unknown_type;
                 }
-                // '&' references any value in place (section 4.2); the
+                // '&' references any value in place (section 5.2); the
                 // reference is mutable when the referenced location is
                 const place = try self.lvalueOf(unary.operand) orelse {
                     _ = try self.checkExpression(unary.operand, null);
@@ -1987,7 +2125,7 @@ pub const Checker = struct {
                 };
                 // borrowing a heap array yields a slice viewing its
                 // elements in place, the only non-owning form of an
-                // array view (section 4.2)
+                // array view (section 5.2)
                 const pierced = try self.resolveAlias(place.pierced);
                 if (pierced.* == .heap_array) {
                     return self.makeType(.{ .slice = .{
@@ -1997,7 +2135,7 @@ pub const Checker = struct {
                 }
                 // re-borrowing a place already holding a slice yields the
                 // same view: '&view' on a '&[u8]' binding is idempotent
-                // (section 4.2)
+                // (section 5.2)
                 if (pierced.* == .slice) {
                     return place.pierced;
                 }
@@ -2005,7 +2143,7 @@ pub const Checker = struct {
             },
             .keyword_new => {
                 // 'new' deep-copies the operand value into a fresh heap
-                // allocation (section 4.2); an array operand allocates *[T]
+                // allocation (section 5.2); an array operand allocates *[T]
                 if (unary.operand.* == .array_fill) {
                     return self.checkArrayFill(unary.operand, expected, true);
                 }
@@ -2031,7 +2169,7 @@ pub const Checker = struct {
             },
             .keyword_move => {
                 // 'move' is the only address-reading operator: it transfers
-                // an owning pointer and clears the source (section 4.2)
+                // an owning pointer and clears the source (section 5.2)
                 const place = try self.lvalueOf(unary.operand) orelse {
                     _ = try self.checkExpression(unary.operand, null);
                     try self.report(unary.operator.location, "'move' requires an owning pointer variable or field", .{});
@@ -2047,15 +2185,15 @@ pub const Checker = struct {
                     },
                 }
                 if (!place.mutable) {
-                    try self.report(unary.operator.location, "'move' clears its source, which must be mutable (section 3.8)", .{});
+                    try self.report(unary.operator.location, "'move' clears its source, which must be mutable (section 4.8)", .{});
                 }
-                // definite move tracking (section 4.2): a bare variable is
+                // definite move tracking (section 5.2): a bare variable is
                 // marked; a field or element move only checks its root
                 const operand_unwrapped = unwrapGrouped(unary.operand);
                 if (rootPathToken(unary.operand)) |root_token| {
                     if (self.lookupPointer(root_token.slice(self.source()))) |binding| {
                         if (binding.moved) {
-                            try self.report(unary.operator.location, "'{s}' was already moved (section 4.2)", .{root_token.slice(self.source())});
+                            try self.report(unary.operator.location, "'{s}' was already moved (section 5.2)", .{root_token.slice(self.source())});
                         }
                         if (operand_unwrapped.* == .path) binding.moved = true;
                     }
@@ -2076,7 +2214,7 @@ pub const Checker = struct {
             .plus, .minus, .asterisk, .slash, .percent => {
                 const left = try self.checkExpression(binary.left, null);
                 const right = try self.checkExpression(binary.right, null);
-                if (!self.isNumericOperand(left) or !self.isNumericOperand(right)) {
+                if (!try self.isNumericOperand(left) or !try self.isNumericOperand(right)) {
                     try self.report(operator.location, "'{s}' requires numeric operands", .{operator.tag.lexeme().?});
                     return &unknown_type;
                 }
@@ -2109,7 +2247,7 @@ pub const Checker = struct {
             .angle_left, .angle_left_equal, .angle_right, .angle_right_equal => {
                 const left = try self.checkExpression(binary.left, null);
                 const right = try self.checkExpression(binary.right, null);
-                if (!self.isNumericOperand(left) or !self.isNumericOperand(right) or try self.unify(left, right) == null) {
+                if (!try self.isNumericOperand(left) or !try self.isNumericOperand(right) or try self.unify(left, right) == null) {
                     try self.operandMismatch(operator, left, right);
                 }
                 return &bool_type;
@@ -2118,9 +2256,9 @@ pub const Checker = struct {
                 const left = try self.checkExpression(binary.left, null);
                 const right = try self.checkExpression(binary.right, null);
                 // closures have no defined identity or structural equality
-                // (section 4.4)
+                // (section 5.4)
                 if ((try self.resolveAlias(left)).* == .function or (try self.resolveAlias(right)).* == .function) {
-                    try self.report(operator.location, "function values cannot be compared (section 4.4)", .{});
+                    try self.report(operator.location, "function values cannot be compared (section 5.4)", .{});
                     return &bool_type;
                 }
                 if (try self.unify(left, right) == null) {
@@ -2131,7 +2269,7 @@ pub const Checker = struct {
             .ampersand_ampersand, .pipe_pipe => {
                 const left = try self.checkExpression(binary.left, null);
                 // the right side runs conditionally: its moves and revives
-                // are not definite (section 4.2)
+                // are not definite (section 5.2)
                 const left_moved = try self.movedSnapshot();
                 const right = try self.checkExpression(binary.right, null);
                 const right_moved = try self.movedSnapshot();
@@ -2161,13 +2299,13 @@ pub const Checker = struct {
         const cast = expression.cast;
         const operand = try self.checkExpression(cast.operand, null);
         switch (cast.operator.tag) {
-            // 'x as T' reinterprets bytes; widths must match (section 3.5)
+            // 'x as T' reinterprets bytes; widths must match (section 4.5)
             .keyword_as => {
                 const target = try self.typeFromExpression(cast.target, self.scope_types);
                 const source_resolved = try self.resolveAlias(try self.defaulted(operand));
                 const target_resolved = try self.resolveAlias(target);
                 // '&S as &T' views the pointee in place, so the pointee
-                // layouts are what must agree (section 3.5)
+                // layouts are what must agree (section 4.5)
                 var source_measured = source_resolved;
                 var target_measured = target_resolved;
                 if (source_resolved.* == .reference and target_resolved.* == .reference) {
@@ -2177,7 +2315,7 @@ pub const Checker = struct {
                 const source_layout = try self.layoutOf(source_measured, 0);
                 const target_layout = try self.layoutOf(target_measured, 0);
                 if (source_layout != null and target_layout != null and source_layout.?.size != target_layout.?.size) {
-                    try self.report(cast.operator.location, "'as' reinterprets bytes in place: {s} is {d} byte(s) but {s} is {d} byte(s) (section 3.5)", .{
+                    try self.report(cast.operator.location, "'as' reinterprets bytes in place: {s} is {d} byte(s) but {s} is {d} byte(s) (section 4.5)", .{
                         try source_measured.render(self.arena),
                         source_layout.?.size,
                         try target_measured.render(self.arena),
@@ -2187,7 +2325,7 @@ pub const Checker = struct {
                     !(source_resolved.* == .primitive and target_resolved.* == .primitive))
                 {
                     // a value cast beyond primitives records its byte shapes
-                    // so the interpreter can reinterpret (section 3.5)
+                    // so the interpreter can reinterpret (section 4.5)
                     const source_shape = try self.shapeOf(source_measured, 0);
                     const target_shape = try self.shapeOf(target_measured, 0);
                     if (source_shape != null and target_shape != null) {
@@ -2196,28 +2334,28 @@ pub const Checker = struct {
                 }
                 return target;
             },
-            // 'x to T' converts between Number types (section 3.5)
+            // 'x to T' converts between Number types (section 4.5)
             .keyword_to => {
                 const target = try self.typeFromExpression(cast.target, self.scope_types);
                 const target_resolved = try self.resolveAlias(target);
                 const target_numeric = target_resolved.isNumeric() and target_resolved.* != .unknown or target_resolved.* == .type_parameter;
                 const operand_resolved = try self.resolveAlias(operand);
                 if (!operand_resolved.isNumeric() and operand_resolved.* != .type_parameter) {
-                    try self.report(cast.operator.location, "'to' converts Number values; the operand is not numeric (section 3.5)", .{});
+                    try self.report(cast.operator.location, "'to' converts Number values; the operand is not numeric (section 4.5)", .{});
                 } else if (!target_numeric) {
                     const rendered = try target.render(self.arena);
-                    try self.report(cast.operator.location, "'to' converts to Number types, found {s} (section 3.5)", .{rendered});
+                    try self.report(cast.operator.location, "'to' converts to Number types, found {s} (section 4.5)", .{rendered});
                 }
                 return target;
             },
             // 'x is T' tests an enum variant or an interface object's
-            // concrete type, yielding bool (section 3.2)
+            // concrete type, yielding bool (section 4.2)
             .keyword_is => {
                 if (try self.enumBody(operand)) |body| {
                     const variant_token = cast.target.named.path[cast.target.named.path.len - 1];
                     const variant_name = variant_token.slice(self.source());
                     if (cast.target.named.path.len == 1 and !cast.target.named.implied) {
-                        try self.report(variant_token.location, "an enum variant test needs '::{s}' or '{s}::{s}' (section 3.2)", .{ variant_name, body.name, variant_name });
+                        try self.report(variant_token.location, "an enum variant test needs '::{s}' or '{s}::{s}' (section 4.2)", .{ variant_name, body.name, variant_name });
                     }
                     var found = false;
                     for (body.variants) |variant| {
@@ -2231,19 +2369,19 @@ pub const Checker = struct {
                     }
                 } else if (try self.interfaceObject(operand)) |interface| {
                     // runtime identity carries no instantiation, so a
-                    // generic interface object only dispatches (section 5.2)
+                    // generic interface object only dispatches (section 6.2)
                     if (interface.arguments.len != 0) {
-                        try self.report(cast.operator.location, "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 5.2)", .{interface.name});
+                        try self.report(cast.operator.location, "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 6.2)", .{interface.name});
                         if (cast.capture) |capture| try self.bind(capture.name, &unknown_type, false);
                         return &bool_type;
                     }
                     const target = try self.typeFromExpression(cast.target, self.scope_types);
                     if (target.* != .unknown and !try self.implements(target, interface)) {
                         const rendered = try target.render(self.arena);
-                        try self.report(cast.operator.location, "{s} does not implement '{s}', so this 'is' test can never succeed (section 3.2)", .{ rendered, interface.name });
+                        try self.report(cast.operator.location, "{s} does not implement '{s}', so this 'is' test can never succeed (section 4.2)", .{ rendered, interface.name });
                     }
                     // record the resolved concrete type so runtime identity
-                    // never re-resolves by name (section 3.2)
+                    // never re-resolves by name (section 4.2)
                     const resolved_target = try self.resolveAlias(target);
                     if (resolved_target.* == .declared) {
                         try self.type_targets.put(self.arena, expression, .{
@@ -2253,16 +2391,16 @@ pub const Checker = struct {
                     }
                 } else if (operand.* != .unknown) {
                     const rendered = try operand.render(self.arena);
-                    try self.report(cast.operator.location, "'is' tests enum variants and interface objects; the subject is {s} (section 3.2)", .{rendered});
+                    try self.report(cast.operator.location, "'is' tests enum variants and interface objects; the subject is {s} (section 4.2)", .{rendered});
                 }
                 // the inline capture binds only where its success dominates
                 // every use: a direct '&&' conjunct of an if or while
-                // condition (section 3.2)
+                // condition (section 4.2)
                 if (cast.capture) |capture| {
                     if (self.condition_captures.contains(expression)) {
                         try self.bindInlineCapture(cast, capture, operand);
                     } else {
-                        try self.report(capture.name.location, "an 'is' capture is only valid on a direct '&&' conjunct of an 'if' or 'while' condition (section 3.2)", .{});
+                        try self.report(capture.name.location, "an 'is' capture is only valid on a direct '&&' conjunct of an 'if' or 'while' condition (section 4.2)", .{});
                         try self.bind(capture.name, &unknown_type, false);
                     }
                 }
@@ -2280,7 +2418,7 @@ pub const Checker = struct {
             try self.report(self.expressionSpan(index.subscript), "an array index must be an integer", .{});
         }
         const resolved = try self.resolveAlias(base);
-        // reading an element pierces like any read (section 4.2)
+        // reading an element pierces like any read (section 5.2)
         return switch (resolved.*) {
             .slice => |slice| self.pierce(slice.child),
             .heap_array => |heap| self.pierce(heap.child),
@@ -2295,7 +2433,7 @@ pub const Checker = struct {
     }
 
     // 'arr[start..end]' borrows a slice viewing the range in place
-    // (section 3.2); the view is mutable when the subject location is
+    // (section 4.2); the view is mutable when the subject location is
     fn checkSubslice(self: *Checker, expression: *const ast.Expression) Error!*const Type {
         const subslice = expression.subslice;
         if (subslice.start) |start| {
@@ -2335,7 +2473,7 @@ pub const Checker = struct {
     fn checkMember(self: *Checker, expression: *const ast.Expression) Error!*const Type {
         const member = expression.member;
         const base = try self.checkExpression(member.object, null);
-        // pointee transparency (section 4.2): reading a pointer or
+        // pointee transparency (section 5.2): reading a pointer or
         // reference field yields a copy of the pointee
         return self.pierce(try self.memberType(base, member.name));
     }
@@ -2369,7 +2507,7 @@ pub const Checker = struct {
                 },
             };
             // generic instantiation comes from explicit arguments
-            // ('Vec<u32> { ... }', section 3.7) or the contextual type
+            // ('Vec<u32> { ... }', section 4.7) or the contextual type
             // ('var v: Vec<u32> = Vec { ... }'); a bare generic init with
             // neither cannot bind its type parameters
             var arguments: []const *const Type = &.{};
@@ -2405,7 +2543,7 @@ pub const Checker = struct {
             try self.checkStructInitMembers(initialized, struct_init.members, name_token.location);
             return initialized;
         }
-        // anonymous initializer: a structural value (section 3.3 rule 6)
+        // anonymous initializer: a structural value (section 4.3 rule 6)
         var fields: std.ArrayList(Type.Field) = .empty;
         for (struct_init.members) |member| {
             const value_type = try self.checkExpression(member.value, null);
@@ -2471,20 +2609,20 @@ pub const Checker = struct {
             if (under_new) {
                 return self.makeType(.{ .heap_array = .{ .mutable = true, .child = try self.defaulted(value_type) } });
             }
-            // a fixed array's length is positive (section 3.2)
+            // a fixed array's length is positive (section 4.2)
             if (length == 0) {
-                try self.report(self.expressionSpan(array_fill.count), "a fixed array needs at least one element (section 3.2)", .{});
+                try self.report(self.expressionSpan(array_fill.count), "a fixed array needs at least one element (section 4.2)", .{});
             }
             return self.makeType(.{ .fixed_array = .{ .element = value_type, .length = length } });
         }
         if (!under_new) {
-            try self.report(self.expressionSpan(expression), "a runtime-sized array fill requires 'new' (section 4.2); a stack array's count must be compile-time evaluatable", .{});
+            try self.report(self.expressionSpan(expression), "a runtime-sized array fill requires 'new' (section 5.2); a stack array's count must be compile-time evaluatable", .{});
             return &unknown_type;
         }
         return self.makeType(.{ .heap_array = .{ .mutable = true, .child = try self.defaulted(value_type) } });
     }
 
-    // '[start..end]' generates the integers start..end-1 (section 2.1):
+    // '[start..end]' generates the integers start..end-1 (section 3.1):
     // literal bounds make a fixed array, runtime bounds need 'new' (heap
     // array) or a 'for' subject position, where no array materializes
     fn checkArrayRange(self: *Checker, expression: *const ast.Expression, expected: ?*const Type, under_new: bool, as_loop_subject: bool) Error!*const Type {
@@ -2542,12 +2680,12 @@ pub const Checker = struct {
         if (as_loop_subject) {
             return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.defaulted(element_type) } });
         }
-        try self.report(self.expressionSpan(expression), "a runtime-bounded range requires 'new' outside a 'for' subject (section 2.1); a stack array's size must be compile-time evaluatable", .{});
+        try self.report(self.expressionSpan(expression), "a runtime-bounded range requires 'new' outside a 'for' subject (section 3.1); a stack array's size must be compile-time evaluatable", .{});
         return &unknown_type;
     }
 
     // the tokenizer validates escape introducers; the payloads (\xHH digit
-    // count, \u{...} contents) are checked here (section 1.6)
+    // count, \u{...} contents) are checked here (section 2.6)
     fn validateEscapes(self: *Checker, token: Token) Error!void {
         const text = token.slice(self.source());
         if (text.len < 2) return;
@@ -2561,29 +2699,29 @@ pub const Checker = struct {
                     const stop = @min(introducer + 3, end);
                     const digits = text[@min(introducer + 1, stop)..stop];
                     if (digits.len != 2 or !isHexDigit(digits[0]) or !isHexDigit(digits[1])) {
-                        try self.report(escapeLocation(token, index, stop), "'\\x' needs exactly two hex digits (section 1.6)", .{});
+                        try self.report(escapeLocation(token, index, stop), "'\\x' needs exactly two hex digits (section 2.6)", .{});
                         return;
                     }
                     index = introducer + 2;
                 },
                 'u', 'U' => {
                     if (introducer + 1 >= end or text[introducer + 1] != '{') {
-                        try self.report(escapeLocation(token, index, @min(introducer + 2, end)), "'\\u' needs '{{' hex digits '}}' (section 1.6)", .{});
+                        try self.report(escapeLocation(token, index, @min(introducer + 2, end)), "'\\u' needs '{{' hex digits '}}' (section 2.6)", .{});
                         return;
                     }
                     var close = introducer + 2;
                     while (close < end and text[close] != '}') close += 1;
                     const digits = text[introducer + 2 .. close];
                     if (close >= end or digits.len == 0) {
-                        try self.report(escapeLocation(token, index, close + 1), "'\\u' needs '{{' hex digits '}}' (section 1.6)", .{});
+                        try self.report(escapeLocation(token, index, close + 1), "'\\u' needs '{{' hex digits '}}' (section 2.6)", .{});
                         return;
                     }
                     const scalar = std.fmt.parseInt(u21, digits, 16) catch {
-                        try self.report(escapeLocation(token, index, close + 1), "'\\u{{...}}' is not a valid Unicode scalar value (section 1.6)", .{});
+                        try self.report(escapeLocation(token, index, close + 1), "'\\u{{...}}' is not a valid Unicode scalar value (section 2.6)", .{});
                         return;
                     };
                     if (scalar > 0x10FFFF or (scalar >= 0xD800 and scalar <= 0xDFFF)) {
-                        try self.report(escapeLocation(token, index, close + 1), "'\\u{{...}}' is not a valid Unicode scalar value (section 1.6)", .{});
+                        try self.report(escapeLocation(token, index, close + 1), "'\\u{{...}}' is not a valid Unicode scalar value (section 2.6)", .{});
                         return;
                     }
                     index = close;
@@ -2637,14 +2775,14 @@ pub const Checker = struct {
                 position += 1;
             }
         }
-        // the smallest unsigned width holding the bytes (section 1.6)
+        // the smallest unsigned width holding the bytes (section 2.6)
         const primitive: types.Primitive = switch (byte_count) {
             0, 1 => .u8,
             2 => .u16,
             3, 4 => .u32,
             5, 6, 7, 8 => .u64,
             else => {
-                try self.report(token.location, "character literal exceeds 8 bytes (section 1.6)", .{});
+                try self.report(token.location, "character literal exceeds 8 bytes (section 2.6)", .{});
                 return &unknown_type;
             },
         };
@@ -2653,7 +2791,7 @@ pub const Checker = struct {
 
     fn checkLambda(self: *Checker, expression: *const ast.Expression) Error!*const Type {
         const lambda = expression.lambda;
-        // capture values are computed in the enclosing scope (section 4.4)
+        // capture values are computed in the enclosing scope (section 5.4)
         var capture_bindings: std.ArrayList(Binding) = .empty;
         for (lambda.captures) |capture| {
             const name = capture.name.slice(self.source());
@@ -2662,12 +2800,12 @@ pub const Checker = struct {
                 continue;
             };
             if (outer.moved) {
-                try self.report(capture.name.location, "use of '{s}' after 'move' (section 4.2)", .{name});
+                try self.report(capture.name.location, "use of '{s}' after 'move' (section 5.2)", .{name});
             }
             const bound = try self.captureBinding(capture, outer.binding_type, outer.mutable, try self.pierce(outer.binding_type));
             try capture_bindings.append(self.arena, bound);
             // an owning capture moves the outer variable at construction,
-            // which is unconditional (section 4.4)
+            // which is unconditional (section 5.4)
             if (capture.modifier) |modifier| {
                 if (modifier == .pointer or modifier == .pointer_var) {
                     if (self.lookupPointer(name)) |outer_binding| outer_binding.moved = true;
@@ -2711,7 +2849,7 @@ pub const Checker = struct {
         const return_resolved = try self.resolveAlias(return_type);
         if (return_resolved.* != .void_type and return_resolved.* != .unknown and !statementTerminates(lambda.function.body)) {
             const rendered = try return_type.render(self.arena);
-            try self.report(self.expressionSpan(expression), "control can fall off the end of this lambda, which must return {s} on every path (section 4.3)", .{rendered});
+            try self.report(self.expressionSpan(expression), "control can fall off the end of this lambda, which must return {s} on every path (section 5.3)", .{rendered});
         }
         return self.makeType(.{ .function = .{
             .parameter_types = try parameter_types.toOwnedSlice(self.arena),
@@ -2734,51 +2872,55 @@ pub const Checker = struct {
         }
     }
 
-    // capture typing (section 2.1): deep copy by default, '&'/' &var' borrow
+    // capture typing (section 3.1): deep copy by default, '&'/' &var' borrow
     // in place, '*'/'*var' take ownership of a pointer-typed value
-    // a downcast capture mirrors the subject's indirection: a '&Shape'
-    // subject yields '&Circle', '*var Shape' yields '*var Circle' (section 3.2)
+    // an interface-object capture must state its form, since an erased
+    // value cannot be copied: '|&c|' / '|&var c|' borrow the concrete value
+    // in place, '|move c|' takes ownership of it; the subject must allow
+    // the form asked for (section 4.2)
     fn downcastBinding(self: *Checker, capture: ast.Capture, subject_raw: *const Type, target: *const Type) Error!Binding {
-        if (capture.modifier != null or capture.annotation != null) {
-            try self.report(capture.name.location, "a downcast capture mirrors the subject's indirection and takes no modifier or annotation (section 3.2)", .{});
-        }
         const name = capture.name.slice(self.source());
-        return switch (subject_raw.*) {
-            .reference => |indirection| .{
-                .name = name,
-                .binding_type = try self.makeType(.{ .reference = .{ .mutable = indirection.mutable, .child = target } }),
-                .mutable = indirection.mutable,
-            },
-            .pointer => |indirection| .{
-                .name = name,
-                .binding_type = try self.makeType(.{ .pointer = .{ .mutable = indirection.mutable, .child = target } }),
-                .mutable = indirection.mutable,
-            },
-            // a pierced subject reads as a reference to the concrete value
-            else => .{
+        const subject_mutable = switch (subject_raw.*) {
+            .reference => |indirection| indirection.mutable,
+            .pointer => |indirection| indirection.mutable,
+            else => false,
+        };
+        const modifier = capture.modifier orelse {
+            try self.report(capture.name.location, "an interface-object capture must state its form: '|&{s}|', '|&var {s}|', or '|move {s}|' - an erased value cannot be copied (section 4.2)", .{ name, name, name });
+            return .{ .name = name, .binding_type = &unknown_type, .mutable = false };
+        };
+        switch (modifier) {
+            .reference => return .{
                 .name = name,
                 .binding_type = try self.makeType(.{ .reference = .{ .mutable = false, .child = target } }),
                 .mutable = false,
             },
-        };
+            .reference_var => {
+                if (!subject_mutable) {
+                    try self.report(capture.name.location, "a '|&var {s}|' capture needs a '&var' or '*var' interface object (section 4.2)", .{name});
+                }
+                return .{
+                    .name = name,
+                    .binding_type = try self.makeType(.{ .reference = .{ .mutable = true, .child = target } }),
+                    .mutable = true,
+                };
+            },
+            .pointer, .pointer_var => {
+                if (subject_raw.* != .pointer) {
+                    try self.report(capture.name.location, "a '|move {s}|' capture needs an owning '*' or '*var' interface object (section 4.2)", .{name});
+                    return .{ .name = name, .binding_type = &unknown_type, .mutable = false };
+                }
+                return .{
+                    .name = name,
+                    .binding_type = try self.makeType(.{ .pointer = .{ .mutable = subject_mutable, .child = target } }),
+                    .mutable = subject_mutable,
+                };
+            },
+        }
     }
 
     fn captureBinding(self: *Checker, capture: ast.Capture, subject_raw: *const Type, subject_mutable: bool, subject_value: *const Type) Error!Binding {
         const name = capture.name.slice(self.source());
-        if (capture.annotation) |annotation| {
-            const annotated = try self.typeFromExpression(annotation, self.scope_types);
-            if (annotated.* == .reference) {
-                if (annotated.reference.mutable and !subject_mutable) {
-                    try self.report(capture.name.location, "a '&var' capture requires a mutable subject (section 2.1)", .{});
-                }
-                if (!try self.coerce(subject_value, annotated.reference.child)) {
-                    try self.typeMismatch(capture.name.location, subject_value, annotated.reference.child);
-                }
-            } else if (!try self.coerce(subject_value, annotated)) {
-                try self.typeMismatch(capture.name.location, subject_value, annotated);
-            }
-            return .{ .name = name, .binding_type = annotated, .mutable = annotated.* == .reference and annotated.reference.mutable };
-        }
         if (capture.modifier) |modifier| {
             switch (modifier) {
                 .reference => {
@@ -2787,23 +2929,24 @@ pub const Checker = struct {
                 },
                 .reference_var => {
                     if (!subject_mutable) {
-                        try self.report(capture.name.location, "a '&var' capture requires a mutable subject (section 2.1)", .{});
+                        try self.report(capture.name.location, "a '&var' capture requires a mutable subject (section 3.1)", .{});
                     }
                     const bound = try self.makeType(.{ .reference = .{ .mutable = true, .child = try self.defaulted(subject_value) } });
                     return .{ .name = name, .binding_type = bound, .mutable = true };
                 },
                 .pointer, .pointer_var => {
-                    // owning capture: only pointers are movable (section 2.1)
+                    // owning capture: only pointers are movable (section 3.1)
                     const is_pointer = subject_raw.* == .pointer or subject_raw.* == .heap_array or subject_raw.* == .unknown;
                     if (!is_pointer) {
                         const rendered = try subject_raw.render(self.arena);
-                        try self.report(capture.name.location, "an owning capture requires a pointer-typed value, found {s} (section 2.1)", .{rendered});
-                        return .{ .name = name, .binding_type = &unknown_type, .mutable = modifier == .pointer_var };
+                        try self.report(capture.name.location, "an owning capture requires a pointer-typed value, found {s} (section 3.1)", .{rendered});
+                        return .{ .name = name, .binding_type = &unknown_type, .mutable = false };
                     }
                     if (!subject_mutable) {
-                        try self.report(capture.name.location, "an owning capture moves out of its subject, which must be mutable (section 2.1)", .{});
+                        try self.report(capture.name.location, "an owning capture moves out of its subject, which must be mutable (section 3.1)", .{});
                     }
-                    return .{ .name = name, .binding_type = subject_raw, .mutable = modifier == .pointer_var };
+                    const pointer_mutable = subject_raw.* == .pointer and subject_raw.pointer.mutable;
+                    return .{ .name = name, .binding_type = subject_raw, .mutable = pointer_mutable };
                 },
             }
         }
@@ -2814,7 +2957,7 @@ pub const Checker = struct {
     fn checkIf(self: *Checker, if_expr: ast.IfExpression, expression: *const ast.Expression, as_value: bool) Error!*const Type {
         // the frame spans condition and then-branch: inline 'is' captures
         // bind while the condition checks, visible to later '&&' conjuncts
-        // and the body (section 3.2)
+        // and the body (section 4.2)
         try self.pushFrame(false);
         try self.registerConditionCaptures(if_expr.condition);
         const condition_type = try self.checkExpression(if_expr.condition, null);
@@ -2826,49 +2969,66 @@ pub const Checker = struct {
         // to the enclosing loop, and 'yield' has nothing to feed
         if (as_value) try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .value_construct });
 
-        // definite-move merging (section 4.2): each branch runs from the
+        // definite-move merging (section 5.2): each branch runs from the
         // entry state, and only moves surviving every falling-through
         // path stay definite
         const entry_moved = try self.movedSnapshot();
-        try self.checkStatement(if_expr.then_branch);
+        try self.checkBranch(if_expr.then_branch, as_value);
         self.popFrame();
         const then_moved = try self.movedSnapshot();
         self.restoreMoved(entry_moved);
 
         var else_moved: ?[]const bool = null;
         if (if_expr.else_branch) |else_branch| {
-            try self.checkStatement(else_branch);
+            try self.checkBranch(else_branch, as_value);
             else_moved = try self.movedSnapshot();
         }
         self.restoreMoved(entry_moved);
-        if (!statementTerminates(if_expr.then_branch)) self.intersectMoved(then_moved);
+        if (!branchTerminates(if_expr.then_branch, as_value)) self.intersectMoved(then_moved);
         if (if_expr.else_branch) |else_branch| {
-            if (!statementTerminates(else_branch)) self.intersectMoved(else_moved.?);
+            if (!branchTerminates(else_branch, as_value)) self.intersectMoved(else_moved.?);
         }
 
         if (!as_value) return &void_type;
         const frame = self.yield_frames.pop().?;
         const yielded = frame.yielded orelse {
-            try self.report(self.expressionSpan(expression), "this if is used as a value but no branch does 'yield value' (section 4.3)", .{});
+            try self.report(self.expressionSpan(expression), "this if is used as a value but no branch does 'yield value' (section 5.3)", .{});
             return &unknown_type;
         };
         if (if_expr.else_branch == null) {
-            try self.report(self.expressionSpan(expression), "an if used as a value needs an else branch", .{});
+            try self.report(self.expressionSpan(expression), "an if used as a value needs an else branch (section 3.1)", .{});
         }
-        // every path must produce the value or leave the construct
-        if (!statementTerminates(if_expr.then_branch)) {
-            try self.report(self.expressionSpan(expression), "a branch of this value-yielding if can complete without 'yield' (section 4.3)", .{});
+        // every block branch must produce the value or leave the construct;
+        // a bare-expression branch yields by itself (section 5.3)
+        if (!branchTerminates(if_expr.then_branch, as_value)) {
+            try self.report(self.expressionSpan(expression), "a branch of this value-yielding if can complete without 'yield' (section 5.3)", .{});
         } else if (if_expr.else_branch) |else_branch| {
-            if (!statementTerminates(else_branch)) {
-                try self.report(self.expressionSpan(expression), "a branch of this value-yielding if can complete without 'yield' (section 4.3)", .{});
+            if (!branchTerminates(else_branch, as_value)) {
+                try self.report(self.expressionSpan(expression), "a branch of this value-yielding if can complete without 'yield' (section 5.3)", .{});
             }
         }
         return yielded;
     }
 
+    // an 'if' branch or 'match' arm in value position that is not a block
+    // is a bare expression yielding its value implicitly (section 3.1)
+    fn checkBranch(self: *Checker, branch: *const ast.Statement, as_value: bool) Error!void {
+        if (as_value and branch.* == .expression) {
+            const frame = self.innermostValueFrame().?;
+            try self.recordYield(frame, branch.expression, self.expressionSpan(branch.expression), "yield");
+            return;
+        }
+        try self.checkStatement(branch);
+    }
+
+    fn branchTerminates(branch: *const ast.Statement, as_value: bool) bool {
+        if (as_value and branch.* == .expression) return true;
+        return statementTerminates(branch);
+    }
+
     // marks the 'is' tests allowed to carry a capture: the direct '&&'
     // conjuncts of an if or while condition, where a successful test
-    // dominates every use of its binding (section 3.2)
+    // dominates every use of its binding (section 4.2)
     fn registerConditionCaptures(self: *Checker, condition: *const ast.Expression) Error!void {
         const unwrapped = unwrapGrouped(condition);
         if (unwrapped.* == .binary and unwrapped.binary.operator.tag == .ampersand_ampersand) {
@@ -2902,7 +3062,7 @@ pub const Checker = struct {
             if (std.mem.eql(u8, variant.name, variant_name)) break variant.payload;
         } else null;
         const payload_type = payload orelse {
-            try self.report(capture.name.location, "variant '{s}' carries no payload to capture (section 3.2)", .{variant_name});
+            try self.report(capture.name.location, "variant '{s}' carries no payload to capture (section 4.2)", .{variant_name});
             try self.bind(capture.name, &unknown_type, false);
             return;
         };
@@ -2914,16 +3074,16 @@ pub const Checker = struct {
 
     fn checkWhile(self: *Checker, while_expr: ast.WhileExpression, expression: *const ast.Expression, as_value: bool) Error!*const Type {
         // condition captures are visible in the body, re-bound each
-        // iteration (section 3.2)
+        // iteration (section 4.2)
         try self.pushFrame(false);
         try self.registerConditionCaptures(while_expr.condition);
         const condition_type = try self.checkExpression(while_expr.condition, null);
         if (!condition_type.isBool()) {
             try self.report(self.expressionSpan(while_expr.condition), "a while condition must be bool", .{});
         }
-        try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .loop });
+        try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .loop, .value_loop = as_value });
         // the body and the else run conditionally: their moves and revives
-        // both merge back against the entry state (section 4.2)
+        // both merge back against the entry state (section 5.2)
         const entry_moved = try self.movedSnapshot();
         try self.checkStatement(while_expr.body);
         self.popFrame();
@@ -2931,7 +3091,7 @@ pub const Checker = struct {
         self.restoreMoved(entry_moved);
         var else_moved: ?[]const bool = null;
         if (while_expr.else_branch) |else_branch| {
-            try self.checkStatement(else_branch);
+            try self.checkLoopElse(else_branch);
             else_moved = try self.movedSnapshot();
         }
         self.restoreMoved(entry_moved);
@@ -2939,17 +3099,32 @@ pub const Checker = struct {
         if (else_moved) |flags| self.intersectMoved(flags);
         const frame = self.yield_frames.pop().?;
         if (!as_value) return &void_type;
-        if (while_expr.else_branch) |else_branch| {
-            // the else is the loop's fall-through path: it must produce
-            // the value or leave the construct (section 4.3)
-            if (!statementTerminates(else_branch)) {
-                try self.report(self.expressionSpan(expression), "the 'else' of this value-yielding loop can complete without 'break value' (section 4.3)", .{});
+        return self.loopValue(frame, while_expr.else_branch, expression);
+    }
+
+    // the 'else' of a value-position loop is outside the loop body: a
+    // 'yield' there produces the loop's value, a 'break' targets an outer
+    // loop (section 5.3)
+    fn checkLoopElse(self: *Checker, else_branch: *const ast.Statement) Error!void {
+        const frame = &self.yield_frames.items[self.yield_frames.items.len - 1];
+        const saved_kind = frame.kind;
+        frame.kind = .value_construct;
+        defer frame.kind = saved_kind;
+        try self.checkStatement(else_branch);
+    }
+
+    // a loop used as a value needs an 'else' that yields on every path, and
+    // a value from somewhere (section 5.3)
+    fn loopValue(self: *Checker, frame: YieldFrame, else_branch: ?*const ast.Statement, expression: *const ast.Expression) Error!*const Type {
+        if (else_branch) |branch| {
+            if (!statementTerminates(branch)) {
+                try self.report(self.expressionSpan(expression), "the 'else' of this value-yielding loop can complete without 'yield' (section 5.3)", .{});
             }
         } else {
-            try self.report(self.expressionSpan(expression), "a loop used as a value requires an 'else' branch (section 4.3)", .{});
+            try self.report(self.expressionSpan(expression), "a loop used as a value needs an 'else' that yields its value (section 5.3)", .{});
         }
         return frame.yielded orelse {
-            try self.report(self.expressionSpan(expression), "this loop is used as a value but never does 'break value' (section 4.3)", .{});
+            try self.report(self.expressionSpan(expression), "this loop is used as a value but never yields one (section 5.3)", .{});
             return &unknown_type;
         };
     }
@@ -2959,7 +3134,7 @@ pub const Checker = struct {
         var element_mutability: std.ArrayList(bool) = .empty;
         for (for_expr.subjects) |subject| {
             // a range subject never materializes: runtime bounds are fine
-            // and the loop lowers to a counting loop (section 4.3)
+            // and the loop lowers to a counting loop (section 5.3)
             const subject_type = if (subject.* == .array_range)
                 try self.checkArrayRange(subject, null, false, true)
             else
@@ -2979,7 +3154,7 @@ pub const Checker = struct {
                 else => false,
             };
             if (element == null) {
-                // the cursor protocol (section 4.3): 'iterator()' yields a
+                // the cursor protocol (section 5.3): 'iterator()' yields a
                 // cursor whose 'next()' returns Option<T>
                 if (try self.cursorElement(subject, subject_type)) |cursor_element| {
                     // a custom subject additionally declares its Iterable
@@ -3001,7 +3176,7 @@ pub const Checker = struct {
             try element_mutability.append(self.arena, mutable);
         }
 
-        try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .loop });
+        try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .loop, .value_loop = as_value });
         const entry_moved = try self.movedSnapshot();
         try self.pushFrame(false);
         for (for_expr.captures, 0..) |capture, capture_index| {
@@ -3019,7 +3194,7 @@ pub const Checker = struct {
         self.restoreMoved(entry_moved);
         var else_moved: ?[]const bool = null;
         if (for_expr.else_branch) |else_branch| {
-            try self.checkStatement(else_branch);
+            try self.checkLoopElse(else_branch);
             else_moved = try self.movedSnapshot();
         }
         self.restoreMoved(entry_moved);
@@ -3027,17 +3202,7 @@ pub const Checker = struct {
         if (else_moved) |flags| self.intersectMoved(flags);
         const frame = self.yield_frames.pop().?;
         if (!as_value) return &void_type;
-        if (for_expr.else_branch) |else_branch| {
-            if (!statementTerminates(else_branch)) {
-                try self.report(self.expressionSpan(expression), "the 'else' of this value-yielding loop can complete without 'break value' (section 4.3)", .{});
-            }
-        } else {
-            try self.report(self.expressionSpan(expression), "a loop used as a value requires an 'else' branch (section 4.3)", .{});
-        }
-        return frame.yielded orelse {
-            try self.report(self.expressionSpan(expression), "this loop is used as a value but never does 'break value' (section 4.3)", .{});
-            return &unknown_type;
-        };
+        return self.loopValue(frame, for_expr.else_branch, expression);
     }
 
     // whether a custom 'for' subject declares Iterable conformance
@@ -3073,7 +3238,7 @@ pub const Checker = struct {
         }
     }
 
-    // resolves the cursor protocol for one 'for' subject (section 4.3):
+    // resolves the cursor protocol for one 'for' subject (section 5.3):
     // 'subject.iterator()' yields a cursor, 'cursor.next()' yields
     // 'Option<T>', and the loop variable binds to T
     fn cursorElement(self: *Checker, subject: *const ast.Expression, subject_type: *const Type) Error!?*const Type {
@@ -3102,7 +3267,7 @@ pub const Checker = struct {
     };
 
     /// Resolves an extension call for one monomorphized receiver during
-    /// code generation: a call through a generic constraint (section 5.2)
+    /// code generation: a call through a generic constraint (section 6.2)
     /// records no static target, so each function instance re-resolves the
     /// callee against its concrete receiver type. Closed-world like the
     /// interface vtables: visibility is not re-checked here.
@@ -3120,7 +3285,7 @@ pub const Checker = struct {
             const fn_def = symbol.definition.kind.fn_def;
             if (fn_def.function.parameters.len == 0 or !fn_def.function.parameters[0].is_self) continue;
             // interface-receiver candidates are DEFAULT implementations
-            // (section 5.2); dispatch prefers type-specific extensions and
+            // (section 6.2); dispatch prefers type-specific extensions and
             // handles defaults separately
             if (skip_interface_receivers) {
                 const candidate_environment = try self.typeParameterEnvironment(fn_def.type_parameters, symbol.view_index);
@@ -3174,7 +3339,7 @@ pub const Checker = struct {
         element: *const Type,
     };
 
-    /// Resolves the cursor protocol (section 4.3) for code generation,
+    /// Resolves the cursor protocol (section 5.3) for code generation,
     /// keeping the chosen symbols and their inferred type bindings:
     /// 'subject.iterator()' yields the cursor, 'cursor.next()' yields
     /// 'Option<element>'.
@@ -3203,7 +3368,7 @@ pub const Checker = struct {
         };
     }
 
-    // recognizes an instance of the 'Option<T>' lang item (section 5.1a)
+    // recognizes an instance of the 'Option<T>' lang item (section 6.1a)
     fn optionPayload(self: *Checker, candidate: *const Type) Error!?*const Type {
         const resolved = try self.resolveAlias(candidate);
         if (resolved.* != .declared) return null;
@@ -3216,10 +3381,10 @@ pub const Checker = struct {
 
     // a value-yielding match must be exhaustive: an enum subject by
     // covering all variants or an 'else' arm, every other subject by an
-    // 'else' arm (section 4.3)
+    // 'else' arm (section 5.3)
     fn checkExhaustiveness(self: *Checker, match_expr: ast.MatchExpression, subject_enum: ?EnumBody, expression: *const ast.Expression) Error!void {
         const body = subject_enum orelse {
-            try self.report(self.expressionSpan(expression), "a match over this subject can never cover every value: add an 'else' arm (section 4.3)", .{});
+            try self.report(self.expressionSpan(expression), "a match over this subject can never cover every value: add an 'else' arm (section 5.3)", .{});
             return;
         };
         var missing: std.ArrayList([]const u8) = .empty;
@@ -3238,7 +3403,7 @@ pub const Checker = struct {
         }
         if (missing.items.len == 0) return;
         const joined = try std.mem.join(self.arena, "', '", missing.items);
-        try self.report(self.expressionSpan(expression), "this match does not cover variant{s} '{s}' of '{s}': add arms or an 'else' arm (section 4.3)", .{
+        try self.report(self.expressionSpan(expression), "this match does not cover variant{s} '{s}' of '{s}': add arms or an 'else' arm (section 5.3)", .{
             if (missing.items.len == 1) "" else "s",
             joined,
             body.name,
@@ -3255,7 +3420,7 @@ pub const Checker = struct {
 
         if (as_value) try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .value_construct });
         // each arm runs from the entry move state; the merge keeps only
-        // moves surviving every falling-through arm (section 4.2)
+        // moves surviving every falling-through arm (section 5.2)
         const entry_moved = try self.movedSnapshot();
         var arm_states: std.ArrayList([]const bool) = .empty;
         var has_else_arm = false;
@@ -3270,13 +3435,13 @@ pub const Checker = struct {
                     try self.checkInterfaceArm(interface, pattern, arm.capture, subject_raw);
                 } else {
                     // numeric, character, and string subjects match literal
-                    // patterns; captures are enum-only (section 4.3)
+                    // patterns; captures are enum-only (section 5.3)
                     const pattern_type = try self.checkExpression(pattern, subject_type);
                     if (try self.unify(pattern_type, subject_type) == null) {
                         try self.operandMismatchAt(self.expressionSpan(pattern), pattern_type, subject_type);
                     }
                     if (arm.capture) |capture| {
-                        try self.report(capture.name.location, "pattern captures are only valid on enum payload variants (section 4.3)", .{});
+                        try self.report(capture.name.location, "pattern captures are only valid on enum payload variants (section 5.3)", .{});
                         try self.bind(capture.name, &unknown_type, false);
                     }
                 }
@@ -3284,14 +3449,14 @@ pub const Checker = struct {
                 try self.report(capture.name.location, "an 'else' arm has no payload to capture", .{});
                 try self.bind(capture.name, &unknown_type, false);
             }
-            try self.checkStatement(arm.body);
+            try self.checkBranch(arm.body, as_value);
             self.popFrame();
-            if (!statementTerminates(arm.body)) {
+            if (!branchTerminates(arm.body, as_value)) {
                 try arm_states.append(self.arena, try self.movedSnapshot());
             }
         }
         // only a value-yielding match must be exhaustive; a statement
-        // match with no matching arm simply does nothing (section 4.3)
+        // match with no matching arm simply does nothing (section 5.3)
         if (as_value and !has_else_arm and subject_type.* != .unknown) {
             try self.checkExhaustiveness(match_expr, subject_enum, expression);
         }
@@ -3308,21 +3473,21 @@ pub const Checker = struct {
         const frame = self.yield_frames.pop().?;
         // without an external else, every arm must produce the value or
         // leave the construct; with one, the else is the fall-through path
-        // and must itself produce the value (section 4.3)
+        // and must itself produce the value (section 5.3)
         if (match_expr.else_branch) |else_branch| {
             if (!statementTerminates(else_branch)) {
-                try self.report(self.expressionSpan(expression), "the external 'else' of this value-yielding match can complete without 'yield' (section 4.3)", .{});
+                try self.report(self.expressionSpan(expression), "the external 'else' of this value-yielding match can complete without 'yield' (section 5.3)", .{});
             }
         } else {
             for (match_expr.arms) |arm| {
-                if (!statementTerminates(arm.body)) {
-                    try self.report(self.expressionSpan(expression), "an arm of this value-yielding match can complete without 'yield'; add 'yield' to every arm or an external 'else' (section 4.3)", .{});
+                if (!branchTerminates(arm.body, true)) {
+                    try self.report(self.expressionSpan(expression), "an arm of this value-yielding match can complete without 'yield'; add 'yield' to every arm or an external 'else' (section 5.3)", .{});
                     break;
                 }
             }
         }
         return frame.yielded orelse {
-            try self.report(self.expressionSpan(expression), "this match is used as a value but no arm does 'yield value' (section 4.3)", .{});
+            try self.report(self.expressionSpan(expression), "this match is used as a value but no arm does 'yield value' (section 5.3)", .{});
             return &unknown_type;
         };
     }
@@ -3346,7 +3511,7 @@ pub const Checker = struct {
         };
         if (capture) |arm_capture| {
             const payload_type = member.payload orelse {
-                try self.report(arm_capture.name.location, "variant '{s}' carries no payload to capture (section 4.3)", .{variant_name});
+                try self.report(arm_capture.name.location, "variant '{s}' carries no payload to capture (section 5.3)", .{variant_name});
                 try self.bind(arm_capture.name, &unknown_type, false);
                 return;
             };
@@ -3356,17 +3521,17 @@ pub const Checker = struct {
     }
 
     // a match arm on an interface object names a concrete type and captures
-    // the downcasted value (section 3.2)
+    // the downcasted value (section 4.2)
     fn checkInterfaceArm(self: *Checker, interface: Type.Interface, pattern: *const ast.Expression, capture: ?ast.Capture, subject_raw: *const Type) Error!void {
         // runtime identity carries no instantiation, so a generic
-        // interface object only dispatches (section 5.2)
+        // interface object only dispatches (section 6.2)
         if (interface.arguments.len != 0) {
-            try self.report(self.expressionSpan(pattern), "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 5.2)", .{interface.name});
+            try self.report(self.expressionSpan(pattern), "downcasting a generic interface object ('{s}') is not supported; dispatch through its functions instead (section 6.2)", .{interface.name});
             return;
         }
         const unwrapped = unwrapGrouped(pattern);
         if (unwrapped.* != .path) {
-            try self.report(self.expressionSpan(pattern), "a match arm on an interface object must name a concrete type implementing '{s}' (section 3.2)", .{interface.name});
+            try self.report(self.expressionSpan(pattern), "a match arm on an interface object must name a concrete type implementing '{s}' (section 4.2)", .{interface.name});
             return;
         }
         const path = unwrapped.path;
@@ -3376,7 +3541,7 @@ pub const Checker = struct {
             const symbol = (try self.pathSymbol(path, self.current_view)) orelse break :resolve null;
             if (symbol.definition.kind != .type_def) break :resolve null;
             // record the resolved concrete type so runtime identity never
-            // re-resolves by name (section 3.2)
+            // re-resolves by name (section 4.2)
             try self.type_targets.put(self.arena, pattern, .{
                 .definition = symbol.definition,
                 .view_index = symbol.view_index,
@@ -3388,11 +3553,11 @@ pub const Checker = struct {
                 .arguments = &.{},
             } });
         } orelse {
-            try self.report(name_token.location, "'{s}' is not a type, so it cannot match an interface object's concrete type (section 3.2)", .{name});
+            try self.report(name_token.location, "'{s}' is not a type, so it cannot match an interface object's concrete type (section 4.2)", .{name});
             return;
         };
         if (!try self.implements(target, interface)) {
-            try self.report(name_token.location, "'{s}' does not implement '{s}', so this arm can never match (section 3.2)", .{ name, interface.name });
+            try self.report(name_token.location, "'{s}' does not implement '{s}', so this arm can never match (section 4.2)", .{ name, interface.name });
         }
         if (capture) |arm_capture| {
             const binding = try self.downcastBinding(arm_capture, subject_raw, target);
@@ -3418,7 +3583,7 @@ pub const Checker = struct {
         for (self.unit.associated) |entry| {
             if (entry.type_definition != type_symbol.definition) continue;
             if (!std.mem.eql(u8, entry.name, fn_name)) continue;
-            // callable when unqualified-visible or exported (section 5.4)
+            // callable when unqualified-visible or exported (section 6.4)
             if (!self.visibleFrom(self.current_view, entry.symbol) and entry.symbol.visibility != .exported) continue;
             try result.append(self.arena, entry.symbol);
         }
@@ -3449,7 +3614,7 @@ pub const Checker = struct {
                 }
             }
             // 'Type::name(...)': a function living in the type's namespace
-            // (section 5.4); checked before variant construction because
+            // (section 6.4); checked before variant construction because
             // the resolver forbids a name shared with a variant, and the
             // variant path reports on any unknown name
             if (path.len >= 2) {
@@ -3479,7 +3644,7 @@ pub const Checker = struct {
                 .pierced = try self.pierce(raw),
                 .mutable = if (place) |found| piercedMutability(found) else false,
             };
-            // built-in '.length()' on every array form (section 5.1)
+            // built-in '.length()' on every array form (section 6.1)
             const resolved = try self.resolveAlias(receiver.pierced);
             const is_array = resolved.* == .slice or resolved.* == .heap_array or resolved.* == .fixed_array;
             if (is_array and std.mem.eql(u8, name, "length") and call.arguments.len == 0) {
@@ -3489,21 +3654,21 @@ pub const Checker = struct {
                 for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
                 return &unknown_type;
             }
-            // the '#Type' reflection methods (section 3.4)
+            // the '#Type' reflection methods (section 4.4)
             if (receiver.pierced.* == .type_description) {
                 for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
                 return self.typeDescriptionMethodResult(name, member.name.location);
             }
             // calls through an interface object dispatch at runtime via the
-            // vtable; the interface declaration is the signature (section 5.2)
+            // vtable; the interface declaration is the signature (section 6.2)
             if (receiver.pierced.* == .interface) {
-                return self.callInterfaceFunction(receiver.pierced.interface, member.name, call);
+                return self.callInterfaceFunction(receiver.pierced.interface, member.name, call, receiver);
             }
             // a constrained generic value exposes its constraint's interface
-            // functions, resolved statically per instantiation (section 5.2)
+            // functions, resolved statically per instantiation (section 6.2)
             if (receiver.pierced.* == .type_parameter) {
                 if (receiver.pierced.type_parameter.constraint) |constraint| {
-                    return self.callInterfaceFunction(constraint, member.name, call);
+                    return self.callInterfaceFunction(constraint, member.name, call, receiver);
                 }
             }
             // a struct member of function type is an ordinary indirect call
@@ -3517,11 +3682,11 @@ pub const Checker = struct {
                     }
                 }
             }
-            // extension function call (section 4.5)
+            // extension function call (section 5.5)
             const symbols = try self.visibleSymbols(name, .unqualified, self.current_view);
             if (symbols.items.len == 0) {
                 const rendered = try receiver.pierced.render(self.arena);
-                try self.report(member.name.location, "no extension function '{s}' for {s} (section 4.5)", .{ name, rendered });
+                try self.report(member.name.location, "no extension function '{s}' for {s} (section 5.5)", .{ name, rendered });
                 for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
                 return &unknown_type;
             }
@@ -3534,7 +3699,7 @@ pub const Checker = struct {
                     if (target.definition.kind == .fn_def) {
                         const parameters = target.definition.kind.fn_def.function.parameters;
                         if (parameters.len != 0 and parameters[0].is_self and selfTakesOwnership(parameters[0].parameter_type)) {
-                            try self.report(member.name.location, "'{s}' takes ownership of its receiver: transfer it with '(move ...).{s}(...)' or allocate inline (section 4.2)", .{ name, name });
+                            try self.report(member.name.location, "'{s}' takes ownership of its receiver: transfer it with '(move ...).{s}(...)' or allocate inline (section 5.2)", .{ name, name });
                         }
                     }
                 }
@@ -3605,7 +3770,7 @@ pub const Checker = struct {
         if (symbol.definition.kind != .type_def) return null;
         const type_def = symbol.definition.kind.type_def;
         // enum syntax or a comptime base that may synthesise an enum
-        // (section 3.4); anything else cannot carry variants
+        // (section 4.4); anything else cannot carry variants
         if (type_def.base.* != .enum_type and type_def.base.* != .comptime_type) return null;
         // generic enums get their arguments inferred at the construction site
         var arguments: std.ArrayList(*const Type) = .empty;
@@ -3632,7 +3797,7 @@ pub const Checker = struct {
         return null;
     }
 
-    // '::Variant' resolution (section 3.2): the contextual type when it is
+    // '::Variant' resolution (section 4.2): the contextual type when it is
     // an enum carrying the variant, otherwise the single visible enum
     // definition carrying it
     fn impliedVariant(self: *Checker, name_token: Token, expected: ?*const Type) Error!?Variant {
@@ -3667,9 +3832,9 @@ pub const Checker = struct {
         }
         if (count == 1) return found;
         if (count == 0) {
-            try self.report(name_token.location, "no enum in scope has a variant '{s}' (section 3.2)", .{variant_name});
+            try self.report(name_token.location, "no enum in scope has a variant '{s}' (section 4.2)", .{variant_name});
         } else {
-            try self.report(name_token.location, "'::{s}' is ambiguous: {d} enums in scope have this variant; name the enum (section 3.2)", .{ variant_name, count });
+            try self.report(name_token.location, "'::{s}' is ambiguous: {d} enums in scope have this variant; name the enum (section 4.2)", .{ variant_name, count });
         }
         return null;
     }
@@ -3688,19 +3853,19 @@ pub const Checker = struct {
     };
 
     // every type parameter must be bound by the payload or the context
-    // when a variant is constructed (section 3.7)
+    // when a variant is constructed (section 4.7)
     fn reportUnboundVariantParameters(self: *Checker, variant: Variant, bindings: *const TypeEnvironment, span: Token.Location) Error!void {
         if (variant.enum_type.* != .declared) return;
         for (variant.enum_type.declared.arguments) |argument| {
             if (argument.* != .type_parameter) continue;
             if (bindings.get(argument.type_parameter.name) != null) continue;
-            try self.report(span, "cannot infer type parameter '{s}' of '{s}': annotate the expected type (section 3.7)", .{ argument.type_parameter.name, variant.enum_type.declared.name });
+            try self.report(span, "cannot infer type parameter '{s}' of '{s}': annotate the expected type (section 4.7)", .{ argument.type_parameter.name, variant.enum_type.declared.name });
         }
     }
 
     fn callVariantConstructor(self: *Checker, variant: Variant, call: anytype, expected: ?*const Type, span: Token.Location) Error!*const Type {
         // a contextual type of the same enum fixes the type parameters first
-        // ('var maybe: Option<u32> = Option::Some(7)', section 3.7)
+        // ('var maybe: Option<u32> = Option::Some(7)', section 4.7)
         var bindings: TypeEnvironment = .empty;
         if (expected) |context| {
             if (context.* == .declared and variant.enum_type.* == .declared and context.declared.definition == variant.enum_type.declared.definition) {
@@ -3726,7 +3891,7 @@ pub const Checker = struct {
         }
         const payload_type = try self.substitute(declared_payload, &bindings);
         const argument_type = try self.checkExpression(call.arguments[0], payload_type);
-        // remaining parameters infer from the payload value (section 3.7)
+        // remaining parameters infer from the payload value (section 4.7)
         if (!try self.unifyParameter(payload_type, argument_type, &bindings)) {
             try self.expectAssignable(argument_type, payload_type, call.arguments[0], span);
         } else if (!try self.coerce(argument_type, try self.substitute(payload_type, &bindings))) {
@@ -3769,7 +3934,7 @@ pub const Checker = struct {
     }
 
     // snapshots the names visible to a '#' expression: const bindings carry
-    // their initializer, runtime bindings poison the name (section 6.1)
+    // their initializer, runtime bindings poison the name (section 7.1)
     fn snapshotComptimeEnvironment(self: *Checker) Error![]const ComptimeEnvironmentEntry {
         var environment: std.ArrayList(ComptimeEnvironmentEntry) = .empty;
         for (self.scopes.items) |frame| {
@@ -3789,7 +3954,7 @@ pub const Checker = struct {
         });
     }
 
-    // compile-time evaluation (section 6.1) runs once checking has filled
+    // compile-time evaluation (section 7.1) runs once checking has filled
     // every side table, so '#' expressions may call functions defined later
     fn runPendingComptime(self: *Checker) Error!void {
         for (self.pending_comptime.items) |pending| {
@@ -3831,6 +3996,7 @@ pub const Checker = struct {
             .context = @ptrCast(self),
             .reflect_named = reflectNamedHook,
             .reflect_expression = reflectExpressionHook,
+            .reflect_layout = reflectLayoutHook,
             .reflect_implementers = reflectImplementersHook,
             .reflect_implements = reflectImplementsHook,
         };
@@ -3860,16 +4026,71 @@ pub const Checker = struct {
         const value = machine.evaluate(inner) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                try self.report(self.expressionSpan(inner), "comptime evaluation failed: {s} (section 6.1)", .{machine.fault_message orelse "unspecified fault"});
+                try self.report(self.expressionSpan(inner), "comptime evaluation failed: {s} (section 7.1)", .{machine.fault_message orelse "unspecified fault"});
                 return null;
             },
         };
         if (violatesPointerBarrier(value)) {
-            try self.report(self.expressionSpan(outer), "a compile-time result is a value or a slice, never a '&T', '*T', or '*[T]' (section 6.2)", .{});
+            try self.report(self.expressionSpan(outer), "a compile-time result is a value or a slice, never a '&T', '*T', or '*[T]' (section 7.2)", .{});
             return null;
+        }
+        // the value must be what the expression's static type says: a
+        // macro body producing something other than its declared result
+        // is an error at the call site (section 7.3)
+        if (self.expression_types.get(inner)) |declared| {
+            if (!try self.valueConforms(value, declared)) {
+                const produced = try (try self.typeOfComptimeValue(value, self.expressionSpan(inner))).render(self.arena);
+                const rendered = try declared.render(self.arena);
+                try self.report(self.expressionSpan(inner), "this compile-time expression produced {s} but is declared {s} (section 7.3)", .{ produced, rendered });
+                return null;
+            }
         }
         try self.comptime_values.put(self.arena, outer, value);
         return value;
+    }
+
+    // whether a compile-time value fits a declared type, loosely: the
+    // interpreter types literals by default width, so numerics compare by
+    // class and arrays by shape (section 7.3)
+    fn valueConforms(self: *Checker, value: Interpreter.Value, declared: *const Type) Error!bool {
+        const resolved = try self.resolveAlias(declared);
+        switch (resolved.*) {
+            .unknown, .void_type => return true,
+            .untyped_integer, .untyped_float => return value == .integer or value == .float,
+            .primitive => |primitive| return switch (value) {
+                .integer => primitive.isNumeric(),
+                .float => primitive.isFloat(),
+                .bool_value => primitive == .bool,
+                else => false,
+            },
+            .slice, .fixed_array, .heap_array => {
+                const instance = switch (value) {
+                    .slice => |instance| instance,
+                    .array => |instance| instance,
+                    .heap_array => |instance| instance orelse return false,
+                    else => return false,
+                };
+                const element: *const Type = switch (resolved.*) {
+                    .slice => |slice| slice.child,
+                    .fixed_array => |array| array.element,
+                    .heap_array => |heap| heap.child,
+                    else => unreachable,
+                };
+                for (instance.elements) |item| {
+                    if (!try self.valueConforms(item, element)) return false;
+                }
+                return true;
+            },
+            .type_description => return value == .type_value,
+            .declared => |declared_type| return switch (value) {
+                .struct_value => |instance| std.mem.eql(u8, instance.type_name, declared_type.name),
+                .enum_value => true,
+                else => false,
+            },
+            .structural, .inline_enum, .structural_enum => return value == .struct_value or value == .enum_value,
+            .function => return value == .function or value == .closure,
+            else => return false,
+        }
     }
 
     // whether a '#' expression must evaluate during checking: macro calls,
@@ -3893,15 +4114,9 @@ pub const Checker = struct {
                 return false;
             },
             .call => |call| {
-                const callee = call.callee;
-                if (callee.* == .path and callee.path.len == 1) {
-                    const name = callee.path[0].slice(self.source());
-                    if (self.lookup(name) == null) {
-                        if (self.firstVisible(name, self.current_view)) |symbol| {
-                            if (symbol.definition.kind == .macro_def) return true;
-                        }
-                    }
-                }
+                // a macro call types by its declared result, so it waits
+                // like a function call (section 7.3); only its arguments
+                // may force eagerness
                 if (self.needsEagerComptime(call.callee)) return true;
                 for (call.arguments) |argument| {
                     if (self.needsEagerComptime(argument)) return true;
@@ -3917,12 +4132,13 @@ pub const Checker = struct {
             // a nested '#' marking reflection makes the whole expression
             // statically untypable, so the outer '#' must run eagerly too
             .comptime_expr => |inner| return self.needsEagerComptime(inner),
+            .type_literal => return true,
             else => return false,
         }
     }
 
     // the runtime type of a compile-time value, for '#' results in value
-    // position (section 6.1, plain values only)
+    // position (section 7.1, plain values only)
     fn typeOfComptimeValue(self: *Checker, value: Interpreter.Value, span: Token.Location) Error!*const Type {
         switch (value) {
             .void_value => return &void_type,
@@ -3951,13 +4167,13 @@ pub const Checker = struct {
                         }
                     }
                 }
-                try self.report(span, "this compile-time struct value has no nameable runtime type (section 6.1)", .{});
+                try self.report(span, "this compile-time struct value has no nameable runtime type (section 7.1)", .{});
                 return &unknown_type;
             },
             .enum_value => |instance| return self.comptimeEnumType(instance.variant, span),
             .function => |symbol| return self.functionType(symbol),
             .type_value => {
-                try self.report(span, "a '#Type' cannot be retained in a runtime declaration (section 3.4)", .{});
+                try self.report(span, "a '#Type' cannot be retained in a runtime declaration (section 4.4)", .{});
                 return &unknown_type;
             },
             .pointer, .reference, .closure => return &unknown_type,
@@ -3970,7 +4186,7 @@ pub const Checker = struct {
     }
 
     // names the unique enum declaring this variant; mirrors implied-variant
-    // inference (section 3.2)
+    // inference (section 4.2)
     fn comptimeEnumType(self: *Checker, variant_name: []const u8, span: Token.Location) Error!*const Type {
         var found: ?*const Type = null;
         var count: usize = 0;
@@ -3996,11 +4212,11 @@ pub const Checker = struct {
             }
         }
         if (count == 1) return found.?;
-        try self.report(span, "the runtime enum type of this compile-time value is ambiguous or unknown (section 6.1)", .{});
+        try self.report(span, "the runtime enum type of this compile-time value is ambiguous or unknown (section 7.1)", .{});
         return &unknown_type;
     }
 
-    // the pointer barrier (section 6.2): references, pointers, closures,
+    // the pointer barrier (section 7.2): references, pointers, closures,
     // and heap arrays cannot escape compile time; a comptime result is a
     // value or a slice ('&[T]' materializes), never a '*[T]'
     fn violatesPointerBarrier(value: Interpreter.Value) bool {
@@ -4034,17 +4250,26 @@ pub const Checker = struct {
         return self.reflectName(name);
     }
 
+    // '#struct { ... }' / '#enum { ... }' (section 4.4): the layout resolves
+    // in its own view and reflects like a declared type
+    fn reflectLayoutHook(context: *anyopaque, layout: *const ast.TypeExpression, view_index: usize) error{OutOfMemory}!?*Interpreter.Value.TypeDescription {
+        const self: *Checker = @ptrCast(@alignCast(context));
+        const resolved = try self.typeFromExpressionIn(layout, self.scope_types, view_index);
+        if (resolved.* == .unknown) return null;
+        return try self.describeType(resolved, 0);
+    }
+
     fn reflectExpressionHook(context: *anyopaque, expression: *const ast.Expression) error{OutOfMemory}!?*Interpreter.Value.TypeDescription {
         const self: *Checker = @ptrCast(@alignCast(context));
         const recorded = self.expression_types.get(expression) orelse return null;
         return try self.describeType(recorded, 0);
     }
 
-    // '#implementers_of(I)' (section 6.4): every type in the merged unit
+    // '#implementers_of(I)' (section 7.4): every type in the merged unit
     // whose marker list names the interface, in module then declaration
     // order; the merge precedes checking, so the whole world is visible
     // regardless of declaration order or library visibility
-    // '#Type.implements_interface(I)' (section 3.4): conformance by
+    // '#Type.implements_interface(I)' (section 4.4): conformance by
     // definition identity through the checker's own rule, so lang items
     // count and same-named interfaces from different libraries never
     // cross wires; null when the argument is not a resolved interface
@@ -4067,7 +4292,7 @@ pub const Checker = struct {
             for (view.module.definitions) |*definition| {
                 if (definition.kind != .type_def) continue;
                 const type_def = definition.kind.type_def;
-                // generic types reflect only as instances (section 3.4)
+                // generic types reflect only as instances (section 4.4)
                 if (type_def.type_parameters.len != 0) continue;
                 for (type_def.interfaces) |marker| {
                     // the marker resolves where the type is declared
@@ -4087,14 +4312,14 @@ pub const Checker = struct {
         return try implementers.toOwnedSlice(self.arena);
     }
 
-    // '#T' reflection (section 3.4): a primitive, type, or interface name
+    // '#T' reflection (section 4.4): a primitive, type, or interface name
     // becomes a '#Type' description
     fn reflectName(self: *Checker, name: []const u8) Error!?*Interpreter.Value.TypeDescription {
         if (primitiveByName(name)) |primitive| {
             return try self.describeType(try self.makeType(.{ .primitive = primitive }), 0);
         }
         // '#void' marks a payload-less enum variant in 'add_member'
-        // (section 3.4)
+        // (section 4.4)
         if (std.mem.eql(u8, name, "void")) {
             return try self.voidDescription();
         }
@@ -4120,7 +4345,7 @@ pub const Checker = struct {
                     .members = .empty,
                     .interface_names = &.{},
                     // the origin identifies the interface for
-                    // '#implementers_of' (section 6.4)
+                    // '#implementers_of' (section 7.4)
                     .origin = try self.makeType(.{ .interface = .{
                         .definition = symbol.definition,
                         .view_index = symbol.view_index,
@@ -4133,10 +4358,10 @@ pub const Checker = struct {
         }
     }
 
-    // converts a checker type into a '#Type' description (section 3.4)
+    // converts a checker type into a '#Type' description (section 4.4)
     fn describeType(self: *Checker, candidate: *const Type, depth: u32) Error!*Interpreter.Value.TypeDescription {
         const description = try self.arena.create(Interpreter.Value.TypeDescription);
-        // untyped literals default first (section 3.3), so '#type_of(7)'
+        // untyped literals default first (section 4.3), so '#type_of(7)'
         // reflects i32
         const resolved = try self.resolveAlias(try self.defaulted(candidate));
         description.* = .{
@@ -4236,7 +4461,7 @@ pub const Checker = struct {
     }
 
     // converts a '#Type' result back into a checker type for
-    // 'type T = #...' synthesis (section 3.4)
+    // 'type T = #...' synthesis (section 4.4)
     fn descriptionToType(self: *Checker, description: *Interpreter.Value.TypeDescription, span: Token.Location) Error!*const Type {
         if (description.origin) |origin| return origin;
         switch (description.kind) {
@@ -4258,7 +4483,7 @@ pub const Checker = struct {
                 var variants: std.ArrayList(Type.EnumVariant) = .empty;
                 for (description.members.items) |member| {
                     // a void member description marks a payload-less variant,
-                    // mirroring how reflection encodes them (section 3.4)
+                    // mirroring how reflection encodes them (section 4.4)
                     const payload: ?*const Type = if (isVoidDescription(member.description))
                         null
                     else
@@ -4268,7 +4493,7 @@ pub const Checker = struct {
                 return self.makeType(.{ .structural_enum = try variants.toOwnedSlice(self.arena) });
             },
             .interface_kind, .other_kind => {
-                try self.report(span, "this '#Type' does not describe a usable runtime type (section 3.4)", .{});
+                try self.report(span, "this '#Type' does not describe a usable runtime type (section 4.4)", .{});
                 return &unknown_type;
             },
         }
@@ -4329,7 +4554,7 @@ pub const Checker = struct {
             try argument_types.append(self.arena, argument_type);
         }
 
-        // a macro may share its name with functions (section 6.3): '#name'
+        // a macro may share its name with functions (section 7.3): '#name'
         // selects the macro, a bare call resolves the functions
         var has_function_candidate = false;
         for (symbols.items) |symbol| {
@@ -4341,10 +4566,10 @@ pub const Checker = struct {
         for (symbols.items) |symbol| {
             switch (symbol.definition.kind) {
                 .macro_def => |macro_def| {
-                    // macro calls evaluate at compile time (section 6.3)
+                    // macro calls evaluate at compile time (section 7.3)
                     if (self.comptime_depth == 0) {
                         if (has_function_candidate) continue;
-                        try self.report(span, "a macro call must be invoked with '#' (section 6.3)", .{});
+                        try self.report(span, "a macro call must be invoked with '#' (section 7.3)", .{});
                     }
                     // the recorded target routes comptime evaluation to the
                     // macro even when functions share the name
@@ -4352,7 +4577,7 @@ pub const Checker = struct {
                     if (call.arguments.len != macro_def.parameters.len) {
                         try self.report(span, "macro '{s}' expects {d} argument(s), found {d}", .{ name, macro_def.parameters.len, call.arguments.len });
                     } else {
-                        // macro parameters are strictly typed (section 6.3);
+                        // macro parameters are strictly typed (section 7.3);
                         // declaration-only macros leave them open
                         for (macro_def.parameters, argument_types.items, 0..) |parameter, argument_type, index| {
                             const parameter_expression = parameter.parameter_type orelse continue;
@@ -4362,11 +4587,9 @@ pub const Checker = struct {
                             }
                         }
                     }
-                    // the std::macros built-ins have known result types
-                    if (macro_def.body == null) {
-                        if (try self.builtinMacroResultType(name)) |known| return known;
-                    }
-                    return &unknown_type;
+                    // the declared result type is the call's type; nothing
+                    // is inferred from the body (section 7.3)
+                    return try self.typeFromExpressionIn(macro_def.return_type, &empty_type_environment, symbol.view_index);
                 },
                 .fn_def, .extern_def => function_count += 1,
                 else => {
@@ -4385,7 +4608,7 @@ pub const Checker = struct {
             }
         }
 
-        // overload resolution (section 3.6)
+        // overload resolution (section 4.6)
         if (viable.items.len == 1) {
             try self.recordCallTarget(target_key, viable.items[0].symbol, viable.items[0].type_bindings);
             try self.recheckContextualArguments(call, viable.items[0].argument_expectations);
@@ -4405,7 +4628,7 @@ pub const Checker = struct {
                 try self.recheckContextualArguments(call, exact.?.argument_expectations);
                 return exact.?.return_type;
             }
-            try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 3.6)", .{ name, viable.items.len });
+            try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 4.6)", .{ name, viable.items.len });
             return &unknown_type;
         }
         try self.report(span, "no overload of '{s}' matches these argument types ({d} candidate{s})", .{ name, function_count, if (function_count == 1) "" else "s" });
@@ -4418,7 +4641,7 @@ pub const Checker = struct {
         raw: *const Type,
         // the receiver value after pointee transparency
         pierced: *const Type,
-        // mutability of the pierced location (section 3.8)
+        // mutability of the pierced location (section 4.8)
         mutable: bool,
     };
 
@@ -4465,7 +4688,7 @@ pub const Checker = struct {
 
         if (extension_count == 0) {
             const rendered = try receiver.pierced.render(self.arena);
-            try self.report(span, "no extension function '{s}' for {s} (section 4.5)", .{ name, rendered });
+            try self.report(span, "no extension function '{s}' for {s} (section 5.5)", .{ name, rendered });
             return &unknown_type;
         }
 
@@ -4498,7 +4721,7 @@ pub const Checker = struct {
                 try self.recheckContextualArguments(call, exact.?.argument_expectations);
                 return exact.?.return_type;
             }
-            try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 3.6)", .{ name, remaining.items.len });
+            try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 4.6)", .{ name, remaining.items.len });
             return &unknown_type;
         }
         const rendered = try receiver.pierced.render(self.arena);
@@ -4509,22 +4732,32 @@ pub const Checker = struct {
 
     // a call through an interface object resolves at runtime through the
     // vtable; statically it checks against the declared signature (5.2)
-    fn callInterfaceFunction(self: *Checker, interface: Type.Interface, name_token: Token, call: anytype) Error!*const Type {
+    fn callInterfaceFunction(self: *Checker, interface: Type.Interface, name_token: Token, call: anytype, receiver: MethodReceiver) Error!*const Type {
         const interface_def = interface.definition.kind.interface_def;
         const interface_source = self.views[interface.view_index].source;
         const name = name_token.slice(self.source());
         const function = for (interface_def.functions) |candidate| {
             if (std.mem.eql(u8, candidate.name.slice(interface_source), name)) break candidate;
         } else {
-            try self.report(name_token.location, "interface '{s}' declares no function '{s}' (section 5.2)", .{ interface.name, name });
+            try self.report(name_token.location, "interface '{s}' declares no function '{s}' (section 6.2)", .{ interface.name, name });
             for (call.arguments) |argument| _ = try self.checkExpression(argument, null);
             return &unknown_type;
         };
+        // the object's own indirection must be at least as permissive as
+        // the function's declared receiver (section 6.2); a constrained
+        // generic value needs a mutable place for a '&var' receiver
+        if (receiver.pierced.* == .interface) {
+            if (!objectPermitsReceiver(receiver.raw, function.receiver)) {
+                try self.report(name_token.location, "'{s}' is declared 'self: {s}' in '{s}', which a '{s}' object cannot provide (section 6.2)", .{ name, function.receiver.lexeme(), interface.name, try receiver.raw.render(self.arena) });
+            }
+        } else if (function.receiver == .reference_var and !receiver.mutable) {
+            try self.report(name_token.location, "'{s}' is declared 'self: &var' in '{s}' and needs a mutable receiver (section 6.2)", .{ name, interface.name });
+        }
         if (call.arguments.len != function.parameters.len) {
             try self.report(name_token.location, "'{s}' expects {d} argument(s), found {d}", .{ name, function.parameters.len, call.arguments.len });
         }
         // a generic constraint's instantiation binds the interface's own
-        // type parameters inside the declared signatures (section 5.2)
+        // type parameters inside the declared signatures (section 6.2)
         const interface_environment = try self.interfaceEnvironment(interface);
         const checked = @min(call.arguments.len, function.parameters.len);
         for (call.arguments[0..checked], function.parameters[0..checked]) |argument, parameter| {
@@ -4540,7 +4773,7 @@ pub const Checker = struct {
     }
 
     // how the receiver expression enters overload resolution as the implicit
-    // first argument (section 4.5): a reference receiver auto-references the
+    // first argument (section 5.5): a reference receiver auto-references the
     // place, a pointer receiver passes the binding's own pointer, and a
     // value receiver passes a copy
     fn methodReceiverArgument(self: *Checker, self_type: *const Type, receiver: MethodReceiver) Error!*const Type {
@@ -4559,13 +4792,13 @@ pub const Checker = struct {
         // reporting pass over contextual arguments; empty when none occur
         argument_expectations: []const *const Type = &.{},
         // resolved type arguments, recorded at the winning call site so
-        // later stages can resolve type parameters (section 3.7)
+        // later stages can resolve type parameters (section 4.7)
         type_bindings: []const Type.Binding = &.{},
     };
 
     // checks one overload candidate: arity, generic inference by unification
-    // (section 3.7), then per-argument compatibility (section 3.3); a
-    // non-null receiver consumes the leading 'self' parameter (section 4.5)
+    // (section 4.7), then per-argument compatibility (section 4.3); a
+    // non-null receiver consumes the leading 'self' parameter (section 5.5)
     fn tryCandidate(self: *Checker, symbol: resolution.Symbol, call: anytype, argument_types: []const *const Type, receiver: ?MethodReceiver, expected: ?*const Type) Error!?CandidateResult {
         var parameters: []const ast.Parameter = undefined;
         var variadic = false;
@@ -4602,7 +4835,7 @@ pub const Checker = struct {
         const definition_source = self.views[symbol.view_index].source;
         const environment = try self.arena.create(TypeEnvironment);
         environment.* = .empty;
-        // explicit type arguments bind left-to-right (section 3.7)
+        // explicit type arguments bind left-to-right (section 4.7)
         for (call.type_arguments, 0..) |explicit, index| {
             if (index >= type_parameters.len) break;
             const bound = try self.typeFromExpression(explicit, self.scope_types);
@@ -4623,7 +4856,7 @@ pub const Checker = struct {
         // the contextual expected type binds type parameters through the
         // declared return type first ('var v: Vector<u8> = Vector::empty()'),
         // exactly like generic variant construction; arguments then unify
-        // against (and may coerce to) those bindings (section 3.7)
+        // against (and may coerce to) those bindings (section 4.7)
         if (expected != null and return_expression != null) {
             const declared_return = try self.typeFromExpressionIn(return_expression.?, &placeholders, symbol.view_index);
             _ = try self.unifyParameter(declared_return, expected.?, environment);
@@ -4666,7 +4899,7 @@ pub const Checker = struct {
         }
 
         // every type parameter must be bound after unification, and the
-        // bound type must satisfy the declared constraint (section 3.7)
+        // bound type must satisfy the declared constraint (section 4.7)
         var type_bindings: []Type.Binding = &.{};
         if (type_parameters.len != 0) {
             type_bindings = try self.arena.alloc(Type.Binding, type_parameters.len);
@@ -4677,7 +4910,7 @@ pub const Checker = struct {
             if (try self.interfaceOfConstraint(type_parameter.constraint, &placeholders, symbol.view_index)) |constraint| {
                 // the constraint's arguments may name sibling type
                 // parameters ('<T, It: Iterator<T>>'); this call's bindings
-                // substitute in before conformance is checked (section 3.7)
+                // substitute in before conformance is checked (section 4.7)
                 const bound_constraint = try self.substituteInterface(constraint, environment);
                 if (!try self.implements(bound, bound_constraint)) return null;
             }
@@ -4708,14 +4941,14 @@ pub const Checker = struct {
     }
 
     // structural unification of a parameter type against an argument type,
-    // binding type parameters as they are encountered (section 3.7)
+    // binding type parameters as they are encountered (section 4.7)
     fn unifyParameter(self: *Checker, parameter: *const Type, argument: *const Type, bindings: *TypeEnvironment) Error!bool {
         switch (parameter.*) {
             .type_parameter => |type_parameter| {
                 if (bindings.get(type_parameter.name)) |bound| {
                     return try self.coerce(argument, bound) or bound.eql(argument);
                 }
-                // an untyped literal binds as its default (section 3.7)
+                // an untyped literal binds as its default (section 4.7)
                 try bindings.put(self.arena, type_parameter.name, try self.defaulted(argument));
                 return true;
             },
@@ -4873,7 +5106,7 @@ pub const Checker = struct {
 
     // mutability when reaching through a location: behind '&var'/'*var' the
     // pointee is mutable regardless of the binding; behind '&'/'*' it is
-    // immutable; direct access inherits the binding (section 3.8)
+    // immutable; direct access inherits the binding (section 4.8)
     fn piercedMutability(place: Lvalue) bool {
         return switch (place.raw.*) {
             .pointer => |indirection| indirection.mutable,
@@ -4882,7 +5115,7 @@ pub const Checker = struct {
         };
     }
 
-    // pointee transparency (section 4.2): a pointer or reference reads as
+    // pointee transparency (section 5.2): a pointer or reference reads as
     // its pointee; slices, arrays, and heap arrays read as themselves
     pub fn pierce(self: *Checker, candidate: *const Type) Error!*const Type {
         _ = self;
@@ -4903,15 +5136,15 @@ pub const Checker = struct {
         const from_rendered = try from.render(self.arena);
         const to_rendered = try to.render(self.arena);
         // a pointer-typed target with a pierced read on the right means the
-        // user wrote 'p' where pointer transfer needs 'move p' (section 4.2)
+        // user wrote 'p' where pointer transfer needs 'move p' (section 5.2)
         const target_owns = to.* == .pointer or to.* == .heap_array;
         const value_place = try self.lvalueOf(value);
         if (target_owns and value_place != null and try self.coerce(value_place.?.raw, to)) {
-            try self.report(span, "assigning to {s} transfers ownership: use 'move' to hand over the allocation or 'new' to copy it (section 4.2)", .{to_rendered});
+            try self.report(span, "assigning to {s} transfers ownership: use 'move' to hand over the allocation or 'new' to copy it (section 5.2)", .{to_rendered});
             return;
         }
         if (to.* == .reference and value_place != null) {
-            try self.report(span, "expected {s}; take a reference explicitly with '&' (section 4.2)", .{to_rendered});
+            try self.report(span, "expected {s}; take a reference explicitly with '&' (section 5.2)", .{to_rendered});
             return;
         }
         try self.report(span, "expected {s}, found {s}", .{ to_rendered, from_rendered });
@@ -5016,7 +5249,7 @@ pub const Checker = struct {
 
     // the definite-move state of every visible binding, flattened in frame
     // order; branch checking snapshots, restores, and intersects these so
-    // only moves common to every path survive a merge (section 4.2)
+    // only moves common to every path survive a merge (section 5.2)
     fn movedSnapshot(self: *Checker) Error![]bool {
         var flags: std.ArrayList(bool) = .empty;
         for (self.scopes.items) |frame| {
@@ -5065,10 +5298,11 @@ pub const Checker = struct {
                 return null;
             },
             .comptime_type => null,
+            .type_description => |token| token,
         };
     }
 
-    // the known result types of the std::macros built-ins (section 6.4)
+    // the known result types of the std::macros built-ins (section 7.4)
     fn builtinMacroResultType(self: *Checker, name: []const u8) Error!?*const Type {
         if (std.mem.eql(u8, name, "struct_type") or
             std.mem.eql(u8, name, "enum_type") or
@@ -5085,7 +5319,7 @@ pub const Checker = struct {
         return null;
     }
 
-    // the '#Type' method surface of section 3.4, by name
+    // the '#Type' method surface of section 4.4, by name
     fn typeDescriptionMethodResult(self: *Checker, name: []const u8, span: Token.Location) Error!*const Type {
         if (std.mem.eql(u8, name, "is_struct") or
             std.mem.eql(u8, name, "is_enum") or
@@ -5108,7 +5342,7 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "add_member") or std.mem.eql(u8, name, "remove_member")) {
             return &void_type;
         }
-        try self.report(span, "'{s}' is not a '#Type' method (section 3.4)", .{name});
+        try self.report(span, "'{s}' is not a '#Type' method (section 4.4)", .{name});
         return &unknown_type;
     }
 
@@ -5116,7 +5350,7 @@ pub const Checker = struct {
         return self.makeType(.{ .slice = .{ .mutable = false, .child = try self.makeType(.{ .primitive = .u8 }) } });
     }
 
-    // reference-binding explicitness (section 4.2): a call's reference-
+    // reference-binding explicitness (section 5.2): a call's reference-
     // typed result does not flow bare into a use site (a binding, an
     // argument, a member initializer, an assignment value, or a
     // return/break/yield). '&f()' keeps the borrow; a bare '&T' result
@@ -5131,14 +5365,14 @@ pub const Checker = struct {
         if (unwrapped.* == .call) {
             switch (resolved.*) {
                 .slice => {
-                    try self.report(self.expressionSpan(expression), "a call's '&[T]' result must be marked at a use site: '&' before the call keeps the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
+                    try self.report(self.expressionSpan(expression), "a call's '&[T]' result must be marked at a use site: '&' before the call keeps the view, 'new' copies it into an owned '*[T]' (section 5.2)", .{});
                     return checked;
                 },
                 .reference => return self.pierceConsumed(unwrapped, checked, resolved),
                 else => unreachable,
             }
         }
-        // using a VARIABLE uses the value (section 4.2): a bare place read
+        // using a VARIABLE uses the value (section 5.2): a bare place read
         // consumes the pointee, and passing the borrow itself is spelled
         // '&x'. Unary results ('&x', 'new x') are already explicit, and
         // non-place expressions (literals, subslices, yielded values)
@@ -5147,7 +5381,7 @@ pub const Checker = struct {
         if ((try self.lvalueOf(unwrapped)) == null) return checked;
         switch (resolved.*) {
             .slice => {
-                try self.report(self.expressionSpan(expression), "a '&[T]' variable used here means the array value, which is unsized: '&' passes the view, 'new' copies it into an owned '*[T]' (section 4.2)", .{});
+                try self.report(self.expressionSpan(expression), "a '&[T]' variable used here means the array value, which is unsized: '&' passes the view, 'new' copies it into an owned '*[T]' (section 5.2)", .{});
                 return checked;
             },
             .reference => |indirection| {
@@ -5215,6 +5449,11 @@ pub const Checker = struct {
             .subslice => |subslice| subslice.operator.location,
             .struct_init => |struct_init| if (struct_init.path) |path| path[0].location else if (struct_init.members.len != 0) struct_init.members[0].name.location else .{ .start = 0, .end = 0 },
             .array_literal => |elements| if (elements.len != 0) self.expressionSpan(elements[0]) else .{ .start = 0, .end = 0 },
+            .type_literal => |layout| switch (layout.*) {
+                .struct_type => |members| if (members.len != 0) members[0].name.location else .{ .start = 0, .end = 0 },
+                .enum_type => |members| if (members.len != 0) members[0].name.location else .{ .start = 0, .end = 0 },
+                else => .{ .start = 0, .end = 0 },
+            },
             .array_fill => |array_fill| self.expressionSpan(array_fill.value),
             .array_range => |array_range| array_range.operator.location,
             .if_expr => |if_expr| self.expressionSpan(if_expr.condition),

@@ -4,7 +4,7 @@
 //! call targets) so no semantic analysis is repeated here.
 //!
 //! Subset covered: integer/float/bool arithmetic with overflow faults
-//! (section 4.2), strings, structs, enums with payloads, fixed and heap
+//! (section 5.2), strings, structs, enums with payloads, fixed and heap
 //! arrays, slices, pointers with move semantics and deep-copy uniqueness,
 //! all control flow including value yielding, ranges, extension calls,
 //! lambdas with captured environments, interface-object dispatch with
@@ -12,10 +12,10 @@
 //! extern. The checker also drives this interpreter in a sandboxed mode
 //! (comptime_mode plus step_budget) as the section 6 compile-time
 //! evaluator, where macros, the built-in macros, and '#Type' reflection
-//! methods (section 3.4) are available through the reflection hooks.
-//! 'as' beyond primitives (section 3.5) runs through checker-recorded byte
+//! methods (section 4.4) are available through the reflection hooks.
+//! 'as' beyond primitives (section 4.5) runs through checker-recorded byte
 //! shapes (types.Shape): the value serializes into its little-endian
-//! C-layout image (section 3.9) and reads back as the target. Deliberately
+//! C-layout image (section 4.9) and reads back as the target. Deliberately
 //! deferred: 'as' on references ('&S as &T' aliases memory, which value
 //! semantics cannot model) and on pointer-bearing values.
 
@@ -35,22 +35,22 @@ pub const Interpreter = struct {
     expression_types: *const std.AutoHashMapUnmanaged(*const ast.Expression, *const Type),
     call_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, resolution.Symbol),
     call_type_bindings: *const std.AutoHashMapUnmanaged(*const ast.Expression, []const Type.Binding),
-    // values precomputed by compile-time evaluation (section 6.1), keyed by
+    // values precomputed by compile-time evaluation (section 7.1), keyed by
     // the '#' expression node; runtime substitutes instead of re-evaluating
     comptime_values: *const std.AutoHashMapUnmanaged(*const ast.Expression, Value),
-    // byte shapes per non-primitive 'as' cast (section 3.5), recorded by
-    // the checker from the section 3.9 layout rules
+    // byte shapes per non-primitive 'as' cast (section 4.5), recorded by
+    // the checker from the section 4.9 layout rules
     cast_shapes: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes),
     type_targets: *const std.AutoHashMapUnmanaged(*const ast.Expression, types.TypeIdentity),
     output: *std.Io.Writer,
     scopes: std.ArrayList(Frame),
     current_view: usize,
-    // the active call's resolved type arguments (section 3.7)
+    // the active call's resolved type arguments (section 4.7)
     current_type_bindings: []const Type.Binding,
-    // compile-time sandboxing (section 6.2): externs fault and evaluation
+    // compile-time sandboxing (section 7.2): externs fault and evaluation
     // is bounded by a step budget
     comptime_mode: bool,
-    // the host facilities behind '#read_file' (section 6.4): the io handle
+    // the host facilities behind '#read_file' (section 7.4): the io handle
     // and the project root every path resolves against; null keeps
     // compile-time evaluation filesystem-free
     comptime_io: ?std.Io = null,
@@ -64,14 +64,14 @@ pub const Interpreter = struct {
     // null makes file externs fault, keeping tests hermetic
     host_io: ?std.Io = null,
     // call nodes whose bare reference result pierces to a copy at the use
-    // site (section 4.2 reference-binding explicitness), from the checker
+    // site (section 5.2 reference-binding explicitness), from the checker
     pierced_results: ?*const std.AutoHashMapUnmanaged(*const ast.Expression, void) = null,
     // the active comptime call chain (function, macro, and extension
     // names, outermost first): a fault inside a macro body reports where
     // evaluation was, since macro bodies carry no static diagnostics
     comptime_call_names: std.ArrayList([]const u8) = .empty,
     open_files: std.ArrayList(OpenFile) = .empty,
-    // the argv tail behind std::process::arguments (section 5.1a)
+    // the argv tail behind std::process::arguments (section 6.1a)
     process_arguments: []const []const u8 = &.{},
     fault_message: ?[]const u8,
     pending_return: ?Value,
@@ -138,7 +138,7 @@ pub const Interpreter = struct {
         reference: *Value,
         function: resolution.Symbol,
         closure: *Closure,
-        // a '#Type' reflection value (section 3.4), compile time only
+        // a '#Type' reflection value (section 4.4), compile time only
         type_value: *TypeDescription,
 
         pub const Integer = struct {
@@ -158,7 +158,7 @@ pub const Interpreter = struct {
             // for display in faults and reflection
             type_name: []const u8,
             // the nominal identity behind interface dispatch, downcasts,
-            // and match arms (section 5.2); null for structural values
+            // and match arms (section 6.2); null for structural values
             identity: ?types.TypeIdentity = null,
         };
 
@@ -176,13 +176,13 @@ pub const Interpreter = struct {
             elements: []Value,
         };
 
-        // a lambda with its captured environment (section 4.4); each entry
+        // a lambda with its captured environment (section 5.4); each entry
         // keeps its capture mode so copies of the closure know what to clone
         pub const Closure = struct {
             lambda: *const ast.Lambda,
             view_index: usize,
             environment: []EnvironmentEntry,
-            // the enclosing call's type bindings at creation (section 3.7)
+            // the enclosing call's type bindings at creation (section 4.7)
             type_bindings: []const Type.Binding,
         };
 
@@ -192,7 +192,7 @@ pub const Interpreter = struct {
             mode: CaptureMode,
         };
 
-        // a first-class, mutable description of a type (section 3.4); the
+        // a first-class, mutable description of a type (section 4.4); the
         // checker reflects real types in, macros may synthesise fresh ones
         pub const TypeDescription = struct {
             kind: Kind,
@@ -213,16 +213,17 @@ pub const Interpreter = struct {
     };
 
     // the checker supplies these so compile-time code can reflect on types
-    // (section 3.4) without the interpreter re-implementing type resolution
+    // (section 4.4) without the interpreter re-implementing type resolution
     pub const ReflectionHooks = struct {
         context: *anyopaque,
         reflect_named: *const fn (context: *anyopaque, name: []const u8) error{OutOfMemory}!?*Value.TypeDescription,
         reflect_expression: *const fn (context: *anyopaque, expression: *const ast.Expression) error{OutOfMemory}!?*Value.TypeDescription,
+        reflect_layout: *const fn (context: *anyopaque, layout: *const ast.TypeExpression, view_index: usize) error{OutOfMemory}!?*Value.TypeDescription,
         // every type in the merged unit implementing the described
-        // interface (section 6.4); null when the description is not an
+        // interface (section 7.4); null when the description is not an
         // interface
         reflect_implementers: *const fn (context: *anyopaque, description: *Value.TypeDescription) error{OutOfMemory}!?[]const Value,
-        // whether the subject type implements the interface (section 3.4),
+        // whether the subject type implements the interface (section 4.4),
         // by definition identity including lang items; null when the
         // interface description carries no resolved interface
         reflect_implements: *const fn (context: *anyopaque, subject: *Value.TypeDescription, interface: *Value.TypeDescription) error{OutOfMemory}!?bool,
@@ -232,7 +233,7 @@ pub const Interpreter = struct {
     // switches to the error channel (error.Break / error.Yield /
     // error.Return with the pending value), so 'break' reaches the
     // enclosing loop and 'yield' the enclosing value construct no matter
-    // how deeply they nest (section 4.3)
+    // how deeply they nest (section 5.3)
     const Flow = union(enum) {
         normal,
         break_value: ?Value,
@@ -276,7 +277,7 @@ pub const Interpreter = struct {
         };
     }
 
-    // unqualified visibility from the executing module (section 5.4): own
+    // unqualified visibility from the executing module (section 6.4): own
     // library plus the 'exp' symbols of libraries it imported without an
     // alias, mirroring the checker's rule
     fn symbolVisible(self: *const Interpreter, symbol: resolution.Symbol) bool {
@@ -315,7 +316,7 @@ pub const Interpreter = struct {
     }
 
     /// Evaluates one expression, resolving an inner 'return' to its value.
-    /// The compile-time evaluator (section 6.1) drives this entry point.
+    /// The compile-time evaluator (section 7.1) drives this entry point.
     pub fn evaluate(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         return self.evalExpression(expression) catch |err| switch (err) {
             error.Return => self.pending_return orelse .void_value,
@@ -399,7 +400,7 @@ pub const Interpreter = struct {
         return null;
     }
 
-    // deep copy is the default value semantics (section 4.2): owned
+    // deep copy is the default value semantics (section 5.2): owned
     // allocations are duplicated so pointer uniqueness always holds
     fn deepCopy(self: *Interpreter, value: Value) Error!Value {
         switch (value) {
@@ -432,7 +433,7 @@ pub const Interpreter = struct {
                 return .{ .pointer = cell };
             },
             .closure => |original| {
-                // a closure owns its environment (section 4.2): owned
+                // a closure owns its environment (section 5.2): owned
                 // captures are duplicated, reference captures stay aliases
                 const environment = try self.arena.alloc(Value.EnvironmentEntry, original.environment.len);
                 for (original.environment, environment) |entry, *copy| {
@@ -453,7 +454,7 @@ pub const Interpreter = struct {
                 return .{ .closure = fresh };
             },
             .type_value => |original| {
-                // '#Type' is a value (section 3.4): mutation never reaches
+                // '#Type' is a value (section 4.4): mutation never reaches
                 // the description it was copied from
                 const fresh = try self.arena.create(Value.TypeDescription);
                 fresh.* = .{
@@ -480,7 +481,7 @@ pub const Interpreter = struct {
         return fresh;
     }
 
-    // pointee transparency (section 4.2): reading through pointers and
+    // pointee transparency (section 5.2): reading through pointers and
     // references reaches the pointee; a null pointer is a use-after-move
     fn pierceCell(self: *Interpreter, cell: *Value) Error!*Value {
         var current = cell;
@@ -532,6 +533,8 @@ pub const Interpreter = struct {
                 _ = switch (expression.*) {
                     .if_expr => |if_expr| try self.evalIf(if_expr, false),
                     .match_expr => |match_expr| try self.evalMatch(match_expr, false),
+                    .while_expr => |while_expr| try self.evalWhile(while_expr, false),
+                    .for_expr => |for_expr| try self.evalFor(for_expr, false),
                     else => try self.evalExpression(expression),
                 };
                 return .normal;
@@ -546,7 +549,7 @@ pub const Interpreter = struct {
             return .normal;
         }
         // compound assignment computes 'place op value' in the pointee's
-        // type (pointee transparency, section 4.2)
+        // type (pointee transparency, section 5.2)
         const pierced = try self.pierceCell(place);
         const right = try self.evalExpression(assign.value);
         const operator: Token.Tag = switch (assign.operator.tag) {
@@ -569,7 +572,7 @@ pub const Interpreter = struct {
     fn evalExpression(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         const value = try self.evalExpressionRaw(expression);
         // a bare '&T' use site (a call result or a variable read) consumes
-        // a deep copy of the pointee, never an alias (section 4.2)
+        // a deep copy of the pointee, never an alias (section 5.2)
         if (self.pierced_results) |pierced| {
             if (value == .reference and pierced.contains(expression)) {
                 // the reference may point at another reference cell
@@ -582,7 +585,7 @@ pub const Interpreter = struct {
 
     fn evalExpressionRaw(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         if (self.step_budget) |budget| {
-            if (budget == 0) return self.fault("compile-time evaluation exceeded its step budget (section 6.1)", .{});
+            if (budget == 0) return self.fault("compile-time evaluation exceeded its step budget (section 7.1)", .{});
             self.step_budget = budget - 1;
         }
         switch (expression.*) {
@@ -597,12 +600,19 @@ pub const Interpreter = struct {
             .path => return self.evalPath(expression),
             .implied_variant => |token| return self.makeEnum(token.slice(self.source()), null),
             .grouped => |inner| return self.evalExpression(inner),
+            // an inline layout's '#Type' (section 4.4)
+            .type_literal => |layout| {
+                const hooks = self.reflection orelse return self.fault("an inline layout reflects only during compile-time evaluation", .{});
+                const description = (try hooks.reflect_layout(hooks.context, layout, self.current_view)) orelse
+                    return self.fault("this inline layout could not be reflected", .{});
+                return .{ .type_value = description };
+            },
             .comptime_expr => |inner| {
-                // substituted by compile-time evaluation (section 6.1); the
+                // substituted by compile-time evaluation (section 7.1); the
                 // fallback covers '#' nodes inside other comptime evaluations
                 if (self.comptime_values.get(expression)) |value| return self.deepCopy(value);
                 // '#name(...)': the '#' selects the macro when the name is
-                // shared with functions (section 6.3); this covers macro
+                // shared with functions (section 7.3); this covers macro
                 // bodies, whose calls carry no checked targets
                 if (self.comptime_mode and inner.* == .call and inner.call.callee.* == .path and inner.call.callee.path.len == 1) {
                     const name = inner.call.callee.path[0].slice(self.source());
@@ -619,7 +629,7 @@ pub const Interpreter = struct {
                     const member_name = expression.member.name.slice(self.source());
                     return self.fault("cannot read member '{s}' here (the receiver is not a struct value)", .{member_name});
                 };
-                // pointee transparency (section 4.2): reading a pointer or
+                // pointee transparency (section 5.2): reading a pointer or
                 // reference field yields a copy of the pointee
                 return self.deepCopy((try self.pierceCell(place)).*);
             },
@@ -643,7 +653,7 @@ pub const Interpreter = struct {
             },
             .subslice => |subslice| {
                 // 'arr[start..end]' borrows a slice aliasing the subject's
-                // element range in place (section 3.2)
+                // element range in place (section 4.2)
                 var subject: Value = undefined;
                 if (try self.evalPlace(subslice.object)) |place| {
                     subject = (try self.pierceCell(place)).*;
@@ -701,7 +711,7 @@ pub const Interpreter = struct {
                 const instance = try self.arena.create(Value.ArrayInstance);
                 instance.* = .{ .elements = values };
                 // '[]' in slice position is the canonical empty view
-                // (section 3.2), not a fixed array
+                // (section 4.2), not a fixed array
                 if (elements.len == 0) {
                     if (self.expression_types.get(expression)) |recorded| {
                         if (recorded.* == .slice) return .{ .slice = instance };
@@ -726,8 +736,8 @@ pub const Interpreter = struct {
                 return .{ .array = instance };
             },
             .if_expr => |if_expr| return self.evalIf(if_expr, true),
-            .while_expr => |while_expr| return self.evalWhile(while_expr),
-            .for_expr => |for_expr| return self.evalFor(for_expr),
+            .while_expr => |while_expr| return self.evalWhile(while_expr, true),
+            .for_expr => |for_expr| return self.evalFor(for_expr, true),
             .match_expr => |match_expr| return self.evalMatch(match_expr, true),
             .lambda => |*lambda| return self.makeClosure(lambda),
         }
@@ -736,7 +746,7 @@ pub const Interpreter = struct {
     fn integerLiteral(self: *Interpreter, expression: *const ast.Expression, token: Token) Error!Value {
         const text = token.slice(self.source());
         const value = parseIntegerText(text) catch return self.fault("invalid integer literal '{s}'", .{text});
-        // an integer literal in float context is a float (section 3.3)
+        // an integer literal in float context is a float (section 4.3)
         if (self.primitiveOf(expression)) |primitive| {
             if (primitive.isFloat()) {
                 return .{ .float = .{ .value = @floatFromInt(value), .primitive = primitive } };
@@ -786,7 +796,7 @@ pub const Interpreter = struct {
     }
 
     // a type recorded inside a generic body may be a type parameter; the
-    // active call's bindings (section 3.7) name the concrete type
+    // active call's bindings (section 4.7) name the concrete type
     fn resolveTypeParameter(self: *Interpreter, recorded: *const Type) *const Type {
         var current = recorded;
         var depth: usize = 0;
@@ -849,7 +859,7 @@ pub const Interpreter = struct {
                     switch (taken) {
                         .pointer => outer.* = .{ .pointer = null },
                         .heap_array => outer.* = .{ .heap_array = null },
-                        else => return self.fault("an owning capture needs a pointer-typed variable (section 2.1)", .{}),
+                        else => return self.fault("an owning capture needs a pointer-typed variable (section 3.1)", .{}),
                     }
                     const cell = try self.arena.create(Value);
                     cell.* = taken;
@@ -902,19 +912,19 @@ pub const Interpreter = struct {
             .ampersand => {
                 const place = try self.evalPlace(unary.operand) orelse {
                     // '&' on a reference-typed call result keeps the borrow
-                    // (section 4.2); the checker gated everything else
+                    // (section 5.2); the checker gated everything else
                     const value = try self.evalExpression(unary.operand);
                     if (value == .reference or value == .slice) return value;
                     return self.fault("'&' needs an addressable operand", .{});
                 };
                 // borrowing a heap array yields a slice aliasing its
-                // elements in place (section 4.2)
+                // elements in place (section 5.2)
                 if (place.* == .heap_array) {
                     const instance = place.heap_array orelse return self.fault("use of a moved-from array", .{});
                     return .{ .slice = instance };
                 }
                 // re-borrowing a place already holding a slice yields the
-                // same view (section 4.2)
+                // same view (section 5.2)
                 if (place.* == .slice) {
                     return place.*;
                 }
@@ -952,7 +962,7 @@ pub const Interpreter = struct {
 
     fn evalBinary(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         const binary = expression.binary;
-        // logical operators short-circuit (section 4.1)
+        // logical operators short-circuit (section 5.1)
         if (binary.operator.tag == .ampersand_ampersand or binary.operator.tag == .pipe_pipe) {
             const left = try self.evalExpression(binary.left);
             if (left != .bool_value) return self.fault("logical operators need bool operands", .{});
@@ -1047,7 +1057,7 @@ pub const Interpreter = struct {
         };
     }
 
-    // overflow is a fault in the interpreter (section 4.2)
+    // overflow is a fault in the interpreter (section 5.2)
     fn checkIntegerRange(self: *Interpreter, integer: Value.Integer) Error!void {
         const primitive = integer.primitive orelse return;
         if (integer.value < minimumOf(primitive) or integer.value > maximumOf(primitive)) {
@@ -1074,7 +1084,7 @@ pub const Interpreter = struct {
                     .float => |float| @intFromFloat(float.value),
                     else => return self.fault("'to' needs a numeric operand", .{}),
                 };
-                // conversion truncates into the target range (section 3.5)
+                // conversion truncates into the target range (section 4.5)
                 return .{ .integer = .{ .value = truncateToPrimitive(wide, target), .primitive = target } };
             },
             .keyword_is => {
@@ -1087,7 +1097,7 @@ pub const Interpreter = struct {
                 return switch (operand) {
                     .enum_value => |instance| .{ .bool_value = std.mem.eql(u8, instance.variant, target_name) },
                     // an interface object's concrete-type test compares the
-                    // checker-resolved identity (section 3.2)
+                    // checker-resolved identity (section 4.2)
                     .struct_value => |instance| verdict: {
                         if (self.type_targets.get(expression)) |target| {
                             const identity = instance.identity orelse break :verdict .{ .bool_value = false };
@@ -1112,7 +1122,7 @@ pub const Interpreter = struct {
         }
     }
 
-    // 'as' reinterprets the bytes of same-width primitives (section 3.5)
+    // 'as' reinterprets the bytes of same-width primitives (section 4.5)
     fn reinterpret(self: *Interpreter, operand: Value, target: types.Primitive) Error!Value {
         const bits: u64 = switch (operand) {
             .integer => |integer| @truncate(@as(u128, @bitCast(integer.value))),
@@ -1135,7 +1145,7 @@ pub const Interpreter = struct {
         return .{ .integer = .{ .value = masked, .primitive = target } };
     }
 
-    // 'as' beyond primitives (section 3.5): the value is serialized into its
+    // 'as' beyond primitives (section 4.5): the value is serialized into its
     // little-endian C-layout byte image and read back as the target shape
     fn reinterpretShaped(self: *Interpreter, operand: Value, shapes: types.CastShapes) Error!Value {
         const size: usize = @intCast(shapes.source.byteSize());
@@ -1250,7 +1260,7 @@ pub const Interpreter = struct {
             .tagged => |tagged| {
                 const index = readUnsigned(bytes[0..@intCast(tagged.tag_size)]);
                 if (index >= tagged.variants.len) {
-                    return self.fault("'as' produced a tag of {d}, which names no variant (section 3.5)", .{index});
+                    return self.fault("'as' produced a tag of {d}, which names no variant (section 4.5)", .{index});
                 }
                 const variant = tagged.variants[@intCast(index)];
                 var payload: ?Value = null;
@@ -1404,14 +1414,14 @@ pub const Interpreter = struct {
                 const arguments = try self.evalArguments(call.arguments);
                 return self.callFunction(symbol, arguments, type_bindings);
             },
-            // '#macro(...)' with a checker-recorded target (section 6.3)
+            // '#macro(...)' with a checker-recorded target (section 7.3)
             .macro_def => |macro_def| return self.callMacro(symbol, macro_def, call),
             else => return self.fault("this callee is not callable", .{}),
         }
     }
 
     fn callMethod(self: *Interpreter, member: anytype, call: anytype) Error!Value {
-        // built-in '.length()' on every array form (section 5.1); the
+        // built-in '.length()' on every array form (section 6.1); the
         // receiver may be a temporary, not only a place
         const name = member.name.slice(self.source());
         if (std.mem.eql(u8, name, "length") and call.arguments.len == 0) {
@@ -1429,14 +1439,14 @@ pub const Interpreter = struct {
             };
             if (length) |value| return .{ .integer = .{ .value = @intCast(value), .primitive = .u64 } };
         }
-        // '#Type' reflection methods (section 3.4), compile time only
+        // '#Type' reflection methods (section 4.4), compile time only
         if (self.comptime_mode) {
             if (try self.typeValueReceiver(member.object)) |description| {
                 return self.typeMethod(description, name, call);
             }
         }
         // a call without a static target dispatches at runtime through the
-        // receiver's concrete type (section 5.2); extensions win over
+        // receiver's concrete type (section 6.2); extensions win over
         // function-typed fields, matching the native dispatch order
         if (try self.evalPlace(member.object)) |place| {
             const pierced = try self.pierceCell(place);
@@ -1462,7 +1472,7 @@ pub const Interpreter = struct {
             }
         } else {
             // a temporary receiver (a call result) also calls through its
-            // function-typed field (section 4.4)
+            // function-typed field (section 5.4)
             const receiver = try self.evalExpression(member.object);
             if (receiver == .struct_value) {
                 for (receiver.struct_value.fields) |*field| {
@@ -1478,7 +1488,7 @@ pub const Interpreter = struct {
         // compile-time code may run before the extension's module is
         // checked (eager macros evaluate mid-check), so no call target or
         // struct identity exists yet: extensions resolve by name and
-        // arity, like every other comptime call (section 6.3)
+        // arity, like every other comptime call (section 7.3)
         if (self.comptime_mode) {
             if (self.globals.get(name)) |symbols| {
                 for (symbols.items) |symbol| {
@@ -1505,7 +1515,7 @@ pub const Interpreter = struct {
         return if (value == .type_value) value.type_value else null;
     }
 
-    // the '#Type' method set (section 3.4)
+    // the '#Type' method set (section 4.4)
     fn typeMethod(self: *Interpreter, description: *Value.TypeDescription, name: []const u8, call: anytype) Error!Value {
         const arguments = try self.evalArguments(call.arguments);
         if (std.mem.eql(u8, name, "is_struct")) return .{ .bool_value = description.kind == .struct_kind };
@@ -1519,7 +1529,7 @@ pub const Interpreter = struct {
         }
         if (std.mem.eql(u8, name, "implements_interface")) {
             const other = try self.typeArgument(arguments, 0, "implements_interface");
-            if (other.kind != .interface_kind) return self.fault("'implements_interface' needs an interface '#Type' (section 3.4)", .{});
+            if (other.kind != .interface_kind) return self.fault("'implements_interface' needs an interface '#Type' (section 4.4)", .{});
             // the checker answers by definition identity, covering lang
             // items; marker names remain only for synthesised descriptions
             if (self.reflection) |hooks| {
@@ -1533,14 +1543,14 @@ pub const Interpreter = struct {
             return .{ .bool_value = false };
         }
         if (std.mem.eql(u8, name, "add_member")) {
-            if (arguments.len != 2) return self.fault("'add_member' expects a name and a '#Type' (section 3.4)", .{});
+            if (arguments.len != 2) return self.fault("'add_member' expects a name and a '#Type' (section 4.4)", .{});
             const member_name = try self.byteSlice(arguments[0]);
             const member_type = try self.typeArgument(arguments, 1, "add_member");
             try description.members.append(self.arena, .{ .name = member_name, .description = member_type });
             return .void_value;
         }
         if (std.mem.eql(u8, name, "remove_member")) {
-            if (arguments.len != 1) return self.fault("'remove_member' expects a member name (section 3.4)", .{});
+            if (arguments.len != 1) return self.fault("'remove_member' expects a member name (section 4.4)", .{});
             const member_name = try self.byteSlice(arguments[0]);
             for (description.members.items, 0..) |member, index| {
                 if (std.mem.eql(u8, member.name, member_name)) {
@@ -1548,7 +1558,7 @@ pub const Interpreter = struct {
                     return .void_value;
                 }
             }
-            return self.fault("no member '{s}' to remove (section 3.4)", .{member_name});
+            return self.fault("no member '{s}' to remove (section 4.4)", .{member_name});
         }
         if (std.mem.eql(u8, name, "member_names")) {
             const values = try self.arena.alloc(Value, description.members.items.len);
@@ -1568,12 +1578,12 @@ pub const Interpreter = struct {
             instance.* = .{ .elements = values };
             return .{ .slice = instance };
         }
-        return self.fault("'#Type' has no method '{s}' (section 3.4)", .{name});
+        return self.fault("'#Type' has no method '{s}' (section 4.4)", .{name});
     }
 
     fn typeArgument(self: *Interpreter, arguments: []const Value, index: usize, method: []const u8) Error!*Value.TypeDescription {
         if (index >= arguments.len or arguments[index] != .type_value) {
-            return self.fault("'{s}' expects a '#Type' argument (section 3.4)", .{method});
+            return self.fault("'{s}' expects a '#Type' argument (section 4.4)", .{method});
         }
         return arguments[index].type_value;
     }
@@ -1586,7 +1596,7 @@ pub const Interpreter = struct {
     }
 
     // resolves an interface-object call by the receiver's nominal identity:
-    // a type-specific extension wins over an interface default (section 5.2)
+    // a type-specific extension wins over an interface default (section 6.2)
     fn findDispatchTarget(self: *Interpreter, receiver: types.TypeIdentity, method_name: []const u8) ?resolution.Symbol {
         const symbols = self.globals.get(method_name) orelse return null;
         var default_implementation: ?resolution.Symbol = null;
@@ -1632,7 +1642,7 @@ pub const Interpreter = struct {
     }
 
     // an extension call: the receiver becomes the self argument per the
-    // self parameter's indirection (section 4.5)
+    // self parameter's indirection (section 5.5)
     fn callExtension(self: *Interpreter, symbol: resolution.Symbol, fn_def: ast.FnDef, member: anytype, call: anytype, type_bindings: []const Type.Binding) Error!Value {
         const receiver_place = try self.evalPlace(member.object);
         const self_parameter = fn_def.function.parameters[0];
@@ -1640,7 +1650,7 @@ pub const Interpreter = struct {
             .reference => reference: {
                 if (receiver_place) |place| break :reference .{ .reference = try self.pierceCell(place) };
                 // a temporary receiver materializes for the call's duration
-                // (section 4.5); the checker only lets immutable '&' through
+                // (section 5.5); the checker only lets immutable '&' through
                 const cell = try self.arena.create(Value);
                 cell.* = try self.evalExpression(member.object);
                 break :reference .{ .reference = try self.pierceCell(cell) };
@@ -1721,7 +1731,7 @@ pub const Interpreter = struct {
         };
     }
 
-    // the built-in macros (section 6.4)
+    // the built-in macros (section 7.4)
     fn builtinMacroCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
         if (std.mem.eql(u8, name, "struct_type") or std.mem.eql(u8, name, "enum_type")) {
             const description = try self.arena.create(Value.TypeDescription);
@@ -1736,49 +1746,49 @@ pub const Interpreter = struct {
             return .{ .type_value = description };
         }
         if (std.mem.eql(u8, name, "type_of")) {
-            if (call.arguments.len != 1) return self.fault("'type_of' expects one argument (section 6.4)", .{});
+            if (call.arguments.len != 1) return self.fault("'type_of' expects one argument (section 7.4)", .{});
             const hooks = self.reflection orelse return self.fault("reflection is unavailable here", .{});
             const description = (try hooks.reflect_expression(hooks.context, call.arguments[0])) orelse
-                return self.fault("the type of this expression is not known at compile time (section 6.4)", .{});
+                return self.fault("the type of this expression is not known at compile time (section 7.4)", .{});
             return .{ .type_value = description };
         }
         if (std.mem.eql(u8, name, "implementers_of")) {
-            if (call.arguments.len != 1) return self.fault("'implementers_of' expects one argument (section 6.4)", .{});
+            if (call.arguments.len != 1) return self.fault("'implementers_of' expects one argument (section 7.4)", .{});
             const hooks = self.reflection orelse return self.fault("reflection is unavailable here", .{});
             const argument = try self.evalExpression(call.arguments[0]);
             if (argument != .type_value) {
-                return self.fault("'implementers_of' expects an interface (section 6.4)", .{});
+                return self.fault("'implementers_of' expects an interface (section 7.4)", .{});
             }
             const implementers = (try hooks.reflect_implementers(hooks.context, argument.type_value)) orelse
-                return self.fault("'implementers_of' expects an interface (section 6.4)", .{});
+                return self.fault("'implementers_of' expects an interface (section 7.4)", .{});
             const instance = try self.arena.create(Value.ArrayInstance);
             instance.* = .{ .elements = try self.arena.dupe(Value, implementers) };
             return .{ .array = instance };
         }
         if (std.mem.eql(u8, name, "read_file")) {
-            if (call.arguments.len != 1) return self.fault("'read_file' expects one argument (section 6.4)", .{});
+            if (call.arguments.len != 1) return self.fault("'read_file' expects one argument (section 7.4)", .{});
             const argument = try self.evalExpression(call.arguments[0]);
             const path = try self.byteSlice(argument);
-            // the comptime sandbox (section 6.2): project-relative paths
+            // the comptime sandbox (section 7.2): project-relative paths
             // only, never escaping the entry module's directory
             if (std.fs.path.isAbsolute(path)) {
-                return self.fault("'read_file' takes a path inside the project, not an absolute one (section 6.2)", .{});
+                return self.fault("'read_file' takes a path inside the project, not an absolute one (section 7.2)", .{});
             }
             var components = std.mem.tokenizeAny(u8, path, "/\\");
             while (components.next()) |component| {
                 if (std.mem.eql(u8, component, "..")) {
-                    return self.fault("'read_file' cannot escape the project root ('..' in '{s}', section 6.2)", .{path});
+                    return self.fault("'read_file' cannot escape the project root ('..' in '{s}', section 7.2)", .{path});
                 }
             }
-            const io = self.comptime_io orelse return self.fault("compile-time file reading is unavailable here (section 6.4)", .{});
+            const io = self.comptime_io orelse return self.fault("compile-time file reading is unavailable here (section 7.4)", .{});
             const joined = try std.fs.path.join(self.arena, &.{ self.comptime_root, path });
             const contents = std.Io.Dir.cwd().readFileAlloc(io, joined, self.arena, .limited(64 * 1024 * 1024)) catch {
-                return self.fault("'read_file' could not read '{s}' (section 6.4)", .{path});
+                return self.fault("'read_file' could not read '{s}' (section 7.4)", .{path});
             };
             return try self.bytesValue(contents);
         }
         if (std.mem.eql(u8, name, "name_of")) {
-            if (call.arguments.len != 1) return self.fault("'name_of' expects one argument (section 6.4)", .{});
+            if (call.arguments.len != 1) return self.fault("'name_of' expects one argument (section 7.4)", .{});
             var argument = try self.evalExpression(call.arguments[0]);
             // a borrowed or owned enum reads as its pointee
             while (true) {
@@ -1789,7 +1799,7 @@ pub const Interpreter = struct {
                 }
             }
             if (argument != .enum_value) {
-                return self.fault("'name_of' expects an enum value (section 6.4)", .{});
+                return self.fault("'name_of' expects an enum value (section 7.4)", .{});
             }
             return try self.bytesValue(argument.enum_value.variant);
         }
@@ -1798,7 +1808,7 @@ pub const Interpreter = struct {
 
     // compile-time name resolution for macro bodies, which carry no checked
     // call targets: functions match by name and arity first — a bare call
-    // never means a macro sharing the name (section 6.3, '#name' does) —
+    // never means a macro sharing the name (section 7.3, '#name' does) —
     // with the macro as the fallback
     fn comptimeNameCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
         const symbols = self.globals.get(name) orelse return null;
@@ -1829,7 +1839,7 @@ pub const Interpreter = struct {
 
     fn callMacro(self: *Interpreter, symbol: resolution.Symbol, macro_def: ast.MacroDef, call: anytype) Error!Value {
         if (!self.comptime_mode) {
-            return self.fault("macros run at compile time; invoke with '#' (section 6.3)", .{});
+            return self.fault("macros run at compile time; invoke with '#' (section 7.3)", .{});
         }
         if (call.arguments.len != macro_def.parameters.len) {
             return self.fault("this macro expects {d} argument(s), found {d}", .{ macro_def.parameters.len, call.arguments.len });
@@ -1838,7 +1848,7 @@ pub const Interpreter = struct {
         if (macro_def.body == null) {
             const name = macro_def.name.slice(self.views[symbol.view_index].source);
             return (try self.builtinMacroCall(name, call)) orelse
-                self.fault("macro '{s}' is declared but not implemented (section 6.4)", .{name});
+                self.fault("macro '{s}' is declared but not implemented (section 7.4)", .{name});
         }
         if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
         self.call_depth += 1;
@@ -1870,7 +1880,7 @@ pub const Interpreter = struct {
     }
 
     // calls an extension on a value cell, shaping the self argument to the
-    // extension's declared indirection (section 4.5)
+    // extension's declared indirection (section 5.5)
     fn callWithSelf(self: *Interpreter, symbol: resolution.Symbol, cell: *Value) Error!Value {
         const fn_def = symbol.definition.kind.fn_def;
         const self_value: Value = switch (selfIndirection(fn_def.function.parameters[0].parameter_type)) {
@@ -1917,7 +1927,7 @@ pub const Interpreter = struct {
         };
     }
 
-    // the std::process::arguments lang item (section 5.1a), recognized by
+    // the std::process::arguments lang item (section 6.1a), recognized by
     // its canonical module key and name
     fn processArgumentsLangItem(self: *const Interpreter, symbol: resolution.Symbol) bool {
         if (symbol.definition.kind != .fn_def) return false;
@@ -1929,7 +1939,7 @@ pub const Interpreter = struct {
 
     fn processArgumentsValue(self: *Interpreter) Error!Value {
         if (self.comptime_mode) {
-            return self.fault("process arguments are unavailable at compile time (section 6.2)", .{});
+            return self.fault("process arguments are unavailable at compile time (section 7.2)", .{});
         }
         const outer = try self.arena.alloc(Value, self.process_arguments.len);
         for (self.process_arguments, outer) |argument, *slot| {
@@ -1948,12 +1958,12 @@ pub const Interpreter = struct {
 
     fn callExtern(self: *Interpreter, name: []const u8, arguments: []const Value) Error!Value {
         if (self.comptime_mode) {
-            return self.fault("extern functions cannot be called at compile time (section 6.2)", .{});
+            return self.fault("extern functions cannot be called at compile time (section 7.2)", .{});
         }
         if (std.mem.eql(u8, name, "printf")) {
             return self.printfExtern(arguments);
         }
-        // the std::io externs (section 5.4): C stdio names implemented over
+        // the std::io externs (section 6.4): C stdio names implemented over
         // the host filesystem, so 'alloyc run' and the debugger execute the
         // standard library unchanged
         if (std.mem.eql(u8, name, "__acrt_iob_func")) {
@@ -2152,15 +2162,15 @@ pub const Interpreter = struct {
     }
 
     // a statement-position if passes 'yield' through to the enclosing
-    // value construct; only a value-position if consumes it (section 4.3)
+    // value construct; only a value-position if consumes it (section 5.3)
     fn evalIf(self: *Interpreter, if_expr: ast.IfExpression, as_value: bool) Error!Value {
         // the frame spans condition and then-branch: inline 'is' captures
-        // bind during the condition (section 3.2)
+        // bind during the condition (section 4.2)
         try self.pushFrame(false);
         const condition = try self.evalExpression(if_expr.condition);
         const taken = condition == .bool_value and condition.bool_value;
         if (taken) {
-            const flow = if (as_value) try self.execYieldingBody(if_expr.then_branch) else try self.execStatement(if_expr.then_branch);
+            const flow = if (as_value) try self.execValueBranch(if_expr.then_branch) else try self.execStatement(if_expr.then_branch);
             self.popFrame();
             switch (flow) {
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),
@@ -2171,7 +2181,7 @@ pub const Interpreter = struct {
         } else {
             self.popFrame();
             if (if_expr.else_branch) |else_branch| {
-                const flow = if (as_value) try self.execYieldingBody(else_branch) else try self.execStatement(else_branch);
+                const flow = if (as_value) try self.execValueBranch(else_branch) else try self.execStatement(else_branch);
                 switch (flow) {
                     .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                     .break_value => return self.flowBreak(flow),
@@ -2203,7 +2213,7 @@ pub const Interpreter = struct {
     }
 
     // a loop body: a nested if or match rethrew 'break' on the error
-    // channel; the loop is where it lands (section 4.3)
+    // channel; the loop is where it lands (section 5.3)
     fn execLoopBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
         return self.execStatement(statement) catch |err| switch (err) {
             error.Break => .{ .break_value = self.pending_break },
@@ -2212,7 +2222,16 @@ pub const Interpreter = struct {
     }
 
     // an if or match body: a nested loop rethrew 'yield' on the error
-    // channel; the value construct is where it lands (section 4.3)
+    // channel; the value construct is where it lands (section 5.3)
+    // a value-position branch or arm that is a bare expression yields its
+    // value implicitly (section 3.1)
+    fn execValueBranch(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
+        if (statement.* == .expression) {
+            return .{ .yield_value = try self.evalExpression(statement.expression) };
+        }
+        return self.execYieldingBody(statement);
+    }
+
     fn execYieldingBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
         return self.execStatement(statement) catch |err| switch (err) {
             error.Yield => .{ .yield_value = self.pending_yield },
@@ -2222,6 +2241,25 @@ pub const Interpreter = struct {
 
     // 'x is Enum::Variant |capture|' evaluates the test and binds the
     // payload (or the downcast value) into the current frame on a match
+    // an interface-object capture: '|&c|' / '|&var c|' borrow the concrete
+    // value in place, '|move c|' takes the owning pointer out of the object
+    // and clears it, leaving the subject moved-from (section 4.2)
+    fn bindDowncast(self: *Interpreter, capture: ast.Capture, place: ?*Value, concrete: *Value) Error!void {
+        const name = capture.name.slice(self.source());
+        if (captureMode(capture) == .owning) {
+            const cell = place orelse return self.fault("a '|move {s}|' capture needs an owning interface object", .{name});
+            // the object may sit behind a reference cell (a reborrowed parameter)
+            var owner = cell;
+            while (owner.* == .reference) owner = owner.reference;
+            if (owner.* != .pointer or owner.pointer == null) return self.fault("a '|move {s}|' capture needs an owning interface object", .{name});
+            const taken = owner.pointer;
+            owner.* = .{ .pointer = null };
+            try self.bind(name, .{ .pointer = taken });
+            return;
+        }
+        try self.bind(name, .{ .reference = concrete });
+    }
+
     fn evalIsWithCapture(self: *Interpreter, expression: *const ast.Expression, cast: anytype, capture: ast.Capture) Error!bool {
         const place = (try self.evalPlace(cast.operand)) orelse temporary: {
             // an 'is' subject may be a temporary (a call result); it lives
@@ -2234,7 +2272,7 @@ pub const Interpreter = struct {
         const target_token = cast.target.named.path[cast.target.named.path.len - 1];
         const target_name = target_token.slice(self.source());
         // a downcast: the capture borrows the concrete value in place,
-        // mirroring the subject's indirection (section 3.2)
+        // mirroring the subject's indirection (section 4.2)
         if (pierced.* == .struct_value) {
             if (self.type_targets.get(expression)) |target| {
                 const identity = pierced.struct_value.identity orelse return false;
@@ -2242,7 +2280,7 @@ pub const Interpreter = struct {
             } else if (!std.mem.eql(u8, pierced.struct_value.type_name, target_name)) {
                 return false;
             }
-            try self.bind(capture.name.slice(self.source()), .{ .reference = pierced });
+            try self.bindDowncast(capture, place, pierced);
             return true;
         }
         if (pierced.* != .enum_value) return self.fault("'is' needs an enum or interface-object subject", .{});
@@ -2252,7 +2290,7 @@ pub const Interpreter = struct {
         return true;
     }
 
-    // capture typing (section 2.1): deep copy by default, '&' borrows in
+    // capture typing (section 3.1): deep copy by default, '&' borrows in
     // place, '*' takes a pointer payload out of the subject
     fn bindCaptured(self: *Interpreter, capture: ast.Capture, payload: Value, subject: *Value) Error!void {
         const name = capture.name.slice(self.source());
@@ -2290,52 +2328,63 @@ pub const Interpreter = struct {
                 .pointer, .pointer_var => .owning,
             };
         }
-        if (capture.annotation) |annotation| {
-            if (annotation.* == .modified) {
-                return switch (annotation.modified.modifier) {
-                    .reference, .reference_var => .reference,
-                    .pointer, .pointer_var => .owning,
-                };
-            }
-        }
         return .copy;
     }
 
-    fn evalWhile(self: *Interpreter, while_expr: ast.WhileExpression) Error!Value {
+    // 'as_value': a loop with an 'else' in value position receives 'yield'
+    // and 'break value' from its body and 'yield' from the else; a
+    // statement loop passes 'yield' through to the enclosing value
+    // construct (section 5.3)
+    fn evalWhile(self: *Interpreter, while_expr: ast.WhileExpression, as_value: bool) Error!Value {
         while (true) {
-            // condition captures live for one iteration (section 3.2)
+            // condition captures live for one iteration (section 4.2)
             try self.pushFrame(false);
             const condition = try self.evalExpression(while_expr.condition);
             if (condition != .bool_value or !condition.bool_value) {
                 self.popFrame();
                 break;
             }
-            const flow = try self.execLoopBody(while_expr.body);
+            const flow = if (as_value) try self.execValueLoopBody(while_expr.body) else try self.execLoopBody(while_expr.body);
             self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
-                .yield_value => return self.flowYield(flow),
+                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
         }
         if (while_expr.else_branch) |else_branch| {
-            const flow = try self.execLoopBody(else_branch);
-            switch (flow) {
-                .break_value => |value| return value orelse .void_value,
-                .yield_value => return self.flowYield(flow),
-                .return_value => return self.flowReturn(flow),
-                .normal => {},
-            }
+            return self.evalLoopElse(else_branch);
         }
         return .void_value;
     }
 
-    fn evalFor(self: *Interpreter, for_expr: ast.ForExpression) Error!Value {
+    // the 'else' of a value loop yields the loop's value; a 'break' there
+    // belongs to an outer loop (section 5.3)
+    fn evalLoopElse(self: *Interpreter, else_branch: *const ast.Statement) Error!Value {
+        const flow = try self.execYieldingBody(else_branch);
+        switch (flow) {
+            .yield_value => |value| return value,
+            .break_value => return self.flowBreak(flow),
+            .return_value => return self.flowReturn(flow),
+            .normal => return .void_value,
+        }
+    }
+
+    // a value loop's body: both 'break' and 'yield' land here
+    fn execValueLoopBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
+        return self.execStatement(statement) catch |err| switch (err) {
+            error.Break => .{ .break_value = self.pending_break },
+            error.Yield => .{ .yield_value = self.pending_yield },
+            else => err,
+        };
+    }
+
+    fn evalFor(self: *Interpreter, for_expr: ast.ForExpression, as_value: bool) Error!Value {
         const Subject = union(enum) {
             counter: struct { next: i128, end: i128, primitive: types.Primitive },
             elements: *Value.ArrayInstance,
-            // the cursor protocol (section 4.3): 'next()' advances this cell
+            // the cursor protocol (section 5.3): 'next()' advances this cell
             cursor: struct { next_symbol: resolution.Symbol, cell: *Value },
         };
         var subjects: std.ArrayList(Subject) = .empty;
@@ -2358,16 +2407,16 @@ pub const Interpreter = struct {
             if (pierced.* == .struct_value) {
                 const type_name = pierced.struct_value.type_name;
                 const identity = pierced.struct_value.identity orelse
-                    return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 4.3)", .{type_name});
+                    return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 5.3)", .{type_name});
                 const iterator_symbol = self.findDispatchTarget(identity, "iterator") orelse
-                    return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 4.3)", .{type_name});
+                    return self.fault("'{s}' is not iterable: no 'iterator()' extension found (section 5.3)", .{type_name});
                 const cursor_value = try self.callWithSelf(iterator_symbol, pierced);
                 const cursor_cell = try self.arena.create(Value);
                 cursor_cell.* = cursor_value;
                 const cursor_name = if (cursor_value == .struct_value) cursor_value.struct_value.type_name else "";
                 const cursor_identity = if (cursor_value == .struct_value) cursor_value.struct_value.identity else null;
                 const next_symbol = (if (cursor_identity) |alive| self.findDispatchTarget(alive, "next") else null) orelse
-                    return self.fault("the cursor '{s}' has no 'next()' extension (section 4.3)", .{cursor_name});
+                    return self.fault("the cursor '{s}' has no 'next()' extension (section 5.3)", .{cursor_name});
                 try subjects.append(self.arena, .{ .cursor = .{ .next_symbol = next_symbol, .cell = cursor_cell } });
                 continue;
             }
@@ -2379,7 +2428,7 @@ pub const Interpreter = struct {
         var iteration: usize = 0;
         while (true) : (iteration += 1) {
             // every subject must produce an element this pass or the loop
-            // ends; a partial pass is a length mismatch (section 4.3)
+            // ends; a partial pass is a length mismatch (section 5.3)
             var any_produced = false;
             var any_exhausted = false;
             if (length) |total| {
@@ -2398,7 +2447,7 @@ pub const Interpreter = struct {
                 }
             }
             if (any_exhausted) {
-                if (any_produced) return self.fault("for subjects disagree on length (section 4.3)", .{});
+                if (any_produced) return self.fault("for subjects disagree on length (section 5.3)", .{});
                 break;
             }
             if (!any_produced) break;
@@ -2425,23 +2474,17 @@ pub const Interpreter = struct {
                     },
                 }
             }
-            const flow = try self.execLoopBody(for_expr.body);
+            const flow = if (as_value) try self.execValueLoopBody(for_expr.body) else try self.execLoopBody(for_expr.body);
             self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
-                .yield_value => return self.flowYield(flow),
+                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
         }
         if (for_expr.else_branch) |else_branch| {
-            const flow = try self.execLoopBody(else_branch);
-            switch (flow) {
-                .break_value => |value| return value orelse .void_value,
-                .yield_value => return self.flowYield(flow),
-                .return_value => return self.flowReturn(flow),
-                .normal => {},
-            }
+            return self.evalLoopElse(else_branch);
         }
         return .void_value;
     }
@@ -2451,7 +2494,7 @@ pub const Interpreter = struct {
     fn checkLockstep(self: *Interpreter, length: *?usize, candidate: usize) Error!void {
         if (length.*) |existing| {
             if (existing != candidate) {
-                return self.fault("for subjects disagree on length: {d} versus {d} (section 4.3)", .{ existing, candidate });
+                return self.fault("for subjects disagree on length: {d} versus {d} (section 5.3)", .{ existing, candidate });
             }
         } else {
             length.* = candidate;
@@ -2495,11 +2538,10 @@ pub const Interpreter = struct {
                         try self.bindCaptured(capture, payload, subject);
                     }
                 } else if (subject.* == .struct_value) {
-                    // an interface-object arm borrows the concrete value
-                    try self.bind(capture.name.slice(self.source()), .{ .reference = subject });
+                    try self.bindDowncast(capture, subject_place, subject);
                 }
             }
-            const flow = if (as_value) try self.execYieldingBody(arm.body) else try self.execStatement(arm.body);
+            const flow = if (as_value) try self.execValueBranch(arm.body) else try self.execStatement(arm.body);
             self.popFrame();
             switch (flow) {
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),

@@ -49,14 +49,14 @@ pub const Parser = struct {
         var imports: std.ArrayList(ast.Import) = .empty;
         var definitions: std.ArrayList(ast.Definition) = .empty;
 
-        self.skipSemicolons();
+        try self.rejectStrayTerminator();
         while (self.current().tag == .keyword_import) {
             try imports.append(self.arena, try self.parseImport());
-            self.skipSemicolons();
+            try self.rejectStrayTerminator();
         }
         while (self.current().tag != .end_of_file) {
             try definitions.append(self.arena, try self.parseDefinition());
-            self.skipSemicolons();
+            try self.rejectStrayTerminator();
         }
         return .{
             .imports = try imports.toOwnedSlice(self.arena),
@@ -157,11 +157,30 @@ pub const Parser = struct {
         const type_parameters = try self.parseTypeParameters();
         _ = try self.expect(.brace_left, "'{'");
         var functions: std.ArrayList(ast.InterfaceFn) = .empty;
-        self.skipSemicolons();
+        try self.rejectStrayTerminator();
         while (self.current().tag != .brace_right) {
             _ = try self.expect(.keyword_fn, "'fn' or '}'");
             const fn_name = try self.expect(.identifier, "a function name");
-            const parameter_list = try self.parseParameterList(false);
+            // the receiver indirection comes first, nameless and typeless:
+            // the type is whatever implements the interface (section 6.2)
+            _ = try self.expect(.parenthesis_left, "'('");
+            const receiver_token = self.current();
+            if (self.match(.keyword_self) == null) {
+                return self.fail(receiver_token, "an interface function declares its receiver first: 'fn {s}(self: &, ...)' (section 6.2)", .{fn_name.slice(self.source)});
+            }
+            _ = try self.expect(.colon, "':'");
+            const receiver = self.parseTypeModifier() orelse {
+                return self.fail(self.current(), "expected the receiver indirection ('&', '&var', '*', or '*var') after 'self:' (section 6.2)", .{});
+            };
+            var parameters: std.ArrayList(ast.Parameter) = .empty;
+            while (self.match(.comma) != null) {
+                if (self.current().tag == .parenthesis_right) break;
+                const parameter_name = try self.expect(.identifier, "a parameter name");
+                _ = try self.expect(.colon, "':'");
+                const parameter_type = try self.parseType();
+                try parameters.append(self.arena, .{ .is_self = false, .name = parameter_name, .parameter_type = parameter_type });
+            }
+            _ = try self.expect(.parenthesis_right, "')'");
             var return_type: ?*const ast.TypeExpression = null;
             if (self.match(.arrow) != null) {
                 return_type = try self.parseType();
@@ -169,10 +188,12 @@ pub const Parser = struct {
             try self.expectTerminator();
             try functions.append(self.arena, .{
                 .name = fn_name,
-                .parameters = parameter_list.parameters,
+                .receiver = receiver,
+                .receiver_token = receiver_token,
+                .parameters = try parameters.toOwnedSlice(self.arena),
                 .return_type = return_type,
             });
-            self.skipSemicolons();
+            try self.rejectStrayTerminator();
         }
         _ = try self.expect(.brace_right, "'}'");
         return .{ .name = name, .type_parameters = type_parameters, .functions = try functions.toOwnedSlice(self.arena) };
@@ -195,11 +216,17 @@ pub const Parser = struct {
             }
         }
         _ = try self.expect(.parenthesis_right, "')'");
+        // the result type is declared, never inferred (section 7.3)
+        if (self.current().tag != .arrow) {
+            return self.fail(self.current(), "a macro declares its result type: 'macro {s}(...) -> type' (section 7.3)", .{name.slice(self.source)});
+        }
+        _ = self.advance();
+        const return_type = try self.parseType();
         // a body makes an ordinary macro; a terminator makes a
         // declaration-only macro, implemented by the compiler
         if (self.current().tag != .brace_left) {
             try self.expectTerminator();
-            return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .body = null };
+            return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .return_type = return_type, .body = null };
         }
         for (parameters.items) |parameter| {
             if (parameter.parameter_type == null) {
@@ -207,7 +234,7 @@ pub const Parser = struct {
             }
         }
         const body = try self.parseBlock();
-        return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .body = body };
+        return .{ .name = name, .parameters = try parameters.toOwnedSlice(self.arena), .return_type = return_type, .body = body };
     }
 
     fn parseTypeParameters(self: *Parser) Error![]const ast.TypeParameter {
@@ -230,7 +257,7 @@ pub const Parser = struct {
     }
 
     // an interface name with optional type arguments, used by conformance
-    // markers and generic constraints ('It: Iterator<T>', section 5.2)
+    // markers and generic constraints ('It: Iterator<T>', section 6.2)
     fn parseInterfaceMarker(self: *Parser) Error!ast.InterfaceMarker {
         const name = try self.expect(.identifier, "an interface name");
         var type_arguments: std.ArrayList(*const ast.TypeExpression) = .empty;
@@ -357,7 +384,14 @@ pub const Parser = struct {
             },
             .hash => {
                 _ = self.advance();
-                const expression = try self.parsePostfix();
+                // '#Type' in a type position is the descriptor itself,
+                // never the reflection of a type named 'Type' (section 4.4)
+                const next = self.current();
+                if (next.tag == .identifier and std.mem.eql(u8, next.slice(self.source), "Type")) {
+                    _ = self.advance();
+                    return self.create(ast.TypeExpression, .{ .type_description = next });
+                }
+                const expression = try self.parseComptimeOperand();
                 return self.create(ast.TypeExpression, .{ .comptime_type = expression });
             },
             .identifier => {
@@ -422,13 +456,13 @@ pub const Parser = struct {
     fn parseBlock(self: *Parser) Error!*const ast.Statement {
         _ = try self.expect(.brace_left, "'{'");
         var statements: std.ArrayList(*const ast.Statement) = .empty;
-        self.skipSemicolons();
+        try self.rejectStrayTerminator();
         while (self.current().tag != .brace_right) {
             if (self.current().tag == .end_of_file) {
                 return self.fail(self.current(), "expected '}}', found end of file", .{});
             }
             try statements.append(self.arena, try self.parseStatement());
-            self.skipSemicolons();
+            try self.rejectStrayTerminator();
         }
         _ = try self.expect(.brace_right, "'}'");
         return self.create(ast.Statement, .{ .block = try statements.toOwnedSlice(self.arena) });
@@ -438,31 +472,39 @@ pub const Parser = struct {
         const token = self.current();
         switch (token.tag) {
             .keyword_var, .keyword_const => return self.parseVarDef(),
-            .brace_left => return self.parseBlock(),
+            // '{' in statement position is a block unless '.' follows
+            // (an anonymous struct literal, section 3.1)
+            .brace_left => {
+                if (self.tokens[self.token_index + 1].tag != .dot) return self.parseBlock();
+            },
+            // a statement starting with one of these always parses as the
+            // statement form, never as an expression (section 3.1)
+            .keyword_if => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .if_expr = try self.parseIf(false) }) }),
+            .keyword_while => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .while_expr = try self.parseWhile(false) }) }),
+            .keyword_for => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .for_expr = try self.parseFor(false) }) }),
+            .keyword_match => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .match_expr = try self.parseMatch(false) }) }),
             .keyword_break => {
                 const keyword = self.advance();
                 var value: ?*const ast.Expression = null;
-                if (!self.atTerminator()) {
+                if (self.current().tag != .semicolon) {
                     value = try self.parseExpression();
                 }
-                // a block-like operand is self-terminating per section 2.1
-                if (value == null or !isBlockLike(value.?)) {
-                    try self.expectTerminator();
-                }
+                try self.expectTerminator();
                 return self.create(ast.Statement, .{ .break_stmt = .{ .keyword = keyword, .value = value } });
             },
             .keyword_yield => {
                 const keyword = self.advance();
                 const value = try self.parseExpression();
-                if (!isBlockLike(value)) {
-                    try self.expectTerminator();
-                }
+                try self.expectTerminator();
                 return self.create(ast.Statement, .{ .yield_stmt = .{ .keyword = keyword, .value = value } });
             },
+            else => {},
+        }
+        switch (token.tag) {
             .keyword_return => {
                 const keyword = self.advance();
                 var value: ?*const ast.Expression = null;
-                if (!self.atTerminator()) {
+                if (self.current().tag != .semicolon) {
                     value = try self.parseExpression();
                 }
                 try self.expectTerminator();
@@ -480,10 +522,7 @@ pub const Parser = struct {
                         .value = value,
                     } });
                 }
-                // a block-like expression statement needs no semicolon
-                if (!isBlockLike(expression)) {
-                    try self.expectTerminator();
-                }
+                try self.expectTerminator();
                 return self.create(ast.Statement, .{ .expression = expression });
             },
         }
@@ -570,11 +609,12 @@ pub const Parser = struct {
                         break :implied .{ .path = path, .type_arguments = &.{}, .implied = true };
                     } else try self.parseNamedType();
                     const target = try self.create(ast.TypeExpression, .{ .named = named });
-                    // 'x is ::Some |v|' captures the payload inline
-                    // (section 3.2); the lookahead keeps '|' as bitwise or
-                    // elsewhere, and match-arm captures stay the arm's own
+                    // 'x is ::Some |v|' captures the payload inline: a '|'
+                    // right after the test's type ALWAYS opens a capture,
+                    // never bitwise or (section 3.1); match-arm captures
+                    // stay the arm's own
                     var capture: ?ast.Capture = null;
-                    if (!self.stop_at_pipe and self.current().tag == .pipe and self.looksLikeCapture()) {
+                    if (!self.stop_at_pipe and self.current().tag == .pipe) {
                         _ = self.advance();
                         capture = try self.parseCapture();
                         _ = try self.expect(.pipe, "'|'");
@@ -613,7 +653,11 @@ pub const Parser = struct {
     }
 
     fn parsePostfix(self: *Parser) Error!*const ast.Expression {
-        var expression = try self.parsePrimary();
+        return self.parsePostfixFrom(try self.parsePrimary());
+    }
+
+    fn parsePostfixFrom(self: *Parser, primary: *const ast.Expression) Error!*const ast.Expression {
+        var expression = primary;
         while (true) {
             switch (self.current().tag) {
                 .parenthesis_left => {
@@ -635,7 +679,7 @@ pub const Parser = struct {
                 .bracket_left => {
                     _ = self.advance();
                     // 'arr[start..end]' and 'arr[..end]' borrow a subslice;
-                    // a lone subscript is an element index (section 2.1)
+                    // a lone subscript is an element index (section 3.1)
                     var start: ?*const ast.Expression = null;
                     if (self.current().tag != .dot_dot) {
                         start = try self.parseInnerExpression();
@@ -706,7 +750,7 @@ pub const Parser = struct {
         }
         try self.expectAngleRight();
         // 'Vector<T> { ... }': a struct literal binding the type's
-        // parameters explicitly (section 3.7)
+        // parameters explicitly (section 4.7)
         if (self.current().tag == .brace_left and self.allow_struct_init and callee.* == .path) {
             const members = try self.parseMemberInits();
             return self.create(ast.Expression, .{ .struct_init = .{
@@ -791,17 +835,28 @@ pub const Parser = struct {
                 return self.create(ast.Expression, .{ .lambda = .{ .captures = captures, .function = function } });
             },
             .bracket_left => return self.parseArrayLiteralOrFill(),
-            .keyword_if => return self.create(ast.Expression, .{ .if_expr = try self.parseIf() }),
-            .keyword_while => return self.create(ast.Expression, .{ .while_expr = try self.parseWhile() }),
-            .keyword_for => return self.create(ast.Expression, .{ .for_expr = try self.parseFor() }),
-            .keyword_match => return self.create(ast.Expression, .{ .match_expr = try self.parseMatch() }),
+            .keyword_if => return self.create(ast.Expression, .{ .if_expr = try self.parseIf(true) }),
+            .keyword_while => return self.create(ast.Expression, .{ .while_expr = try self.parseWhile(true) }),
+            .keyword_for => return self.create(ast.Expression, .{ .for_expr = try self.parseFor(true) }),
+            .keyword_match => return self.create(ast.Expression, .{ .match_expr = try self.parseMatch(true) }),
             .hash => {
                 _ = self.advance();
-                const operand = try self.parsePostfix();
+                const operand = try self.parseComptimeOperand();
                 return self.create(ast.Expression, .{ .comptime_expr = operand });
             },
             else => return self.fail(token, "expected an expression, found {s}", .{try self.describe(token)}),
         }
+    }
+
+    // what follows '#': a postfix expression, or an inline 'struct' /
+    // 'enum' layout giving that layout's '#Type' (section 3.1)
+    fn parseComptimeOperand(self: *Parser) Error!*const ast.Expression {
+        if (self.current().tag == .keyword_struct or self.current().tag == .keyword_enum) {
+            const layout = try self.parseBaseType();
+            // '#' binds the whole postfix chain: '#struct { ... }.name()'
+            return self.parsePostfixFrom(try self.create(ast.Expression, .{ .type_literal = layout }));
+        }
+        return self.parsePostfix();
     }
 
     fn parseMemberInits(self: *Parser) Error![]const ast.MemberInit {
@@ -822,18 +877,18 @@ pub const Parser = struct {
     fn parseArrayLiteralOrFill(self: *Parser) Error!*const ast.Expression {
         _ = try self.expect(.bracket_left, "'['");
         // '[]' is the empty array literal; its element type comes from
-        // context (section 3.2)
+        // context (section 4.2)
         if (self.match(.bracket_right) != null) {
             return self.create(ast.Expression, .{ .array_literal = &.{} });
         }
-        // '[..end]' is a range generator starting at 0 (section 2.1)
+        // '[..end]' is a range generator starting at 0 (section 3.1)
         if (self.match(.dot_dot)) |operator| {
             const end = try self.parseInnerExpression();
             _ = try self.expect(.bracket_right, "']'");
             return self.create(ast.Expression, .{ .array_range = .{ .operator = operator, .start = null, .end = end } });
         }
         const first = try self.parseInnerExpression();
-        // '[start..end]' generates the integers start..end-1 (section 2.1)
+        // '[start..end]' generates the integers start..end-1 (section 3.1)
         if (self.match(.dot_dot)) |operator| {
             const end = try self.parseInnerExpression();
             _ = try self.expect(.bracket_right, "']'");
@@ -841,7 +896,7 @@ pub const Parser = struct {
         }
         if (self.match(.colon) != null) {
             // the count is any expression; a later stage verifies it is
-            // compile-time evaluatable for stack arrays (section 2.1)
+            // compile-time evaluatable for stack arrays (section 3.1)
             const count = try self.parseInnerExpression();
             _ = try self.expect(.bracket_right, "']'");
             return self.create(ast.Expression, .{ .array_fill = .{ .value = first, .count = count } });
@@ -855,18 +910,26 @@ pub const Parser = struct {
         return self.create(ast.Expression, .{ .array_literal = try elements.toOwnedSlice(self.arena) });
     }
 
-    fn parseIf(self: *Parser) Error!ast.IfExpression {
+    // 'as_value': the construct is in value position, where an 'if'
+    // branch or a 'match' arm may be a bare expression and a loop may carry
+    // an 'else' (section 3.1)
+    fn parseIf(self: *Parser, as_value: bool) Error!ast.IfExpression {
         _ = try self.expect(.keyword_if, "'if'");
         _ = try self.expect(.parenthesis_left, "'('");
         const condition = try self.parseInnerExpression();
         _ = try self.expect(.parenthesis_right, "')'");
         // the retired postfix capture: captures moved inside the condition
-        // onto the 'is' test itself (section 3.2)
+        // onto the 'is' test itself (section 4.2)
         if (self.current().tag == .pipe) {
-            return self.fail(self.current(), "the capture follows the 'is' test inside the condition: 'if (x is ::Some |v|)' (section 3.2)", .{});
+            return self.fail(self.current(), "the capture follows the 'is' test inside the condition: 'if (x is ::Some |v|)' (section 4.2)", .{});
         }
-        const then_branch = try self.parseStatement();
-        const else_branch = try self.parseElseBranch();
+        const then_branch = try self.parseIfBranch(as_value);
+        var else_branch: ?*const ast.Statement = null;
+        if (self.match(.keyword_else) != null) {
+            else_branch = try self.parseIfBranch(as_value);
+        } else if (as_value) {
+            return self.fail(self.current(), "an 'if' used as a value needs an 'else' branch (section 3.1)", .{});
+        }
         return .{
             .condition = condition,
             .then_branch = then_branch,
@@ -874,17 +937,52 @@ pub const Parser = struct {
         };
     }
 
-    fn parseWhile(self: *Parser) Error!ast.WhileExpression {
+    // a branch is a block, or in value position a bare expression that
+    // yields implicitly; '{' starts a block unless '.' follows (section 3.1)
+    fn parseIfBranch(self: *Parser, as_value: bool) Error!*const ast.Statement {
+        const token = self.current();
+        if (token.tag == .brace_left and self.tokens[self.token_index + 1].tag != .dot) {
+            return self.parseBlock();
+        }
+        if (token.tag == .keyword_if and !as_value) {
+            // 'else if' chains in statement form
+            return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .if_expr = try self.parseIf(false) }) });
+        }
+        if (!as_value) {
+            return self.fail(token, "the body of an 'if' is a block: write '{{ ... }}' (section 3.1)", .{});
+        }
+        const expression = try self.parseExpression();
+        return self.create(ast.Statement, .{ .expression = expression });
+    }
+
+    fn parseLoopBody(self: *Parser, construct: []const u8) Error!*const ast.Statement {
+        if (self.current().tag != .brace_left) {
+            return self.fail(self.current(), "the body of a '{s}' is a block: write '{{ ... }}' (section 3.1)", .{construct});
+        }
+        return self.parseBlock();
+    }
+
+    // a trailing 'else' on a loop is only valid in value position (section 5.3)
+    fn parseLoopElse(self: *Parser, as_value: bool) Error!?*const ast.Statement {
+        const token = self.current();
+        if (self.match(.keyword_else) == null) return null;
+        if (!as_value) {
+            return self.fail(token, "an 'else' on a loop is only valid when the loop is used as a value (section 5.3)", .{});
+        }
+        return try self.parseLoopBody("loop else");
+    }
+
+    fn parseWhile(self: *Parser, as_value: bool) Error!ast.WhileExpression {
         _ = try self.expect(.keyword_while, "'while'");
         _ = try self.expect(.parenthesis_left, "'('");
         const condition = try self.parseInnerExpression();
         _ = try self.expect(.parenthesis_right, "')'");
-        const body = try self.parseStatement();
-        const else_branch = try self.parseElseBranch();
+        const body = try self.parseLoopBody("while");
+        const else_branch = try self.parseLoopElse(as_value);
         return .{ .condition = condition, .body = body, .else_branch = else_branch };
     }
 
-    fn parseFor(self: *Parser) Error!ast.ForExpression {
+    fn parseFor(self: *Parser, as_value: bool) Error!ast.ForExpression {
         _ = try self.expect(.keyword_for, "'for'");
         _ = try self.expect(.parenthesis_left, "'('");
         var subjects: std.ArrayList(*const ast.Expression) = .empty;
@@ -897,8 +995,8 @@ pub const Parser = struct {
         if (self.current().tag == .pipe or self.current().tag == .pipe_pipe) {
             captures = try self.parseCaptureList();
         }
-        const body = try self.parseStatement();
-        const else_branch = try self.parseElseBranch();
+        const body = try self.parseLoopBody("for");
+        const else_branch = try self.parseLoopElse(as_value);
         return .{
             .subjects = try subjects.toOwnedSlice(self.arena),
             .captures = captures,
@@ -907,14 +1005,14 @@ pub const Parser = struct {
         };
     }
 
-    fn parseMatch(self: *Parser) Error!ast.MatchExpression {
+    fn parseMatch(self: *Parser, as_value: bool) Error!ast.MatchExpression {
         _ = try self.expect(.keyword_match, "'match'");
         _ = try self.expect(.parenthesis_left, "'('");
         const subject = try self.parseInnerExpression();
         _ = try self.expect(.parenthesis_right, "')'");
         _ = try self.expect(.brace_left, "'{'");
         var arms: std.ArrayList(ast.MatchArm) = .empty;
-        self.skipSemicolons();
+        try self.rejectStrayTerminator();
         while (self.current().tag != .brace_right) {
             if (self.current().tag == .end_of_file) {
                 return self.fail(self.current(), "expected '}}', found end of file", .{});
@@ -935,32 +1033,34 @@ pub const Parser = struct {
                 capture = try self.parseCapture();
                 _ = try self.expect(.pipe, "'|'");
             }
-            const body = try self.parseStatement();
+            // an arm body is a block, or in value position a bare
+            // expression ended with ';' (section 5.3)
+            const body: *const ast.Statement = body: {
+                if (self.current().tag == .brace_left) break :body try self.parseBlock();
+                if (!as_value) {
+                    return self.fail(self.current(), "a match arm body is a block: write '{{ ... }}' (a bare expression arm is only valid when the match is used as a value, section 5.3)", .{});
+                }
+                const expression = try self.parseExpression();
+                try self.expectTerminator();
+                break :body try self.create(ast.Statement, .{ .expression = expression });
+            };
             try arms.append(self.arena, .{ .pattern = pattern, .capture = capture, .body = body });
-            self.skipSemicolons();
+            try self.rejectStrayTerminator();
         }
         _ = try self.expect(.brace_right, "'}'");
-        const else_branch = try self.parseElseBranch();
+        var else_branch: ?*const ast.Statement = null;
+        if (self.current().tag == .keyword_else) {
+            const token = self.advance();
+            if (!as_value) {
+                return self.fail(token, "an external 'else' on a match is only valid when the match is used as a value (section 5.3)", .{});
+            }
+            else_branch = try self.parseLoopBody("match else");
+        }
         return .{
             .subject = subject,
             .arms = try arms.toOwnedSlice(self.arena),
             .else_branch = else_branch,
         };
-    }
-
-    // accepts 'else' directly after the previous branch or past its semicolon
-    fn parseElseBranch(self: *Parser) Error!?*const ast.Statement {
-        if (self.current().tag == .keyword_else) {
-            _ = self.advance();
-            return try self.parseStatement();
-        }
-        var index = self.token_index;
-        while (self.tokens[index].tag == .semicolon) index += 1;
-        if (index != self.token_index and self.tokens[index].tag == .keyword_else) {
-            self.token_index = index + 1;
-            return try self.parseStatement();
-        }
-        return null;
     }
 
     fn parseCaptureList(self: *Parser) Error![]const ast.Capture {
@@ -974,50 +1074,43 @@ pub const Parser = struct {
         return captures.toOwnedSlice(self.arena);
     }
 
+    // a capture writes its modifier BEFORE the name and carries no type
+    // annotation: '|x|', '|&x|', '|&var x|', '|move x|' (section 3.1)
     fn parseCapture(self: *Parser) Error!ast.Capture {
-        // a modifier ahead of the name is the retired prefix form: captures
-        // annotate after the name, like every other binding (section 2.1)
-        if (self.current().tag == .asterisk or self.current().tag == .ampersand) {
-            const token = self.current();
-            const modifier = self.parseTypeModifier().?;
-            if (self.current().tag == .identifier) {
-                const name = self.current().slice(self.source);
-                return self.fail(token, "a capture is annotated after its name: write '|{s}: {s}|'", .{ name, modifier.lexeme() });
-            }
-            return self.fail(token, "expected a capture name, found {s}", .{try self.describe(token)});
+        if (self.match(.keyword_move) != null) {
+            const name = try self.expect(.identifier, "a capture name");
+            return .{ .modifier = .pointer, .name = name };
+        }
+        var modifier: ?ast.TypeModifier = null;
+        if (self.match(.ampersand) != null) {
+            modifier = if (self.match(.keyword_var) != null) .reference_var else .reference;
+        } else if (self.current().tag == .asterisk) {
+            return self.fail(self.current(), "an owning capture is written '|move name|' (section 3.1)", .{});
         }
         const name = try self.expect(.identifier, "a capture name");
-        if (self.match(.colon) == null) {
-            return .{ .modifier = null, .name = name, .annotation = null };
+        if (self.current().tag == .colon) {
+            return self.fail(self.current(), "a capture carries no type annotation; its modifier goes before the name: '|&{s}|' (section 3.1)", .{name.slice(self.source)});
         }
-        // a bare modifier annotation ('|a: &|', '|a: *var|') ends at '|' or ','
-        if (self.current().tag == .asterisk or self.current().tag == .ampersand) {
-            const after_modifier = self.peekPastModifier();
-            if (after_modifier == .pipe or after_modifier == .comma) {
-                const modifier = self.parseTypeModifier().?;
-                return .{ .modifier = modifier, .name = name, .annotation = null };
-            }
-        }
-        const annotation = try self.parseType();
-        return .{ .modifier = null, .name = name, .annotation = annotation };
+        return .{ .modifier = modifier, .name = name };
     }
 
-    // whether a '|' opens a capture clause ('|name|', '|name: ...|')
-    // rather than a bitwise-or operand; pure lookahead
+    // whether a '|' opens a capture clause rather than a bitwise-or
+    // operand: '|name', '|&', '|move' followed by the closing '|' or ','
     fn looksLikeCapture(self: *const Parser) bool {
-        if (self.tokens[self.token_index + 1].tag != .identifier) return false;
-        const after = self.tokens[self.token_index + 2].tag;
-        return after == .pipe or after == .colon;
+        var index = self.token_index + 1;
+        switch (self.tokens[index].tag) {
+            .keyword_move => index += 1,
+            .ampersand => {
+                index += 1;
+                if (self.tokens[index].tag == .keyword_var) index += 1;
+            },
+            else => {},
+        }
+        if (self.tokens[index].tag != .identifier) return false;
+        const after = self.tokens[index + 1].tag;
+        return after == .pipe or after == .comma;
     }
 
-    // looks past '&' / '*' and an optional 'var' without consuming anything
-    fn peekPastModifier(self: *const Parser) Token.Tag {
-        var index = self.token_index + 1;
-        if (self.tokens[index].tag == .keyword_var) {
-            index += 1;
-        }
-        return self.tokens[index].tag;
-    }
 
     // a '(' starts a lambda when it opens a parameter list: '()', '(self ...)',
     // or '(name: ...)'; anything else is a parenthesized expression
@@ -1033,12 +1126,6 @@ pub const Parser = struct {
         }
     }
 
-    fn isBlockLike(expression: *const ast.Expression) bool {
-        return switch (expression.*) {
-            .if_expr, .while_expr, .for_expr, .match_expr => true,
-            else => false,
-        };
-    }
 
     fn binaryPrecedence(tag: Token.Tag) ?u8 {
         return switch (tag) {
@@ -1116,24 +1203,17 @@ pub const Parser = struct {
         }
     }
 
-    // redundant semicolons are empty statements and are skipped silently
-    fn skipSemicolons(self: *Parser) void {
-        while (self.tokens[self.token_index].tag == .semicolon) {
-            self.token_index += 1;
+    // there is no empty statement: a ';' that terminates nothing is an
+    // error (section 3.1)
+    fn rejectStrayTerminator(self: *Parser) Error!void {
+        if (self.current().tag == .semicolon) {
+            return self.fail(self.current(), "this ';' terminates nothing: a block statement ends at its '}}' and takes no ';' (section 3.1)", .{});
         }
     }
 
-    // a statement may end at ';', or implicitly before '}', 'else', or end
-    // of file; the terminator is verified but never consumed here
-    fn atTerminator(self: *const Parser) bool {
-        return switch (self.current().tag) {
-            .semicolon, .brace_right, .keyword_else, .end_of_file => true,
-            else => false,
-        };
-    }
-
+    // every statement and declaration ends with ';' (section 3.1)
     fn expectTerminator(self: *Parser) Error!void {
-        if (self.atTerminator()) return;
+        if (self.match(.semicolon) != null) return;
         const token = self.current();
         return self.fail(token, "expected ';' before {s}", .{try self.describe(token)});
     }
@@ -1259,7 +1339,7 @@ test "match arms with patterns, captures, and external else" {
     const source =
         \\fn f() {
         \\    var label = match (value) {
-        \\        Option::Some |v: &| { yield v; }
+        \\        Option::Some |&v| { yield v; }
         \\        Option::None { yield fallback; }
         \\        else { yield other; }
         \\    } else {
@@ -1278,17 +1358,18 @@ test "match arms with patterns, captures, and external else" {
     try testing.expect(match_expr.else_branch != null);
 }
 
-test "if with is test, owning capture, and else past a semicolon" {
+test "if with is test, owning capture, and value form with bare branches" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    if (h is Holder::Boxed |boxed: *|) {
+        \\    if (h is Holder::Boxed |move boxed|) {
         \\        use(boxed);
         \\    } else {
         \\        nothing();
         \\    }
-        \\    if (cond) run(); else halt();
+        \\    var w = if (cond) a else { yield b; };
+        \\    var chain = if (a) x else if (b) y else z;
         \\}
     ;
     const module = try parseForTest(&arena, source);
@@ -1297,7 +1378,32 @@ test "if with is test, owning capture, and else past a semicolon" {
     try testing.expectEqual(Token.Tag.keyword_is, if_expr.condition.cast.operator.tag);
     try testing.expectEqual(ast.TypeModifier.pointer, if_expr.condition.cast.capture.?.modifier.?);
     try testing.expect(if_expr.else_branch != null);
-    try testing.expect(body[1].expression.if_expr.else_branch != null);
+    const value_if = body[1].var_def.value.if_expr;
+    try testing.expect(value_if.then_branch.* == .expression);
+    try testing.expect(value_if.else_branch.?.* == .block);
+    const chain = body[2].var_def.value.if_expr;
+    try testing.expect(chain.else_branch.?.expression.* == .if_expr);
+}
+
+test "statement-position constructs reject bare branches and loop else" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, needle: []const u8 }{
+        .{ .source = "fn f() { if (c) doA(); }", .needle = "the body of an 'if' is a block" },
+        .{ .source = "fn f() { while (c) { } else { } }", .needle = "only valid when the loop is used as a value" },
+        .{ .source = "fn f() { match (c) { 0 run(); } }", .needle = "a match arm body is a block" },
+        .{ .source = "fn f() { match (c) { 0 { } } else { } }", .needle = "external 'else' on a match is only valid" },
+        .{ .source = "fn f() { var x = if (c) a; }", .needle = "needs an 'else' branch" },
+    };
+    for (cases) |case| {
+        var tokenizer = tokenizer_module.Tokenizer.init(case.source);
+        var tokens: std.ArrayList(Token) = .empty;
+        defer tokens.deinit(arena.allocator());
+        try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+        var parser = Parser.init(arena.allocator(), case.source, tokens.items);
+        try testing.expectError(error.ParseError, parser.parseModule());
+        try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, case.needle) != null);
+    }
 }
 
 test "lambda forms and capture annotations" {
@@ -1305,7 +1411,7 @@ test "lambda forms and capture annotations" {
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    const doubler = |x: &var, y: &u32, z: *var| (a: i64) -> i64 { return a; };
+        \\    const doubler = |&var x, y, move z| (a: i64) -> i64 { return a; };
         \\    const plain = (b: i64) { use(b); };
         \\    const empty = () { run(); };
         \\    var grouped = (a + b);
@@ -1316,28 +1422,40 @@ test "lambda forms and capture annotations" {
     const captures = body[0].var_def.value.lambda.captures;
     try testing.expectEqual(@as(usize, 3), captures.len);
     try testing.expectEqual(ast.TypeModifier.reference_var, captures[0].modifier.?);
-    try testing.expect(captures[1].annotation != null);
-    try testing.expectEqual(ast.TypeModifier.pointer_var, captures[2].modifier.?);
+    try testing.expect(captures[1].modifier == null);
+    try testing.expectEqual(ast.TypeModifier.pointer, captures[2].modifier.?);
     try testing.expectEqual(@as(usize, 1), body[1].var_def.value.lambda.function.parameters.len);
     try testing.expectEqual(@as(usize, 0), body[2].var_def.value.lambda.captures.len);
     try testing.expectEqual(Token.Tag.plus, body[3].var_def.value.grouped.binary.operator.tag);
 }
 
-test "break with block-like operand is self-terminating" {
+test "loops carry an else in value position and match arms may be bare" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    while (running) {
-        \\        break if (cond) yield a else yield b
-        \\    }
+        \\    var found = while (running) {
+        \\        break if (cond) a else b;
+        \\    } else {
+        \\        yield 0;
+        \\    };
+        \\    var y = match (state) {
+        \\        ::Idle 0;
+        \\        ::Busy |load| load;
+        \\        else -1;
+        \\    };
         \\}
     ;
     const module = try parseForTest(&arena, source);
     const body = module.definitions[0].kind.fn_def.function.body.block;
-    const loop_body = body[0].expression.while_expr.body.block;
-    const break_value = loop_body[0].break_stmt.value.?;
-    try testing.expect(break_value.* == .if_expr);
+    const loop = body[0].var_def.value.while_expr;
+    try testing.expect(loop.else_branch != null);
+    try testing.expect(loop.body.block[0].break_stmt.value.?.* == .if_expr);
+    const match_expr = body[1].var_def.value.match_expr;
+    try testing.expectEqual(@as(usize, 3), match_expr.arms.len);
+    try testing.expect(match_expr.arms[0].body.* == .expression);
+    try testing.expect(match_expr.arms[1].capture != null);
+    try testing.expect(match_expr.arms[2].pattern == null);
 }
 
 test "casts chain and pointer assignments parse" {
@@ -1363,19 +1481,23 @@ test "casts chain and pointer assignments parse" {
     try testing.expect(body[3].assign.target.* == .index);
 }
 
-test "redundant semicolons parse as empty statements" {
+test "a semicolon that terminates nothing is an error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const source =
-        \\fn f() {
-        \\    ;;
-        \\    var x = 1;;
-        \\    return x;
-        \\};
-    ;
-    const module = try parseForTest(&arena, source);
-    const body = module.definitions[0].kind.fn_def.function.body.block;
-    try testing.expectEqual(@as(usize, 2), body.len);
+    const sources = [_][]const u8{
+        "fn f() { var x = 1;; return x; }",
+        "fn f() { if (c) { } ; }",
+        "fn f() { return 1; };",
+    };
+    for (sources) |source| {
+        var tokenizer = tokenizer_module.Tokenizer.init(source);
+        var tokens: std.ArrayList(Token) = .empty;
+        defer tokens.deinit(arena.allocator());
+        try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+        var parser = Parser.init(arena.allocator(), source, tokens.items);
+        try testing.expectError(error.ParseError, parser.parseModule());
+        try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "terminates nothing") != null);
+    }
 }
 
 test "missing semicolon fails with a clear message" {
@@ -1394,9 +1516,9 @@ test "declaration-only macros parse without a body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source =
-        \\pub macro type_of(value);
-        \\macro pair(left, right);
-        \\macro doubled(x: i64) { return x; }
+        \\pub macro type_of(value) -> #Type;
+        \\macro pair(left, right) -> i64;
+        \\macro doubled(x: i64) -> i64 { return x; }
     ;
     const module = try parseForTest(&arena, source);
     try testing.expectEqual(@as(usize, 3), module.definitions.len);
@@ -1407,10 +1529,22 @@ test "declaration-only macros parse without a body" {
     try testing.expect(module.definitions[2].kind.macro_def.parameters[0].parameter_type != null);
 }
 
+test "a macro declares its result type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = "macro answer() { return 42; }";
+    var tokenizer = tokenizer_module.Tokenizer.init(source);
+    var tokens: std.ArrayList(Token) = .empty;
+    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+    var parser = Parser.init(arena.allocator(), source, tokens.items);
+    try testing.expectError(error.ParseError, parser.parseModule());
+    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "declares its result type") != null);
+}
+
 test "a macro body requires typed parameters" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const source = "macro bad(x) { return x; }";
+    const source = "macro bad(x) -> i64 { return x; }";
     var tokenizer = tokenizer_module.Tokenizer.init(source);
     var tokens: std.ArrayList(Token) = .empty;
     try tokenizer.tokenizeAll(arena.allocator(), &tokens);
@@ -1431,16 +1565,16 @@ test "an empty capture list fails with the omitted form" {
     try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "drop the '||'") != null);
 }
 
-test "a modifier before a capture name fails with the annotated form" {
+test "an annotated capture fails with the prefix form" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const source = "fn f() { const doubler = |&var x| (a: i64) -> i64 { return a; }; }";
+    const source = "fn f() { const doubler = |x: &var| (a: i64) -> i64 { return a; }; }";
     var tokenizer = tokenizer_module.Tokenizer.init(source);
     var tokens: std.ArrayList(Token) = .empty;
     try tokenizer.tokenizeAll(arena.allocator(), &tokens);
     var parser = Parser.init(arena.allocator(), source, tokens.items);
     try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "'|x: &var|'") != null);
+    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "'|&x|'") != null);
 }
 
 test "extern, interface, and macro definitions" {
@@ -1451,10 +1585,10 @@ test "extern, interface, and macro definitions" {
         \\extern exit(code: i32);
         \\extern getpid() -> i32;
         \\interface Shape {
-        \\    fn area() -> f32;
-        \\    fn scale(factor: f32)
+        \\    fn area(self: &) -> f32;
+        \\    fn scale(self: &var, factor: f32);
         \\}
-        \\macro readTypeFromJson(path: &[u8]) {
+        \\macro readTypeFromJson(path: &[u8]) -> #Type {
         \\    return path;
         \\}
     ;
@@ -1500,15 +1634,15 @@ test "for with multiple subjects and captures" {
     defer arena.deinit();
     const source =
         \\fn f() {
-        \\    for (first, second) |a, b: &var| {
+        \\    var r = for (first, second) |a, &var b| {
         \\        consume(a, b);
         \\    } else {
-        \\        break 0;
-        \\    }
+        \\        yield 0;
+        \\    };
         \\}
     ;
     const module = try parseForTest(&arena, source);
-    const for_expr = module.definitions[0].kind.fn_def.function.body.block[0].expression.for_expr;
+    const for_expr = module.definitions[0].kind.fn_def.function.body.block[0].var_def.value.for_expr;
     try testing.expectEqual(@as(usize, 2), for_expr.subjects.len);
     try testing.expectEqual(@as(usize, 2), for_expr.captures.len);
     try testing.expect(for_expr.captures[0].modifier == null);

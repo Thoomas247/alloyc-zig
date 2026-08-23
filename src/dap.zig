@@ -296,7 +296,7 @@ pub const Server = struct {
         }
 
         // the working directory first, then the program's directory, then
-        // - for std/ imports - the configured search bases (section 5.4)
+        // - for std/ imports - the configured search bases (section 6.4)
         fn loadModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
             const loader: *DiskLoader = @ptrCast(@alignCast(context.?));
             if (Io.Dir.cwd().readFileAlloc(loader.io, file_path, allocator, .limited(10 * 1024 * 1024))) |source| {
@@ -684,7 +684,7 @@ fn isCompound(value: Interpreter.Value) bool {
 const EvalError = error{Unsupported};
 
 // follows references and live pointers so member access and arithmetic
-// see the pointee, mirroring pointee transparency (section 4.2)
+// see the pointee, mirroring pointee transparency (section 5.2)
 fn pierceValue(value: Interpreter.Value) EvalError!Interpreter.Value {
     return switch (value) {
         .reference => |target| pierceValue(target.*),

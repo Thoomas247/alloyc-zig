@@ -17,7 +17,7 @@ const Token = tokenizer_module.Token;
 const ast = @import("ast.zig");
 const formatter = @import("formatter.zig");
 
-// the '#Type' reflection methods (section 3.4), offered after '.' on a
+// the '#Type' reflection methods (section 4.4), offered after '.' on a
 // value the tooling pass typed as a '#Type'
 const type_description_completions = [_]struct { name: []const u8, detail: []const u8 }{
     .{ .name = "name", .detail = "() -> &[u8]" },
@@ -33,15 +33,15 @@ const type_description_completions = [_]struct { name: []const u8, detail: []con
     .{ .name = "member_types", .detail = "() -> &[#Type]" },
 };
 
-// the declaration-only macros of std::macros (section 6.4), offered after
+// the declaration-only macros of std::macros (section 7.4), offered after
 // '#' even when the import is not written yet
 const builtin_macro_completions = [_]struct { name: []const u8, detail: []const u8 }{
-    .{ .name = "type_of", .detail = "macro type_of(value) - std::macros" },
-    .{ .name = "struct_type", .detail = "macro struct_type() - std::macros" },
-    .{ .name = "enum_type", .detail = "macro enum_type() - std::macros" },
-    .{ .name = "implementers_of", .detail = "macro implementers_of(target) - std::macros" },
-    .{ .name = "name_of", .detail = "macro name_of(value) - std::macros" },
-    .{ .name = "read_file", .detail = "macro read_file(path) - std::macros" },
+    .{ .name = "type_of", .detail = "macro type_of(value) -> #Type - std::macros" },
+    .{ .name = "struct_type", .detail = "macro struct_type() -> #Type - std::macros" },
+    .{ .name = "enum_type", .detail = "macro enum_type() -> #Type - std::macros" },
+    .{ .name = "implementers_of", .detail = "macro implementers_of(target) -> &[#Type] - std::macros" },
+    .{ .name = "name_of", .detail = "macro name_of(value) -> &[u8] - std::macros" },
+    .{ .name = "read_file", .detail = "macro read_file(path) -> &[u8] - std::macros" },
 };
 
 const keyword_completions = [_][]const u8{
@@ -427,7 +427,7 @@ pub const Server = struct {
     // imports resolve next to the entry document; open editor buffers
     // shadow the file system. std/ imports additionally search the
     // document's ancestor directories (finding a project's std/ from any
-    // subfolder), then the configured search bases (section 5.4)
+    // subfolder), then the configured search bases (section 6.4)
     fn loadModuleSource(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
         const loader: *LoaderContext = @ptrCast(@alignCast(context.?));
         if (try loader.readFromBase(allocator, loader.base_directory, file_path)) |source| return source;
@@ -737,7 +737,7 @@ pub const Server = struct {
         const receiver = wordAt(location.text, dot_offset -| 1) orelse return;
         const view = unit.views[view_index];
 
-        // '#TypeName.' reflects the type (section 3.4): the receiver needs
+        // '#TypeName.' reflects the type (section 4.4): the receiver needs
         // no prior typed use, the name and the leading '#' are enough
         var word_start = dot_offset;
         while (word_start > 0 and isIdentifierByte(location.text[word_start - 1])) word_start -= 1;
@@ -777,7 +777,7 @@ pub const Server = struct {
         const pierced = checker.pierce(recorded) catch return;
         const resolved = checker.resolveAlias(pierced) catch return;
 
-        // a '#Type' value exposes the reflection methods (section 3.4)
+        // a '#Type' value exposes the reflection methods (section 4.4)
         if (resolved.* == .type_description) {
             for (type_description_completions) |method| {
                 try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
@@ -1563,6 +1563,7 @@ fn collectFromExpression(arena: std.mem.Allocator, expression: *const ast.Expres
         },
         .struct_init => |struct_init| for (struct_init.members) |member| try collectFromExpression(arena, member.value, into),
         .array_literal => |elements| for (elements) |element| try collectFromExpression(arena, element, into),
+        .type_literal => {},
         .array_fill => |fill| {
             try collectFromExpression(arena, fill.value, into);
             try collectFromExpression(arena, fill.count, into);
@@ -1685,7 +1686,7 @@ fn harvestIdentifiers(arena: std.mem.Allocator, items: *std.ArrayList(Server.Com
     }
 }
 
-// an extension function is invoked through '.' only (section 4.5)
+// an extension function is invoked through '.' only (section 5.5)
 fn dotOnlyFunction(definition: *const ast.Definition) bool {
     if (definition.kind != .fn_def) return false;
     const fn_def = definition.kind.fn_def;
@@ -1694,7 +1695,7 @@ fn dotOnlyFunction(definition: *const ast.Definition) bool {
     return parameters.len != 0 and parameters[0].is_self;
 }
 
-// an associated function is invoked through 'Type::' only (section 5.4)
+// an associated function is invoked through 'Type::' only (section 6.4)
 fn qualifiedOnlyFunction(definition: *const ast.Definition) bool {
     return definition.kind == .fn_def and definition.kind.fn_def.qualifier != null;
 }
@@ -2327,7 +2328,7 @@ test "semantic tokens color by resolution, not by name" {
     const uri = "file:///c%3A/probe/resolution_colors.alloy";
     // the struct member shares the macro's name: it must stay uncolored
     const source =
-        "macro build(x: i64) { return x; }\n" ++
+        "macro build(x: i64) -> i64 { return x; }\n" ++
         "type Pair = struct { build: i64 };\n" ++
         "fn main() -> i32 { return 0; }\n";
 
@@ -2361,7 +2362,7 @@ test "semantic tokens color by resolution, not by name" {
     // 'Pair' type name (1), 'main' function name (0) - and NO token for
     // the 'build' struct member, which only shares the macro's name
     const transcript = output.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,6,5,3,0,0,6,1,5,0,0,17,1,5,0,1,5,4,1,0,1,3,4,0,0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"data\":[0,6,5,3,0,0,6,1,5,0,0,24,1,5,0,1,5,4,1,0,1,3,4,0,0]") != null);
 }
 
 test "the outline survives an edit that fails to parse" {

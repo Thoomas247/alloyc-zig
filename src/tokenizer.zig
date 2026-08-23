@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// Decodes the escape sequences (section 1.6) of a string or character
+/// Decodes the escape sequences (section 2.6) of a string or character
 /// literal body (the text between the quotes) into raw bytes. Shared by the
 /// interpreter and code generation so both decode literals identically.
 pub fn unescape(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]const u8 {
@@ -415,7 +415,7 @@ pub const Tokenizer = struct {
 
     const TriviaError = error{UnterminatedBlockComment};
 
-    /// Skips whitespace and comments (section 1.2), returning the comment
+    /// Skips whitespace and comments (section 2.2), returning the comment
     /// as a token instead when 'emit_comments' is set. On an unterminated
     /// block comment, leaves `index` at the offending `/*` opener and errors.
     fn skipTrivia(self: *Tokenizer) TriviaError!?Token {
@@ -530,7 +530,7 @@ pub const Tokenizer = struct {
     }
 
     /// Scans a quote-delimited literal with backslash escapes. The tokenizer
-    /// validates termination and the escape introducer set (section 1.6);
+    /// validates termination and the escape introducer set (section 2.6);
     /// escape payloads (\xHH digits, \u{...} contents) are checked by a later
     /// phase. A literal is unterminated at the end of input or at a raw
     /// newline. An unrecognized escape reports the escape's own span.
