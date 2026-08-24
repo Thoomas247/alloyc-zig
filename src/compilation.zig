@@ -4093,8 +4093,8 @@ test "heap arrays borrow as slices, subslice, and move on return" {
         \\        copied[index] = value;
         \\        index += 1;
         \\    }
-        \\    // a bare return hands out a deep copy; the local drops
-        \\    return copied;
+        \\    // a heap array leaves explicitly: move transfers it
+        \\    return move copied;
         \\}
         \\fn main() -> i64 {
         \\    const owned = make(4);
@@ -4138,8 +4138,8 @@ test "native executables borrow, subslice, and return heap arrays" {
         \\        copied[index] = value;
         \\        index += 1;
         \\    }
-        \\    // a bare return hands out a deep copy; the local drops
-        \\    return copied;
+        \\    // a heap array leaves explicitly: move transfers it
+        \\    return move copied;
         \\}
         \\fn main() -> i32 {
         \\    const owned = make(4);
@@ -4571,4 +4571,87 @@ test "a return unwinding through a loop leaves the caller's frames intact" {
         \\    return s.count to i32;
         \\}
     , 22, "");
+}
+
+test "borrowing captures reach through owning payloads to the pointee" {
+    // '|&x|' on a '*T' payload binds '&T', on a '*[T]' payload the slice
+    // '&[T]' - never a reference to the pointer itself (section 3.1)
+    try expectBuildsAndRuns("capture_pointee",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\type Holder = enum { Data: *[u8], Boxed: *i64, Empty };
+        \\fn view_len(text: &[u8]) -> u64 {
+        \\    return text.length();
+        \\}
+        \\fn main() -> i32 {
+        \\    var h: Holder = Holder::Data(new [65 : 5]);
+        \\    var total: i64 = 0;
+        \\    if (h is ::Data |&bytes|) {
+        \\        total += view_len(&bytes) to i64;
+        \\        total += bytes.length() to i64;
+        \\    }
+        \\    match (h) {
+        \\        ::Data |&bytes| { total += bytes[0] to i64; }
+        \\        else { total += 1000; }
+        \\    }
+        \\    var b: Holder = Holder::Boxed(new 7);
+        \\    if (b is ::Boxed |&inner|) {
+        \\        total += inner;
+        \\    }
+        \\    printf("total %d\n", total to i32);
+        \\    return total to i32;
+        \\}
+    , 82, "total 82\n");
+    // the bare use of such a capture means the unsized array value
+    try expectCheckErrors(
+        \\type Holder = enum { Data: *[u8], Empty };
+        \\fn f(h: &Holder) -> &[u8] {
+        \\    return match (h) {
+        \\        ::Data |&bytes| bytes;
+        \\        else { yield ""; }
+        \\    };
+        \\}
+    , &.{"a '&[T]' variable used here means the array value, which is unsized"});
+}
+
+test "'new' on a slice copies the elements into an owned heap array" {
+    // a string literal never allocates; 'new "text"' is the owned copy of
+    // its BYTES, type *[u8], never a boxed view (sections 2.6, 5.2)
+    try expectBuildsAndRuns("new_slice_copy",
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\fn main() -> i32 {
+        \\    const a: *[u8] = new "hello";
+        \\    const src = "abcd";
+        \\    const c: *[u8] = new src;
+        \\    var d: *var [u8] = new "abc";
+        \\    d[0] = 'B';
+        \\    printf("%d %d %c\n", a.length() to i32, c.length() to i32, d[0] to i32);
+        \\    return (a.length() + c.length() + d.length()) to i32;
+        \\}
+    , 12, "5 4 B\n");
+}
+
+test "a bare '*[T]' place read is the unsized array value" {
+    try expectCheckErrors(
+        \\type Holder = enum { Data: *[u8], Empty };
+        \\fn f(h: &var Holder) -> *[u8] {
+        \\    return match (h) {
+        \\        ::Data |move src| src;
+        \\        else { yield new "x"; }
+        \\    };
+        \\}
+    , &.{"a '*[T]' variable used here means the array value, which is unsized: 'move' transfers the allocation, '&' passes the view, 'new' copies it"});
+    try expectBuildsAndRuns("heap_array_move_yield",
+        \\type Holder = enum { Data: *[u8], Empty };
+        \\fn take(h: &var Holder) -> *[u8] {
+        \\    return match (h) {
+        \\        ::Data |move src| move src;
+        \\        else { yield new "x"; }
+        \\    };
+        \\}
+        \\fn main() -> i32 {
+        \\    var h: Holder = Holder::Data(new [66 : 4]);
+        \\    const owned = take(&h);
+        \\    return (owned.length() + owned[0] to u64) to i32;
+        \\}
+    , 70, "");
 }

@@ -2177,6 +2177,13 @@ pub const Checker = struct {
                 if (operand.* == .fixed_array) {
                     return self.makeType(.{ .heap_array = .{ .mutable = true, .child = operand.fixed_array.element } });
                 }
+                // a slice operand - a string literal included - copies the
+                // ELEMENTS into an owned '*[T]', never boxing the view
+                // (sections 2.6, 5.2)
+                const operand_resolved = try self.resolveAlias(operand);
+                if (operand_resolved.* == .slice) {
+                    return self.makeType(.{ .heap_array = .{ .mutable = true, .child = operand_resolved.slice.child } });
+                }
                 // the contextual pointee type fixes an untyped operand
                 if (expected_child) |context| {
                     if (context.* != .heap_array and try self.coerce(operand, context)) {
@@ -2941,16 +2948,22 @@ pub const Checker = struct {
         const name = capture.name.slice(self.source());
         if (capture.modifier) |modifier| {
             switch (modifier) {
-                .reference => {
-                    const bound = try self.makeType(.{ .reference = .{ .mutable = false, .child = try self.defaulted(subject_value) } });
-                    return .{ .name = name, .binding_type = bound, .mutable = false };
-                },
-                .reference_var => {
-                    if (!subject_mutable) {
+                .reference, .reference_var => {
+                    const mutable = modifier == .reference_var;
+                    if (mutable and !subject_mutable) {
                         try self.report(capture.name.location, "a '&var' capture requires a mutable subject (section 3.1)", .{});
                     }
-                    const bound = try self.makeType(.{ .reference = .{ .mutable = true, .child = try self.defaulted(subject_value) } });
-                    return .{ .name = name, .binding_type = bound, .mutable = true };
+                    // pointee transparency (section 5.2): the borrow reaches
+                    // the pointee - a '*T' payload gives '&T', a '*[T]'
+                    // payload gives the slice '&[T]', never a reference to
+                    // the pointer itself (section 3.1)
+                    const resolved = try self.resolveAlias(try self.defaulted(subject_value));
+                    const bound: *const Type = switch (resolved.*) {
+                        .heap_array => |heap| try self.makeType(.{ .slice = .{ .mutable = mutable, .child = heap.child } }),
+                        .pointer => |indirection| try self.makeType(.{ .reference = .{ .mutable = mutable, .child = indirection.child } }),
+                        else => try self.makeType(.{ .reference = .{ .mutable = mutable, .child = try self.defaulted(subject_value) } }),
+                    };
+                    return .{ .name = name, .binding_type = bound, .mutable = mutable };
                 },
                 .pointer, .pointer_var => {
                     // owning capture: only pointers are movable (section 3.1)
@@ -3086,8 +3099,9 @@ pub const Checker = struct {
             return;
         };
         const place = try self.lvalueOf(cast.operand);
-        // a temporary subject is a fresh value: consumable (section 5.5)
-        const subject_mutable = if (place) |info| info.mutable else true;
+        // a temporary subject is a fresh value: consumable (section 5.5);
+        // a place takes the pierced mutability (section 4.8)
+        const subject_mutable = if (place) |info| piercedMutability(info) else true;
         const binding = try self.captureBinding(capture, payload_type, subject_mutable, try self.pierce(payload_type));
         try self.bindComputed(capture.name, binding);
     }
@@ -3436,8 +3450,10 @@ pub const Checker = struct {
         const subject_interface = try self.interfaceObject(subject_type);
         const subject_place = try self.lvalueOf(match_expr.subject);
         // a temporary subject (a call result) is a fresh value nobody else
-        // owns, so an owning capture may consume it (section 5.5)
-        const subject_mutable = if (subject_place) |place| place.mutable else true;
+        // owns, so an owning capture may consume it (section 5.5); a place
+        // takes the PIERCED mutability - one reached through '&var' is
+        // mutable whatever the binding is (section 4.8)
+        const subject_mutable = if (subject_place) |place| piercedMutability(place) else true;
         const subject_raw = if (subject_place) |place| place.raw else subject_type;
 
         if (as_value) try self.yield_frames.append(self.arena, .{ .yielded = null, .kind = .value_construct });
@@ -5383,7 +5399,7 @@ pub const Checker = struct {
         if (self.tooling_only) return checked;
         const unwrapped = unwrapGrouped(expression);
         const resolved = try self.resolveAlias(checked);
-        if (resolved.* != .slice and resolved.* != .reference) return checked;
+        if (resolved.* != .slice and resolved.* != .reference and resolved.* != .heap_array) return checked;
         if (unwrapped.* == .call) {
             switch (resolved.*) {
                 .slice => {
@@ -5391,6 +5407,9 @@ pub const Checker = struct {
                     return checked;
                 },
                 .reference => return self.pierceConsumed(unwrapped, checked, resolved),
+                // a call's '*[T]' result is a fresh allocation nobody else
+                // owns: it passes bare (section 5.5)
+                .heap_array => return checked,
                 else => unreachable,
             }
         }
@@ -5413,6 +5432,12 @@ pub const Checker = struct {
                     return checked;
                 }
                 return self.pierceConsumed(unwrapped, checked, resolved);
+            },
+            // using a '*[T]' variable means the pointee, an unsized array
+            // (section 5.2): the pointer moves or the view passes
+            .heap_array => {
+                try self.report(self.expressionSpan(expression), "a '*[T]' variable used here means the array value, which is unsized: 'move' transfers the allocation, '&' passes the view, 'new' copies it (section 5.2)", .{});
+                return checked;
             },
             else => unreachable,
         }

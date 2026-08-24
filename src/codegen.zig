@@ -1606,6 +1606,26 @@ pub const Codegen = struct {
                 // and its bits transfer into the allocation
                 const value = try self.evalExpression(operand);
                 const value_type = try self.resolvedOf(try self.typeOf(operand));
+                // a slice operand - a string literal included - copies its
+                // elements into the fresh allocation (sections 2.6, 5.2)
+                if (value_type.* == .slice) {
+                    const pair = try self.ensureMemory(value, value_type, span);
+                    const source_data = try self.loadPointerField(pair.pointer, 0);
+                    const length_slot = try self.byteOffset(pair.pointer, 8);
+                    const source_length = try self.freshTemp();
+                    try self.instruction("{s} = load i64, ptr {s}", .{ source_length, length_slot });
+                    const data = try self.allocateHeapArray(source_length, element_layout.size);
+                    if (try self.ownsHeap(element_type, 0)) {
+                        const helper = try self.copyHelper(element_type, span);
+                        try self.emitHelperElementLoop(data, source_length, element_layout.size, helper, source_data);
+                    } else {
+                        const byte_size = try self.freshTemp();
+                        try self.instruction("{s} = mul i64 {s}, {d}", .{ byte_size, source_length, element_layout.size });
+                        try self.declareIntrinsic("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)");
+                        try self.instruction("call void @llvm.memcpy.p0.p0.i64(ptr {s}, ptr {s}, i64 {s}, i1 false)", .{ data, source_data, byte_size });
+                    }
+                    return .{ .scalar = .{ .text = data, .llvm = "ptr" } };
+                }
                 if (value_type.* != .fixed_array) {
                     return self.report(span, "'new' on this operand is not yet supported by native code generation", .{});
                 }
@@ -3024,6 +3044,32 @@ pub const Codegen = struct {
         return pointer_type;
     }
 
+    // binds a borrowing capture over a payload place: pointee transparency
+    // reaches through an owning payload, so a '*T' payload binds '&T' (the
+    // loaded pointer) and a '*[T]' payload binds the slice fat pair; other
+    // payloads borrow in place (section 3.1)
+    fn bindBorrowedCapture(self: *Codegen, name: []const u8, payload_pointer: []const u8, payload_type: *const Type) Error!void {
+        const resolved = try self.resolvedOf(payload_type);
+        switch (resolved.*) {
+            .heap_array => |heap| {
+                const view = try self.heapArrayView(payload_pointer);
+                const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+                try self.instruction("store ptr {s}, ptr {s}", .{ view.data, pair });
+                const length_slot = try self.byteOffset(pair, 8);
+                try self.instruction("store i64 {s}, ptr {s}", .{ view.length, length_slot });
+                const slice_type = try self.arena.create(Type);
+                slice_type.* = .{ .slice = .{ .mutable = heap.mutable, .child = heap.child } };
+                try self.bindLocal(name, pair, slice_type);
+            },
+            .pointer => |indirection| {
+                const loaded = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr {s}", .{ loaded, payload_pointer });
+                try self.bindBorrowed(name, loaded, indirection.child);
+            },
+            else => try self.bindBorrowed(name, payload_pointer, payload_type),
+        }
+    }
+
     fn bindBorrowed(self: *Codegen, name: []const u8, pointer_value: []const u8, child_type: *const Type) Error!void {
         const slot = try self.scalarSlot("ptr");
         try self.storeScalar(slot, .{ .text = pointer_value, .llvm = "ptr" });
@@ -3039,15 +3085,39 @@ pub const Codegen = struct {
     fn emitInlineCaptureBind(self: *Codegen, capture: ast.Capture, matches: []const u8, payload_pointer: []const u8, payload_type: *const Type, borrowed: bool, span: Token.Location) Error!void {
         const name = capture.name.slice(self.source());
         const mode = captureMode(capture);
-        // borrows hold a pointer and own nothing
+        // borrows hold a pointer and own nothing; pointee transparency
+        // reaches through an owning payload ('*T' binds '&T', '*[T]' the
+        // slice), with the loads emitted only on the matched path
         if (borrowed or mode == .reference) {
+            const resolved = try self.resolvedOf(payload_type);
+            if (!borrowed and resolved.* == .heap_array) {
+                const pair = try self.aggregateSlot(.{ .size = 16, .alignment = 8 });
+                try self.zeroAggregateSlotInEntry(pair, 16);
+                try self.emitCaptureDiamond(matches, pair, null);
+                try self.startCaptureBind();
+                const view = try self.heapArrayView(payload_pointer);
+                try self.instruction("store ptr {s}, ptr {s}", .{ view.data, pair });
+                const length_slot = try self.byteOffset(pair, 8);
+                try self.instruction("store i64 {s}, ptr {s}", .{ view.length, length_slot });
+                try self.finishCaptureBind();
+                const slice_type = try self.arena.create(Type);
+                slice_type.* = .{ .slice = .{ .mutable = resolved.heap_array.mutable, .child = resolved.heap_array.child } };
+                try self.bindLocal(name, pair, slice_type);
+                return;
+            }
             const slot = try self.scalarSlot("ptr");
             try self.emitCaptureDiamond(matches, slot, null);
             try self.startCaptureBind();
-            try self.storeScalar(slot, .{ .text = payload_pointer, .llvm = "ptr" });
+            if (!borrowed and resolved.* == .pointer) {
+                const loaded = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr {s}", .{ loaded, payload_pointer });
+                try self.storeScalar(slot, .{ .text = loaded, .llvm = "ptr" });
+            } else {
+                try self.storeScalar(slot, .{ .text = payload_pointer, .llvm = "ptr" });
+            }
             try self.finishCaptureBind();
             const reference_type = try self.arena.create(Type);
-            reference_type.* = .{ .reference = .{ .mutable = false, .child = payload_type } };
+            reference_type.* = .{ .reference = .{ .mutable = false, .child = if (!borrowed and resolved.* == .pointer) resolved.pointer.child else payload_type } };
             try self.bindLocal(name, slot, reference_type);
             return;
         }
@@ -3816,7 +3886,7 @@ pub const Codegen = struct {
                 }
                 try self.bindLocal(name, slot, payload_type);
             },
-            .reference => try self.bindBorrowed(name, payload_pointer, payload_type),
+            .reference => try self.bindBorrowedCapture(name, payload_pointer, payload_type),
             .owning => {
                 // an owning capture takes the owning payload out, leaving
                 // the source moved-from (section 3.1); an interface fat

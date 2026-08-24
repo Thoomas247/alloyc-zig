@@ -958,6 +958,16 @@ pub const Interpreter = struct {
             },
             else => {
                 const value = try self.evalExpression(operand);
+                // a slice value - a string literal included - copies its
+                // ELEMENTS into an owned '*[T]' (sections 2.6, 5.2); the
+                // deep copy keeps owning elements unique
+                if (value == .slice) {
+                    const copied = try self.deepCopy(.{ .array = value.slice });
+                    return .{ .heap_array = copied.array };
+                }
+                if (value == .array) {
+                    return .{ .heap_array = value.array };
+                }
                 const cell = try self.arena.create(Value);
                 cell.* = value;
                 return .{ .pointer = cell };
