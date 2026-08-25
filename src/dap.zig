@@ -665,6 +665,7 @@ pub const Server = struct {
             .assign => |assign| checker.expressionSpan(assign.target).start,
             .expression => |expression| checker.expressionSpan(expression).start,
             .break_stmt => |break_stmt| break_stmt.keyword.location.start,
+            .continue_stmt => |continue_stmt| continue_stmt.keyword.location.start,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location.start,
             .return_stmt => |return_stmt| return_stmt.keyword.location.start,
         };

@@ -117,7 +117,7 @@ pub const Interpreter = struct {
 
     // 'Return' unwinds a 'return' written inside a value-yielding construct
     // up to the enclosing function call, carrying 'pending_return'
-    pub const Error = error{ OutOfMemory, RuntimeFault, WriteFailed, Return, Break, Yield };
+    pub const Error = error{ OutOfMemory, RuntimeFault, WriteFailed, Return, Break, Continue, Yield };
 
     pub const Value = union(enum) {
         void_value,
@@ -237,6 +237,7 @@ pub const Interpreter = struct {
     const Flow = union(enum) {
         normal,
         break_value: ?Value,
+        continue_flow,
         yield_value: Value,
         return_value: Value,
     };
@@ -519,6 +520,7 @@ pub const Interpreter = struct {
                 const value: ?Value = if (break_stmt.value) |expression| try self.evalExpression(expression) else null;
                 return .{ .break_value = value };
             },
+            .continue_stmt => return .continue_flow,
             .yield_stmt => |yield_stmt| {
                 return .{ .yield_value = try self.evalExpression(yield_stmt.value) };
             },
@@ -2219,6 +2221,7 @@ pub const Interpreter = struct {
             switch (flow) {
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .break_value => return self.flowBreak(flow),
+                .continue_flow => return error.Continue,
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
             }
@@ -2229,6 +2232,7 @@ pub const Interpreter = struct {
                 switch (flow) {
                     .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                     .break_value => return self.flowBreak(flow),
+                    .continue_flow => return error.Continue,
                     .return_value => return self.flowReturn(flow),
                     .normal => {},
                 }
@@ -2261,6 +2265,7 @@ pub const Interpreter = struct {
     fn execLoopBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
         return self.execStatement(statement) catch |err| switch (err) {
             error.Break => .{ .break_value = self.pending_break },
+            error.Continue => .continue_flow,
             else => err,
         };
     }
@@ -2401,6 +2406,7 @@ pub const Interpreter = struct {
             self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
+                .continue_flow => {},
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
@@ -2419,6 +2425,7 @@ pub const Interpreter = struct {
         switch (flow) {
             .yield_value => |value| return value,
             .break_value => return self.flowBreak(flow),
+            .continue_flow => return error.Continue,
             .return_value => return self.flowReturn(flow),
             .normal => return .void_value,
         }
@@ -2428,6 +2435,7 @@ pub const Interpreter = struct {
     fn execValueLoopBody(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
         return self.execStatement(statement) catch |err| switch (err) {
             error.Break => .{ .break_value = self.pending_break },
+            error.Continue => .continue_flow,
             error.Yield => .{ .yield_value = self.pending_yield },
             else => err,
         };
@@ -2540,6 +2548,7 @@ pub const Interpreter = struct {
             self.popFrame();
             switch (flow) {
                 .break_value => |value| return value orelse .void_value,
+                .continue_flow => {},
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .return_value => return self.flowReturn(flow),
                 .normal => {},
@@ -2617,6 +2626,7 @@ pub const Interpreter = struct {
             switch (flow) {
                 .yield_value => |value| return if (as_value) value else self.flowYield(flow),
                 .break_value => return self.flowBreak(flow),
+                .continue_flow => return error.Continue,
                 .return_value => return self.flowReturn(flow),
                 // the arm completed without 'yield': the external else runs
                 .normal => {
@@ -2625,6 +2635,7 @@ pub const Interpreter = struct {
                         switch (else_flow) {
                             .yield_value => |value| return if (as_value) value else self.flowYield(else_flow),
                             .break_value => return self.flowBreak(else_flow),
+                            .continue_flow => return error.Continue,
                             .return_value => return self.flowReturn(else_flow),
                             .normal => {},
                         }

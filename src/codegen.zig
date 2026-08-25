@@ -120,6 +120,8 @@ pub const Codegen = struct {
     // (section 5.3)
     break_targets: std.ArrayList(BreakTarget),
     yield_targets: std.ArrayList(BreakTarget),
+    // 'continue' targets the innermost loop's latch (section 5.3)
+    continue_targets: std.ArrayList(ContinueTarget),
     return_type: *const Type,
     return_slot: ?[]const u8,
     // the active instance's resolved type parameters (section 4.7); every
@@ -196,6 +198,15 @@ pub const Codegen = struct {
         slot: ?Slot,
         // scope depth at construct entry: 'break' drops every owning local
         // in frames deeper than this before branching out (section 5.2)
+        frame_depth: usize,
+    };
+
+    const ContinueTarget = struct {
+        // the block that advances the loop: the latch of a 'for', the
+        // header of a 'while'
+        latch_label: []const u8,
+        // scope depth at iteration entry: 'continue' drops every owning
+        // local in frames deeper than this before re-entering (section 5.2)
         frame_depth: usize,
     };
 
@@ -286,6 +297,7 @@ pub const Codegen = struct {
             .scopes = .empty,
             .break_targets = .empty,
             .yield_targets = .empty,
+            .continue_targets = .empty,
             .return_type = &void_type,
             .return_slot = null,
             .current_bindings = null,
@@ -635,6 +647,7 @@ pub const Codegen = struct {
         self.scopes = .empty;
         self.break_targets = .empty;
         self.yield_targets = .empty;
+        self.continue_targets = .empty;
         self.return_type = info.return_type;
         self.return_slot = null;
         self.current_bindings = info.bindings_environment;
@@ -724,6 +737,15 @@ pub const Codegen = struct {
                 }
                 try self.emitDropsDownTo(target.frame_depth, null);
                 try self.instruction("br label %{s}", .{target.exit_label});
+                self.terminated = true;
+            },
+            .continue_stmt => |continue_stmt| {
+                const target = if (self.continue_targets.items.len != 0)
+                    self.continue_targets.items[self.continue_targets.items.len - 1]
+                else
+                    return self.report(continue_stmt.keyword.location, "'continue' outside a loop", .{});
+                try self.emitDropsDownTo(target.frame_depth, null);
+                try self.instruction("br label %{s}", .{target.latch_label});
                 self.terminated = true;
             },
             .yield_stmt => |yield_stmt| try self.emitYield(yield_stmt.value, yield_stmt.keyword.location),
@@ -2555,11 +2577,13 @@ pub const Codegen = struct {
         const saved_scopes = self.scopes;
         const saved_break_targets = self.break_targets;
         const saved_yield_targets = self.yield_targets;
+        const saved_continue_targets = self.continue_targets;
         const saved_return_type = self.return_type;
         const saved_return_slot = self.return_slot;
         self.scopes = .empty;
         self.break_targets = .empty;
         self.yield_targets = .empty;
+        self.continue_targets = .empty;
         self.return_type = return_type;
         self.return_slot = null;
 
@@ -2589,6 +2613,7 @@ pub const Codegen = struct {
         self.scopes = saved_scopes;
         self.break_targets = saved_break_targets;
         self.yield_targets = saved_yield_targets;
+        self.continue_targets = saved_continue_targets;
         self.return_type = saved_return_type;
         self.return_slot = saved_return_slot;
     }
@@ -3237,6 +3262,9 @@ pub const Codegen = struct {
         // condition captures re-bind each iteration: their bind sites drop
         // and re-zero the slots, and the frame closes on the exit path
         try self.pushFrame();
+        // 'continue' re-enters the header; the condition frame stays live
+        // exactly as on the normal back edge, so the depth records inside it
+        try self.continue_targets.append(self.arena, .{ .latch_label = header, .frame_depth = self.scopes.items.len });
         const condition = try self.evalExpression(while_expr.condition);
         try self.instruction("br i1 {s}, label %{s}, label %{s}", .{ condition.scalar.text, body, after });
         self.terminated = true;
@@ -3250,9 +3278,10 @@ pub const Codegen = struct {
         }
         try self.startBlock(after);
         try self.closeFrame();
-        // a 'break' inside the else belongs to an outer loop; a 'yield'
-        // there produces this loop's value (section 5.3)
+        // a 'break' or 'continue' inside the else belongs to an outer loop;
+        // a 'yield' there produces this loop's value (section 5.3)
         _ = self.break_targets.pop();
+        _ = self.continue_targets.pop();
         if (while_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
@@ -3320,6 +3349,8 @@ pub const Codegen = struct {
         // a value loop also receives 'yield' from its body and its else
         // (section 5.3)
         if (slot != null) try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // 'continue' advances through the latch like the normal back edge
+        try self.continue_targets.append(self.arena, .{ .latch_label = latch, .frame_depth = self.scopes.items.len });
         try self.startBlock(body);
         try self.pushFrame();
         const capture_count = @min(for_expr.captures.len, subjects.items.len);
@@ -3361,6 +3392,7 @@ pub const Codegen = struct {
         self.terminated = true;
         try self.startBlock(after);
         _ = self.break_targets.pop();
+        _ = self.continue_targets.pop();
         if (for_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
@@ -3448,12 +3480,16 @@ pub const Codegen = struct {
 
         const header = try self.freshLabel("cursor.header");
         const body = try self.freshLabel("cursor.body");
+        const latch = try self.freshLabel("cursor.latch");
         const after = try self.freshLabel("cursor.after");
         const exit = try self.freshLabel("cursor.exit");
         try self.break_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
         // a value loop also receives 'yield' from its body and its else
         // (section 5.3)
         if (slot != null) try self.yield_targets.append(self.arena, .{ .exit_label = exit, .slot = slot, .frame_depth = self.scopes.items.len });
+        // 'continue' advances through the latch, which drops the spent
+        // option payload before the next advance
+        try self.continue_targets.append(self.arena, .{ .latch_label = latch, .frame_depth = self.scopes.items.len });
         try self.startBlock(header);
         try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ next_info.name, option_slot, cursor_slot });
         const tag = try self.loadTag(option_slot, frame);
@@ -3472,18 +3508,22 @@ pub const Codegen = struct {
         try self.execStatement(for_expr.body);
         try self.closeFrame();
         if (!self.terminated) {
-            if (option_owns) {
-                // the capture copied the payload out; the option still owns
-                // its original, which drops before the next advance
-                const helper = try self.dropHelper(option_type, span);
-                try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, option_slot });
-                try self.zeroFill(option_slot, frame.layout.size);
-            }
-            try self.instruction("br label %{s}", .{header});
+            try self.instruction("br label %{s}", .{latch});
             self.terminated = true;
         }
+        try self.startBlock(latch);
+        if (option_owns) {
+            // the capture copied the payload out; the option still owns
+            // its original, which drops before the next advance
+            const helper = try self.dropHelper(option_type, span);
+            try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, option_slot });
+            try self.zeroFill(option_slot, frame.layout.size);
+        }
+        try self.instruction("br label %{s}", .{header});
+        self.terminated = true;
         try self.startBlock(after);
         _ = self.break_targets.pop();
+        _ = self.continue_targets.pop();
         if (for_expr.else_branch) |else_branch| {
             try self.pushFrame();
             try self.execStatement(else_branch);
@@ -5380,6 +5420,7 @@ pub const Codegen = struct {
             .assign => |assign| self.checker.expressionSpan(assign.target).start,
             .expression => |expression| self.checker.expressionSpan(expression).start,
             .break_stmt => |break_stmt| break_stmt.keyword.location.start,
+            .continue_stmt => |continue_stmt| continue_stmt.keyword.location.start,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location.start,
             .return_stmt => |return_stmt| return_stmt.keyword.location.start,
         };

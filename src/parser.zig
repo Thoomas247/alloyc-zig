@@ -492,6 +492,11 @@ pub const Parser = struct {
                 try self.expectTerminator();
                 return self.create(ast.Statement, .{ .break_stmt = .{ .keyword = keyword, .value = value } });
             },
+            .keyword_continue => {
+                const keyword = self.advance();
+                try self.expectTerminator();
+                return self.create(ast.Statement, .{ .continue_stmt = .{ .keyword = keyword } });
+            },
             .keyword_yield => {
                 const keyword = self.advance();
                 const value = try self.parseExpression();
@@ -1456,6 +1461,24 @@ test "loops carry an else in value position and match arms may be bare" {
     try testing.expect(match_expr.arms[0].body.* == .expression);
     try testing.expect(match_expr.arms[1].capture != null);
     try testing.expect(match_expr.arms[2].pattern == null);
+}
+
+test "continue parses as a bare statement" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source =
+        \\fn f() {
+        \\    while (running) {
+        \\        if (skip) { continue; }
+        \\        work();
+        \\    }
+        \\}
+    ;
+    const module = try parseForTest(&arena, source);
+    const body = module.definitions[0].kind.fn_def.function.body.block;
+    const loop = body[0].expression.while_expr;
+    const then_branch = loop.body.block[0].expression.if_expr.then_branch;
+    try testing.expect(then_branch.block[0].* == .continue_stmt);
 }
 
 test "casts chain and pointer assignments parse" {

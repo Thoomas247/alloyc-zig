@@ -501,6 +501,7 @@ pub const Resolver = struct {
             .break_stmt => |break_stmt| {
                 if (break_stmt.value) |value| try self.resolveExpression(value);
             },
+            .continue_stmt => {},
             .yield_stmt => |yield_stmt| try self.resolveExpression(yield_stmt.value),
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value| try self.resolveExpression(value);

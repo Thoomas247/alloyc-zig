@@ -180,6 +180,7 @@ pub const Statement = union(enum) {
     var_def: VarDef,
     block: []const *const Statement,
     break_stmt: struct { keyword: Token, value: ?*const Expression },
+    continue_stmt: struct { keyword: Token },
     // 'yield value' produces the value of the innermost value-position
     // 'if' or 'match' (section 5.3)
     yield_stmt: struct { keyword: Token, value: *const Expression },

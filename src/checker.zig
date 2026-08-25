@@ -1642,6 +1642,11 @@ pub const Checker = struct {
                     try self.recordYield(frame, value, break_stmt.keyword.location, "break");
                 }
             },
+            .continue_stmt => |continue_stmt| {
+                if (self.innermostYieldFrame(.loop) == null) {
+                    try self.report(continue_stmt.keyword.location, "'continue' must be inside a loop (section 5.3)", .{});
+                }
+            },
             .yield_stmt => |yield_stmt| {
                 const frame = self.innermostValueFrame() orelse {
                     try self.report(yield_stmt.keyword.location, "'yield' must be inside an if, a match, or a loop with an 'else' used as a value (section 5.3)", .{});
@@ -1662,7 +1667,7 @@ pub const Checker = struct {
     // count as falling through
     fn statementTerminates(statement: *const ast.Statement) bool {
         switch (statement.*) {
-            .return_stmt, .break_stmt, .yield_stmt => return true,
+            .return_stmt, .break_stmt, .continue_stmt, .yield_stmt => return true,
             .block => |statements| {
                 for (statements) |child| {
                     if (statementTerminates(child)) return true;
@@ -1705,6 +1710,8 @@ pub const Checker = struct {
     fn statementBreaksLoop(statement: *const ast.Statement, depth: usize) bool {
         switch (statement.*) {
             .break_stmt => return depth == 0,
+            // 'continue' stays in the loop, so it never breaks one
+            .continue_stmt => return false,
             .yield_stmt => |yield_stmt| return expressionBreaksLoop(yield_stmt.value, depth),
             .return_stmt => |return_stmt| {
                 const value = return_stmt.value orelse return false;
@@ -5518,6 +5525,7 @@ pub const Checker = struct {
             .var_def => |var_def| var_def.name.location,
             .assign => |assign| assign.operator.location,
             .break_stmt => |break_stmt| break_stmt.keyword.location,
+            .continue_stmt => |continue_stmt| continue_stmt.keyword.location,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location,
             .return_stmt => |return_stmt| return_stmt.keyword.location,
             .expression => |expression| self.expressionSpan(expression),

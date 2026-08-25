@@ -46,9 +46,9 @@ const builtin_macro_completions = [_]struct { name: []const u8, detail: []const 
 
 const keyword_completions = [_][]const u8{
     "import", "as",    "extern", "type",  "enum",   "struct",    "const", "var",
-    "fn",     "if",    "else",   "while", "for",    "match",     "break", "yield",
-    "return", "new",   "move",   "self",  "pub",    "exp",       "true",  "false",
-    "interface", "macro", "is",  "to",
+    "fn",     "if",    "else",   "while", "for",    "match",     "break", "continue",
+    "yield",  "return", "new",   "move",  "self",   "pub",       "exp",   "true",
+    "false",  "interface", "macro", "is", "to",
 };
 
 // the semantic token legend registered at initialize; indexes match
@@ -1562,6 +1562,7 @@ fn collectFromStatement(arena: std.mem.Allocator, statement: *const ast.Statemen
         },
         .expression => |expression| try collectFromExpression(arena, expression, into),
         .break_stmt => |break_stmt| if (break_stmt.value) |value| try collectFromExpression(arena, value, into),
+        .continue_stmt => {},
         .yield_stmt => |yield_stmt| try collectFromExpression(arena, yield_stmt.value, into),
         .return_stmt => |return_stmt| if (return_stmt.value) |value| try collectFromExpression(arena, value, into),
     }
