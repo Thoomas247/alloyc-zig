@@ -78,6 +78,12 @@ pub const Server = struct {
     // import-relative view paths to the absolute file the loader found,
     // so navigation targets open the real file; reset per analysis
     resolved_paths: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // documents edited since the last analysis; keys borrow the documents
+    // map's path storage. Analysis is deferred until the input goes quiet
+    // or a request needs it, so a burst of didChange notifications runs
+    // the pipeline once instead of once per keystroke — per-keystroke
+    // publishes made stale transient errors flash in the editor
+    dirty: std.StringHashMapUnmanaged(void) = .empty,
 
     const Document = struct {
         uri: []const u8,
@@ -124,6 +130,7 @@ pub const Server = struct {
             self.gpa.free(entry.value_ptr.*);
         }
         self.resolved_paths.deinit(self.gpa);
+        self.dirty.deinit(self.gpa);
         self.dropAnalysis();
         self.analysis_arena.deinit();
         self.message_arena.deinit();
@@ -140,12 +147,32 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         while (true) {
             _ = self.message_arena.reset(.retain_capacity);
+            // the client has gone quiet: run the deferred analysis now,
+            // before blocking on the next message
+            if (self.dirty.count() != 0 and self.reader.bufferedLen() == 0) {
+                try self.flushDirty();
+            }
             const body = self.readMessage() catch |err| switch (err) {
-                error.EndOfStream => return,
+                error.EndOfStream => {
+                    // a test transcript (or a closing client) ends the
+                    // stream with edits still pending; publish for them
+                    if (self.dirty.count() != 0) try self.flushDirty();
+                    return;
+                },
                 else => return err,
             };
             const proceed = try self.dispatch(body);
             if (!proceed) return;
+        }
+    }
+
+    fn flushDirty(self: *Server) !void {
+        while (true) {
+            var paths = self.dirty.keyIterator();
+            const path = (paths.next() orelse return).*;
+            _ = self.dirty.remove(path);
+            const entry = self.documents.getEntry(path) orelse continue;
+            try self.analyze(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -275,6 +302,10 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, method, "textDocument/didSave")) return true;
 
+        // the feature requests below read the analysis: run any deferred
+        // re-analysis first so the answer reflects the latest text
+        if (id != .null and self.dirty.count() != 0) try self.flushDirty();
+
         if (std.mem.eql(u8, method, "textDocument/completion")) {
             try self.completion(id, params);
             return true;
@@ -338,6 +369,9 @@ pub const Server = struct {
                 .text = try self.gpa.dupe(u8, text),
             };
         }
+        // opening analyzes at once: the document is a known-good baseline
+        // the deferred re-analysis of later edits can fall back on
+        _ = self.dirty.remove(entry.key_ptr.*);
         try self.analyze(entry.key_ptr.*, entry.value_ptr.*);
     }
 
@@ -368,13 +402,15 @@ pub const Server = struct {
             entry.text = updated;
         }
         const key = self.documents.getKey(path).?;
-        try self.analyze(key, entry.*);
+        try self.dirty.put(self.gpa, key, {});
     }
 
     fn closeDocument(self: *Server, uri: []const u8) void {
         const arena = self.message_arena.allocator();
         const path = normalizedPathFromUri(arena, uri) orelse return;
         const entry = self.documents.fetchRemove(path) orelse return;
+        // the dirty set borrows the key freed below
+        _ = self.dirty.remove(entry.key);
         self.gpa.free(entry.key);
         self.gpa.free(entry.value.uri);
         self.gpa.free(entry.value.text);
@@ -2549,4 +2585,61 @@ test "navigating to an imported module keeps the entry's diagnostics" {
         index = found + 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "a burst of edits analyzes once, not once per keystroke" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///c%3A/probe/burst.alloy";
+    // each intermediate state is broken mid-word; only the final state
+    // matters, and only it may publish (per-state publishes flashed
+    // transient errors in the editor)
+    const states = [_][]const u8{
+        "fn main() -> i32 { r\n}\n",
+        "fn main() -> i32 { re\n}\n",
+        "fn main() -> i32 { retu\n}\n",
+        "fn main() -> i32 { return 0; }\n",
+    };
+
+    var frames: std.ArrayList(u8) = .empty;
+    var messages: std.ArrayList([]const u8) = .empty;
+    try messages.append(arena, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    try messages.append(arena, try std.json.Stringify.valueAlloc(arena, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "alloy", .version = 1, .text = "fn main() -> i32 { return 1; }\n" } },
+    }, .{}));
+    for (states) |state| {
+        try messages.append(arena, try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{
+                .textDocument = .{ .uri = uri },
+                .contentChanges = &[_]struct { text: []const u8 }{.{ .text = state }},
+            },
+        }, .{}));
+    }
+    for (messages.items) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, std.testing.io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    // one publish for the open, one for the whole coalesced burst — and
+    // none of the mid-word states' errors ever reach the client
+    const transcript = output.writer.buffered();
+    var publishes: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, transcript, index, "textDocument/publishDiagnostics")) |found| {
+        publishes += 1;
+        index = found + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), publishes);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"diagnostics\":[]") != null);
 }
