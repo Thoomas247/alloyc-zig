@@ -214,7 +214,8 @@ pub const Expression = union(enum) {
         left: *const Expression,
         right: *const Expression,
     },
-    unary: struct { operator: Token, operand: *const Expression },
+    // 'mutable' marks the '&var' form of the borrow operator (section 5.2)
+    unary: struct { operator: Token, operand: *const Expression, mutable: bool = false },
     cast: struct {
         operator: Token,
         operand: *const Expression,

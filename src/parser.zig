@@ -650,8 +650,10 @@ pub const Parser = struct {
         switch (self.current().tag) {
             .minus, .tilde, .bang, .ampersand, .keyword_new, .keyword_move => {
                 const operator = self.advance();
+                // '&var' is the mutable form of the borrow (section 5.2)
+                const mutable = operator.tag == .ampersand and self.match(.keyword_var) != null;
                 const operand = try self.parseUnary();
-                return self.create(ast.Expression, .{ .unary = .{ .operator = operator, .operand = operand } });
+                return self.create(ast.Expression, .{ .unary = .{ .operator = operator, .operand = operand, .mutable = mutable } });
             },
             else => return self.parsePostfix(),
         }

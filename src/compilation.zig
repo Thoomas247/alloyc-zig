@@ -2514,7 +2514,7 @@ test "generic interface objects dispatch dynamically in both engines" {
         \\fn main() -> i32 {
         \\    var range_cursor = RangeCursor { .current = 0, .limit = 3 };
         \\    var repeater: Repeater<u64> = Repeater { .value = 7, .remaining = 2 };
-        \\    const combined = total(&range_cursor) + total(&repeater);
+        \\    const combined = total(&var range_cursor) + total(&var repeater);
         \\    return combined to i32;
         \\}
     ;
@@ -4171,10 +4171,10 @@ test "heap arrays borrow as slices, subslice, and move on return" {
         \\fn main() -> i64 {
         \\    const owned = make(4);
         \\    const view: &[u8] = &owned;
-        \\    const tail = owned[2..4];
+        \\    const tail = &owned[2..4];
         \\    const doubled = duplicate(&view);
         \\    const text: &[u8] = "abc";
-        \\    const middle = text[1..2];
+        \\    const middle = &text[1..2];
         \\    printf("%d %d %d %d %d\n", view.length(), sum(&view), sum(&tail), middle[0], sum(&doubled));
         \\    return sum(&view) + sum(&tail);
         \\}
@@ -4182,7 +4182,7 @@ test "heap arrays borrow as slices, subslice, and move on return" {
     try expectRunFault(
         \\fn main() -> i64 {
         \\    var buffer: *var [u8] = new [1 : 4];
-        \\    const bad = buffer[3..9];
+        \\    const bad = &buffer[3..9];
         \\    return bad.length() to i64;
         \\}
     , "out of bounds");
@@ -4216,14 +4216,126 @@ test "native executables borrow, subslice, and return heap arrays" {
         \\fn main() -> i32 {
         \\    const owned = make(4);
         \\    const view: &[u8] = &owned;
-        \\    const tail = owned[2..4];
+        \\    const tail = &owned[2..4];
         \\    const doubled = duplicate(&view);
         \\    const text: &[u8] = "abc";
-        \\    const middle = text[1..2];
+        \\    const middle = &text[1..2];
         \\    printf("%d %d %d %d %d\n", view.length(), sum(&view), sum(&tail), middle[0], sum(&doubled));
         \\    return (sum(&view) + sum(&tail)) to i32;
         \\}
     , 24, "4 18 6 98 18\n");
+}
+
+test "borrow mutability is explicit: '&' is immutable, '&var' mutable" {
+    // '&x' into a '&var T' parameter names the fix (section 5.2)
+    try expectCheckErrors(
+        \\fn bump(count: &var i32) { count += 1; }
+        \\fn main() -> i32 {
+        \\    var n: i32 = 0;
+        \\    bump(&n);
+        \\    return n;
+        \\}
+    , &.{"this borrow must be mutable here: write '&var' (section 5.2)"});
+    // the same for a mutable slice parameter fed a heap array borrow
+    try expectCheckErrors(
+        \\fn fill(values: &var [u8]) { values[0] = 1; }
+        \\fn main() -> i32 {
+        \\    var buffer: *var [u8] = new [0 : 3];
+        \\    fill(&buffer);
+        \\    return 0;
+        \\}
+    , &.{"this borrow must be mutable here: write '&var' (section 5.2)"});
+    // '&var' demands a mutable subject (section 5.2)
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const n: i32 = 3;
+        \\    var r: &var i32 = &var n;
+        \\    return r;
+        \\}
+    , &.{"a '&var' borrow requires a mutable subject (section 5.2)"});
+    // re-borrowing through an immutable reference cannot add mutability
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    var n: i32 = 1;
+        \\    const r: &i32 = &n;
+        \\    var w: &var i32 = &var r;
+        \\    return w;
+        \\}
+    , &.{"a '&var' borrow requires a mutable subject (section 5.2)"});
+    // an assignment-position mismatch points at the form too
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    var n: i32 = 1;
+        \\    var w: &var i32 = &n;
+        \\    return w;
+        \\}
+    , &.{"expected &var i32: write '&var' to borrow mutably (section 5.2)"});
+    // '&r' on a mutable source downgrades to the immutable view
+    try expectCheckErrors(
+        \\fn bump(count: &var i32) { count += 1; }
+        \\fn main() -> i32 {
+        \\    var n: i32 = 0;
+        \\    var w: &var i32 = &var n;
+        \\    bump(&w);
+        \\    return n;
+        \\}
+    , &.{"this borrow must be mutable here: write '&var' (section 5.2)"});
+    // a mutable borrow still fits an immutable target (section 4.3)
+    try expectChecks(
+        \\fn read(count: &i32) -> i32 { return count; }
+        \\fn main() -> i32 {
+        \\    var n: i32 = 1;
+        \\    return read(&var n);
+        \\}
+    );
+    // the engines agree on mutation through explicit '&var' borrows
+    try expectBuildsAndRuns("explicit_borrows",
+        \\fn bump(count: &var i32) { count += 1; }
+        \\fn fill(values: &var [u8], value: u8) { values[0] = value; }
+        \\fn main() -> i32 {
+        \\    var n: i32 = 0;
+        \\    bump(&var n);
+        \\    bump(&var n);
+        \\    var w: &var i32 = &var n;
+        \\    bump(&var w);
+        \\    var buffer: *var [u8] = new [3 : 2];
+        \\    fill(&var buffer, 40);
+        \\    return n + buffer[0] to i32 + buffer[1] to i32;
+        \\}
+    , 46, "");
+}
+
+test "a bare subslice is the unsized array value" {
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const text: &[u8] = "abcd";
+        \\    const middle = text[1..3];
+        \\    return middle.length() to i32;
+        \\}
+    , &.{"a subslice is the unsized array value: '&' borrows the view, '&var' borrows it mutably, 'new' copies it (section 3.1)"});
+    // a mutable view needs a mutable subject
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    const text: &[u8] = "abcd";
+        \\    const window = &var text[1..3];
+        \\    return window[0] to i32;
+        \\}
+    , &.{"a '&var' borrow requires a mutable subject (section 5.2)"});
+    // '&'/'&var' keep the view, 'new' copies the range, and in-place
+    // consumers (a 'for' subject, a receiver) still take it bare
+    try expectBuildsAndRuns("subslice_views",
+        \\fn main() -> i32 {
+        \\    var buffer: *var [u8] = new [5 : 6];
+        \\    const window = &var buffer[1..4];
+        \\    window[0] = 9;
+        \\    var total: u64 = 0;
+        \\    for (buffer[..2]) |b| {
+        \\        total += b to u64;
+        \\    }
+        \\    const copied = new buffer[2..5];
+        \\    return (total + window.length() + copied.length() + copied[0] to u64) to i32;
+        \\}
+    , 25, "");
 }
 
 test "file io externs fault without a host filesystem" {
@@ -4237,7 +4349,7 @@ test "file io externs fault without a host filesystem" {
 
 test "the interpreter serves process arguments through the lang item" {
     var sources = TestSources.initComptime(.{
-        .{ "std/process.alloy", "pub fn arguments() -> &[&[u8]] {\n    const empty: [&[u8] : 1] = [\"\"];\n    return empty[..0];\n}" },
+        .{ "std/process.alloy", "pub fn arguments() -> &[&[u8]] {\n    const empty: [&[u8] : 1] = [\"\"];\n    return &empty[..0];\n}" },
     });
     var compilation = Compilation.init(std.testing.allocator);
     defer compilation.deinit();
@@ -4445,9 +4557,9 @@ test "logical operators short-circuit, bitwise ones do not" {
         \\}
         \\fn main() -> i32 {
         \\    var n: i32 = 0;
-        \\    if (tick(&n, false) && tick(&n, true)) { n += 100; }
-        \\    if (tick(&n, true) || tick(&n, true)) { }
-        \\    if ((bit(&n, 0) & bit(&n, 1)) != 0) { n += 100; }
+        \\    if (tick(&var n, false) && tick(&var n, true)) { n += 100; }
+        \\    if (tick(&var n, true) || tick(&var n, true)) { }
+        \\    if ((bit(&var n, 0) & bit(&var n, 1)) != 0) { n += 100; }
         \\    return n;
         \\}
     , 4, "");
@@ -4464,7 +4576,7 @@ test "interface functions declare their receiver indirection" {
         \\fn peek(self c: &C) -> i32 { return c.n; }
         \\fn main() -> i32 {
         \\    var c = C { .n = 1 };
-        \\    var object: &var Counter = &c;
+        \\    var object: &var Counter = &var c;
         \\    object.bump();
         \\    object.bump();
         \\    const view: &Counter = &c;
@@ -4638,8 +4750,8 @@ test "a return unwinding through a loop leaves the caller's frames intact" {
         \\}
         \\fn main() -> i32 {
         \\    var s = S { .count = 0 };
-        \\    bump(&s);
-        \\    bump(&s);
+        \\    bump(&var s);
+        \\    bump(&var s);
         \\    return s.count to i32;
         \\}
     , 22, "");
@@ -4722,7 +4834,7 @@ test "a bare '*[T]' place read is the unsized array value" {
         \\}
         \\fn main() -> i32 {
         \\    var h: Holder = Holder::Data(new [66 : 4]);
-        \\    const owned = take(&h);
+        \\    const owned = take(&var h);
         \\    return (owned.length() + owned[0] to u64) to i32;
         \\}
     , 70, "");

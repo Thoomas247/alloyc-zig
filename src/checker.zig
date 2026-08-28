@@ -2130,19 +2130,36 @@ pub const Checker = struct {
                 return &bool_type;
             },
             .ampersand => {
-                // '&' on a reference-typed call result keeps the borrow
-                // verbatim (section 5.2); no addressable place is needed
-                if (unwrapGrouped(unary.operand).* == .call) {
+                // the written form fixes the borrow's mutability (section
+                // 5.2): '&' is the immutable view, '&var' the mutable one
+                // and it demands a mutable subject
+                //
+                // on a call result or a subslice no addressable place is
+                // needed: the view passes through, downgraded by '&',
+                // kept mutable by '&var'
+                const operand_kind = unwrapGrouped(unary.operand).*;
+                if (operand_kind == .call or operand_kind == .subslice) {
                     const operand_type = try self.checkExpression(unary.operand, null);
                     const operand_resolved = try self.resolveAlias(operand_type);
-                    if (operand_resolved.* == .reference or operand_resolved.* == .slice) {
-                        return operand_type;
+                    if (operand_resolved.* == .reference) {
+                        if (operand_resolved.reference.mutable == unary.mutable) return operand_type;
+                        if (unary.mutable) {
+                            try self.report(unary.operator.location, "a '&var' borrow requires a mutable subject (section 5.2)", .{});
+                        }
+                        return self.makeType(.{ .reference = .{ .mutable = unary.mutable, .child = operand_resolved.reference.child } });
                     }
-                    try self.report(unary.operator.location, "'&' requires an addressable value or a call already yielding a reference (section 5.2)", .{});
+                    if (operand_resolved.* == .slice) {
+                        if (operand_resolved.slice.mutable == unary.mutable) return operand_type;
+                        if (unary.mutable) {
+                            try self.report(unary.operator.location, "a '&var' borrow requires a mutable subject (section 5.2)", .{});
+                        }
+                        return self.makeType(.{ .slice = .{ .mutable = unary.mutable, .child = operand_resolved.slice.child } });
+                    }
+                    if (operand_kind == .call and operand_resolved.* != .unknown) {
+                        try self.report(unary.operator.location, "'&' requires an addressable value or a call already yielding a reference (section 5.2)", .{});
+                    }
                     return &unknown_type;
                 }
-                // '&' references any value in place (section 5.2); the
-                // reference is mutable when the referenced location is
                 const place = try self.lvalueOf(unary.operand) orelse {
                     _ = try self.checkExpression(unary.operand, null);
                     try self.report(unary.operator.location, "'&' requires an addressable value (a variable, field, or element)", .{});
@@ -2150,21 +2167,31 @@ pub const Checker = struct {
                 };
                 // borrowing a heap array yields a slice viewing its
                 // elements in place, the only non-owning form of an
-                // array view (section 5.2)
+                // array view (section 5.2); '&var' pierces the '*var'
+                // like any write through it (section 4.8)
                 const pierced = try self.resolveAlias(place.pierced);
                 if (pierced.* == .heap_array) {
+                    if (unary.mutable and !pierced.heap_array.mutable) {
+                        try self.report(unary.operator.location, "a '&var' borrow requires a mutable subject (section 5.2)", .{});
+                    }
                     return self.makeType(.{ .slice = .{
-                        .mutable = place.mutable and pierced.heap_array.mutable,
+                        .mutable = unary.mutable,
                         .child = pierced.heap_array.child,
                     } });
                 }
-                // re-borrowing a place already holding a slice yields the
-                // same view: '&view' on a '&[u8]' binding is idempotent
-                // (section 5.2)
+                // re-borrowing a place already holding a slice passes the
+                // view through with the written mutability (section 5.2)
                 if (pierced.* == .slice) {
-                    return place.pierced;
+                    if (pierced.slice.mutable == unary.mutable) return place.pierced;
+                    if (unary.mutable) {
+                        try self.report(unary.operator.location, "a '&var' borrow requires a mutable subject (section 5.2)", .{});
+                    }
+                    return self.makeType(.{ .slice = .{ .mutable = unary.mutable, .child = pierced.slice.child } });
                 }
-                return self.makeType(.{ .reference = .{ .mutable = place.mutable, .child = place.pierced } });
+                if (unary.mutable and !piercedMutability(place)) {
+                    try self.report(unary.operator.location, "a '&var' borrow requires a mutable subject (section 5.2)", .{});
+                }
+                return self.makeType(.{ .reference = .{ .mutable = unary.mutable, .child = place.pierced } });
             },
             .keyword_new => {
                 // 'new' deep-copies the operand value into a fresh heap
@@ -4676,9 +4703,47 @@ pub const Checker = struct {
             try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 4.6)", .{ name, viable.items.len });
             return &unknown_type;
         }
-        try self.report(span, "no overload of '{s}' matches these argument types ({d} candidate{s})", .{ name, function_count, if (function_count == 1) "" else "s" });
+        if (try self.borrowMutabilityHint(symbols, call, argument_types.items, null, expected)) |hint_span| {
+            try self.report(hint_span, "this borrow must be mutable here: write '&var' (section 5.2)", .{});
+        } else {
+            try self.report(span, "no overload of '{s}' matches these argument types ({d} candidate{s})", .{ name, function_count, if (function_count == 1) "" else "s" });
+        }
         try self.recheckContextualArguments(call, &.{});
         return &unknown_type;
+    }
+
+    // when overload resolution fails only because a borrow was written
+    // '&' where the parameter wants the '&var' form, point at the borrow
+    // instead of listing candidates (section 5.2)
+    fn borrowMutabilityHint(self: *Checker, symbols: resolution.SymbolList, call: anytype, argument_types: []const *const Type, receiver: ?MethodReceiver, expected: ?*const Type) Error!?Token.Location {
+        var promoted: std.ArrayList(*const Type) = .empty;
+        var first_changed: ?Token.Location = null;
+        for (call.arguments, argument_types) |argument, argument_type| {
+            const unwrapped = unwrapGrouped(argument);
+            const written_plain = unwrapped.* == .unary and unwrapped.unary.operator.tag == .ampersand and !unwrapped.unary.mutable;
+            const resolved = try self.resolveAlias(argument_type);
+            var replacement = argument_type;
+            if (written_plain) {
+                if (resolved.* == .reference and !resolved.reference.mutable) {
+                    replacement = try self.makeType(.{ .reference = .{ .mutable = true, .child = resolved.reference.child } });
+                } else if (resolved.* == .slice and !resolved.slice.mutable) {
+                    replacement = try self.makeType(.{ .slice = .{ .mutable = true, .child = resolved.slice.child } });
+                }
+            }
+            if (replacement != argument_type and first_changed == null) {
+                first_changed = self.expressionSpan(argument);
+            }
+            try promoted.append(self.arena, replacement);
+        }
+        if (first_changed == null) return null;
+        for (symbols.items) |symbol| {
+            switch (symbol.definition.kind) {
+                .fn_def, .extern_def => {},
+                else => continue,
+            }
+            if (try self.tryCandidate(symbol, call, promoted.items, receiver, expected)) |_| return first_changed;
+        }
+        return null;
     }
 
     const MethodReceiver = struct {
@@ -4769,8 +4834,12 @@ pub const Checker = struct {
             try self.report(span, "the call to '{s}' is ambiguous: {d} overloads are viable (section 4.6)", .{ name, remaining.items.len });
             return &unknown_type;
         }
-        const rendered = try receiver.pierced.render(self.arena);
-        try self.report(span, "no overload of '{s}' matches {s} and these argument types ({d} candidate{s})", .{ name, rendered, extension_count, if (extension_count == 1) "" else "s" });
+        if (try self.borrowMutabilityHint(symbols, call, argument_types.items, receiver, null)) |hint_span| {
+            try self.report(hint_span, "this borrow must be mutable here: write '&var' (section 5.2)", .{});
+        } else {
+            const rendered = try receiver.pierced.render(self.arena);
+            try self.report(span, "no overload of '{s}' matches {s} and these argument types ({d} candidate{s})", .{ name, rendered, extension_count, if (extension_count == 1) "" else "s" });
+        }
         try self.recheckContextualArguments(call, &.{});
         return &unknown_type;
     }
@@ -5160,6 +5229,18 @@ pub const Checker = struct {
         };
     }
 
+    // true when the only gap between the types is borrow mutability: an
+    // immutable '&' / '&[T]' offered where the '&var' form is needed
+    fn borrowMutabilityShort(from: *const Type, to: *const Type) bool {
+        if (from.* == .reference and to.* == .reference) {
+            return !from.reference.mutable and to.reference.mutable and from.reference.child.eql(to.reference.child);
+        }
+        if (from.* == .slice and to.* == .slice) {
+            return !from.slice.mutable and to.slice.mutable and from.slice.child.eql(to.slice.child);
+        }
+        return false;
+    }
+
     // pointee transparency (section 5.2): a pointer or reference reads as
     // its pointee; slices, arrays, and heap arrays read as themselves
     pub fn pierce(self: *Checker, candidate: *const Type) Error!*const Type {
@@ -5186,6 +5267,12 @@ pub const Checker = struct {
         const value_place = try self.lvalueOf(value);
         if (target_owns and value_place != null and try self.coerce(value_place.?.raw, to)) {
             try self.report(span, "assigning to {s} transfers ownership: use 'move' to hand over the allocation or 'new' to copy it (section 5.2)", .{to_rendered});
+            return;
+        }
+        // an immutable borrow written where a mutable one is needed: the
+        // fix is the '&var' form, not a different value (section 5.2)
+        if (borrowMutabilityShort(from, to) and unwrapGrouped(value).* == .unary) {
+            try self.report(span, "expected {s}: write '&var' to borrow mutably (section 5.2)", .{to_rendered});
             return;
         }
         if (to.* == .reference and value_place != null) {
@@ -5420,10 +5507,16 @@ pub const Checker = struct {
                 else => unreachable,
             }
         }
+        // a bare subslice denotes the unsized range value [T] (section
+        // 3.1): the view is written '&' / '&var', a copy 'new'
+        if (unwrapped.* == .subslice) {
+            try self.report(self.expressionSpan(expression), "a subslice is the unsized array value: '&' borrows the view, '&var' borrows it mutably, 'new' copies it (section 3.1)", .{});
+            return checked;
+        }
         // using a VARIABLE uses the value (section 5.2): a bare place read
         // consumes the pointee, and passing the borrow itself is spelled
         // '&x'. Unary results ('&x', 'new x') are already explicit, and
-        // non-place expressions (literals, subslices, yielded values)
+        // the remaining non-place expressions (literals, yielded values)
         // construct their reference visibly.
         if (unwrapped.* == .unary) return checked;
         if ((try self.lvalueOf(unwrapped)) == null) return checked;

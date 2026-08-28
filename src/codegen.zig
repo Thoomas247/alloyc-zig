@@ -1455,9 +1455,10 @@ pub const Codegen = struct {
                 return .{ .scalar = .{ .text = result, .llvm = operand.scalar.llvm } };
             },
             .ampersand => {
-                // '&' on a reference-typed call result keeps the borrow
-                // (section 5.2): the operand already carries the pointer
-                if (unwrapGrouped(unary.operand).* == .call) {
+                // '&' on a reference-typed call result or a subslice keeps
+                // the borrow (section 5.2): the operand already carries
+                // the pointer; mutability is the checker's business
+                if (unwrapGrouped(unary.operand).* == .call or unwrapGrouped(unary.operand).* == .subslice) {
                     const operand_type = try self.resolvedOf(try self.typeOf(unary.operand));
                     if (operand_type.* == .reference or operand_type.* == .slice) {
                         return self.evalExpression(unary.operand);
