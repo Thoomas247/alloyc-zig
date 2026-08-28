@@ -776,6 +776,42 @@ test "the interpreter faults on overflow bounds and lockstep" {
     , "disagree on length");
 }
 
+test "'to' keeps the value and faults when the target cannot" {
+    // in-range conversions pass; a float loses only its fractional part
+    try expectRuns(
+        \\fn main() -> i32 {
+        \\    var n: i64 = 120;
+        \\    var wide = n to u64;
+        \\    var back = wide to i32;
+        \\    var f: f64 = -2.9;
+        \\    var whole = f to i32;
+        \\    return back + whole;
+        \\}
+    , 118, "");
+    // a negative cannot keep its meaning in an unsigned (section 4.5)
+    try expectRunFault(
+        \\fn main() -> i32 {
+        \\    var n: i64 = -5;
+        \\    var u = n to u64;
+        \\    return 0;
+        \\}
+    , "'to' keeps the value");
+    try expectRunFault(
+        \\fn main() -> i32 {
+        \\    var n: i64 = 300;
+        \\    var b = n to u8;
+        \\    return 0;
+        \\}
+    , "does not fit u8");
+    try expectRunFault(
+        \\fn main() -> i32 {
+        \\    var f: f64 = 4000000000.0;
+        \\    var v = f to i32;
+        \\    return 0;
+        \\}
+    , "does not fit i32");
+}
+
 test "the interpreter runs lambdas with captured environments" {
     try expectRuns(
         \\fn main() -> i32 {
@@ -3363,6 +3399,42 @@ test "release codegen wraps arithmetic and keeps move bookkeeping" {
     }, &.{
         "with.overflow",
     });
+}
+
+test "native 'to' guards conversions in checked builds only" {
+    // negative-into-unsigned and float-into-integer range guards
+    // (section 4.5); release converts straight
+    const source =
+        \\fn main() -> i32 {
+        \\    var n: i64 = -5;
+        \\    var u = n to u64;
+        \\    var f: f64 = 2.5;
+        \\    var v = f to i32;
+        \\    return (u to i32) + v;
+        \\}
+    ;
+    try expectGenerates(source, false, &.{
+        "icmp sge i64",
+        "fcmp oge double",
+        "fcmp ole double",
+        "@\"alloy.fault\"",
+    }, &.{});
+    try expectGenerates(source, true, &.{}, &.{
+        "icmp sge",
+        "fcmp oge",
+        "@\"alloy.fault\"",
+    });
+    // the engines agree on the passing conversions
+    try expectBuildsAndRuns("to_conversions",
+        \\fn main() -> i32 {
+        \\    var n: i64 = 120;
+        \\    var wide = n to u64;
+        \\    var back = wide to i32;
+        \\    var f: f64 = -2.9;
+        \\    var whole = f to i32;
+        \\    return back + whole;
+        \\}
+    , 118, "");
 }
 
 test "release executables match checked executables" {

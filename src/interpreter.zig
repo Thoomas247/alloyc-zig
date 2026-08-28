@@ -1096,13 +1096,26 @@ pub const Interpreter = struct {
                     };
                     return .{ .float = .{ .value = value, .primitive = target } };
                 }
+                // 'to' keeps the value: a float loses only its fractional
+                // part, and a value the target cannot represent is a fault
+                // (section 4.5)
                 const wide: i128 = switch (operand) {
                     .integer => |integer| integer.value,
-                    .float => |float| @intFromFloat(float.value),
+                    .float => |float| whole: {
+                        if (std.math.isNan(float.value) or
+                            float.value < @as(f64, @floatFromInt(minimumOf(target))) - 1.0 or
+                            float.value > @as(f64, @floatFromInt(maximumOf(target))) + 1.0)
+                        {
+                            return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ float.value, @tagName(target) });
+                        }
+                        break :whole @intFromFloat(float.value);
+                    },
                     else => return self.fault("'to' needs a numeric operand", .{}),
                 };
-                // conversion truncates into the target range (section 4.5)
-                return .{ .integer = .{ .value = truncateToPrimitive(wide, target), .primitive = target } };
+                if (wide < minimumOf(target) or wide > maximumOf(target)) {
+                    return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ wide, @tagName(target) });
+                }
+                return .{ .integer = .{ .value = wide, .primitive = target } };
             },
             .keyword_is => {
                 if (cast.capture) |capture| {
@@ -2734,7 +2747,7 @@ pub fn parseIntegerText(text: []const u8) !i128 {
     return std.fmt.parseInt(i128, text, 10);
 }
 
-fn minimumOf(primitive: types.Primitive) i128 {
+pub fn minimumOf(primitive: types.Primitive) i128 {
     return switch (primitive) {
         .u8, .u16, .u32, .u64, .bool => 0,
         .i8 => std.math.minInt(i8),
@@ -2745,7 +2758,7 @@ fn minimumOf(primitive: types.Primitive) i128 {
     };
 }
 
-fn maximumOf(primitive: types.Primitive) i128 {
+pub fn maximumOf(primitive: types.Primitive) i128 {
     return switch (primitive) {
         .u8 => std.math.maxInt(u8),
         .u16 => std.math.maxInt(u16),

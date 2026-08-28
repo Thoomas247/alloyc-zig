@@ -1912,6 +1912,11 @@ pub const Codegen = struct {
                 if (source_resolved.* != .primitive or target_resolved.* != .primitive) {
                     return self.report(span, "'to' needs numeric operands", .{});
                 }
+                // 'to' keeps the value: checked builds guard against a
+                // value the target cannot represent (section 4.5)
+                if (!self.release_mode) {
+                    try self.checkConvertible(operand.scalar, source_resolved.primitive, target_resolved.primitive);
+                }
                 return .{ .scalar = try self.convertNumeric(operand.scalar, source_resolved.primitive, target_resolved.primitive) };
             },
             .keyword_as => {
@@ -2004,6 +2009,49 @@ pub const Codegen = struct {
         const opcode: []const u8 = if (origin.isSigned()) "sext" else "zext";
         try self.instruction("{s} = {s} {s} {s} to {s}", .{ result, opcode, operand.llvm, operand.text, target_llvm });
         return .{ .text = result, .llvm = target_llvm };
+    }
+
+    // 'to' keeps the value (section 4.5): checked builds verify the
+    // target can represent it before converting
+    fn checkConvertible(self: *Codegen, operand: Scalar, origin: types.Primitive, target: types.Primitive) Error!void {
+        if (origin == target or target.isFloat()) return;
+        const message = "runtime fault: 'to' keeps the value, which does not fit the target type (section 4.5)";
+        const minimum = interpreter_module.minimumOf(target);
+        const maximum = interpreter_module.maximumOf(target);
+        if (origin.isFloat()) {
+            // the bounds are the widest values of the operand's float type
+            // still inside the target's range, so a passing operand
+            // converts without overflow; NaN fails both ordered compares
+            const low = floatBound(origin, minimum, false);
+            const high = floatBound(origin, maximum, true);
+            const above = try self.freshTemp();
+            try self.instruction("{s} = fcmp oge {s} {s}, {s}", .{ above, operand.llvm, operand.text, (try self.floatConstant(low, origin)).text });
+            const below = try self.freshTemp();
+            try self.instruction("{s} = fcmp ole {s} {s}, {s}", .{ below, operand.llvm, operand.text, (try self.floatConstant(high, origin)).text });
+            const in_range = try self.freshTemp();
+            try self.instruction("{s} = and i1 {s}, {s}", .{ in_range, above, below });
+            try self.faultUnless(in_range, message);
+            return;
+        }
+        // integers compare in the operand's own width, where every bound
+        // that can be violated is representable
+        var in_range: ?[]const u8 = null;
+        if (origin.isSigned() and minimum > interpreter_module.minimumOf(origin)) {
+            const check = try self.freshTemp();
+            try self.instruction("{s} = icmp sge {s} {s}, {d}", .{ check, operand.llvm, operand.text, minimum });
+            in_range = check;
+        }
+        if (maximum < interpreter_module.maximumOf(origin)) {
+            const check = try self.freshTemp();
+            const predicate: []const u8 = if (origin.isSigned()) "sle" else "ule";
+            try self.instruction("{s} = icmp {s} {s} {s}, {d}", .{ check, predicate, operand.llvm, operand.text, maximum });
+            in_range = if (in_range) |first| both: {
+                const merged = try self.freshTemp();
+                try self.instruction("{s} = and i1 {s}, {s}", .{ merged, first, check });
+                break :both merged;
+            } else check;
+        }
+        if (in_range) |condition| try self.faultUnless(condition, message);
     }
 
     // 'as' between same-width primitives reuses the bits (section 4.5)
@@ -5667,6 +5715,20 @@ fn scalarTypeText(primitive: types.Primitive) []const u8 {
         .f64 => "double",
         .bool => "i1",
     };
+}
+
+// the widest value of the operand's float type still inside the integer
+// bound: rounded down when the bound is a maximum, up when a minimum
+fn floatBound(origin: types.Primitive, limit: i128, round_down: bool) f64 {
+    return if (origin == .f32) floatBoundIn(f32, limit, round_down) else floatBoundIn(f64, limit, round_down);
+}
+
+fn floatBoundIn(comptime F: type, limit: i128, round_down: bool) f64 {
+    var value: F = @floatFromInt(limit);
+    const converted: i128 = @intFromFloat(value);
+    if (round_down and converted > limit) value = std.math.nextAfter(F, value, -std.math.inf(F));
+    if (!round_down and converted < limit) value = std.math.nextAfter(F, value, std.math.inf(F));
+    return value;
 }
 
 fn tagTypeText(tag_size: u64) []const u8 {
