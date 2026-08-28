@@ -3437,6 +3437,104 @@ test "native 'to' guards conversions in checked builds only" {
     , 118, "");
 }
 
+test "'to' on an enum gives its integer tag" {
+    // the tag is the zero-based declaration index; payloads play no
+    // part, and a '&E' operand converts its pointee (section 4.5)
+    try expectRuns(
+        \\type State = enum { Idle, Running, Done };
+        \\type Holder = enum { Empty, Data: i64 };
+        \\fn tag(state: &State) -> i64 { return state to i64; }
+        \\fn main() -> i64 {
+        \\    var running = State::Running;
+        \\    const held: Holder = Holder::Data(99);
+        \\    return State::Done to i64 * 100 + held to i64 * 10 + tag(&running);
+        \\}
+    , 211, "");
+    // only an integer target holds a tag
+    try expectCheckErrors(
+        \\type State = enum { Idle, Running };
+        \\fn main() -> i32 {
+        \\    return (State::Idle to f32) to i32;
+        \\}
+    , &.{"'to' on an enum gives its integer tag; the target must be an integer type (section 4.5)"});
+    // the engines agree
+    try expectBuildsAndRuns("enum_to_tag",
+        \\type State = enum { Idle, Running, Done };
+        \\type Holder = enum { Empty, Data: i64 };
+        \\fn tag(state: &State) -> i32 { return state to i32; }
+        \\fn main() -> i32 {
+        \\    var running = State::Running;
+        \\    const held: Holder = Holder::Data(99);
+        \\    return State::Done to i32 * 100 + held to i32 * 10 + tag(&running);
+        \\}
+    , 211, "");
+}
+
+test "'to' builds an enum value from its integer tag" {
+    // the value names the variant by declaration index; the built value
+    // matches and converts back (section 4.5)
+    try expectRuns(
+        \\type State = enum { Idle, Running, Done };
+        \\fn main() -> i64 {
+        \\    const running = 1 to State;
+        \\    var value: i64 = 0;
+        \\    if (running is ::Running) { value += 10; }
+        \\    var index: i64 = 2;
+        \\    const done = index to State;
+        \\    if (done is ::Done) { value += 1; }
+        \\    return value + done to i64 * 100;
+        \\}
+    , 211, "");
+    // a value outside the enum's variants faults
+    try expectRunFault(
+        \\type State = enum { Idle, Running, Done };
+        \\fn main() -> i32 {
+        \\    var index: i64 = 9;
+        \\    const bad = index to State;
+        \\    return 0;
+        \\}
+    , "names no variant of the target enum");
+    // a payload-carrying variant cannot be invented
+    try expectRunFault(
+        \\type Holder = enum { Empty, Data: i64 };
+        \\fn main() -> i32 {
+        \\    var index: i64 = 1;
+        \\    const bad = index to Holder;
+        \\    return 0;
+        \\}
+    , "carries a payload 'to' cannot build");
+    // only an integer operand names a tag
+    try expectCheckErrors(
+        \\type State = enum { Idle, Running };
+        \\fn main() -> i32 {
+        \\    const bad = 1.5 to State;
+        \\    return 0;
+        \\}
+    , &.{"'to' builds an enum value from its integer tag; the operand must be an integer (section 4.5)"});
+    // the engines agree, and checked native builds guard both rules
+    try expectBuildsAndRuns("int_to_enum",
+        \\type State = enum { Idle, Running, Done };
+        \\fn pick(index: i64) -> State { return index to State; }
+        \\fn main() -> i32 {
+        \\    var value = 0;
+        \\    if (pick(2) is ::Done) { value += 7; }
+        \\    if (pick(0) is ::Idle) { value += 30; }
+        \\    return value;
+        \\}
+    , 37, "");
+}
+
+test "a macro name used as a value names the missing invocation" {
+    try expectCheckErrors(
+        \\macro items() -> &[&[u8]] {
+        \\    return ["a", "b"];
+        \\}
+        \\fn main() -> i32 {
+        \\    return #items.length() to i32;
+        \\}
+    , &.{"'items' is a macro: invoke it as '#items(...)' with its argument list (section 7.3)"});
+}
+
 test "release executables match checked executables" {
     try expectBuildsAndRunsMode("release_soundness",
         \\extern printf(format: &[u8], ...) -> i32;

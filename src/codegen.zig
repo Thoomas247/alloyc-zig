@@ -1907,18 +1907,63 @@ pub const Codegen = struct {
         const span = cast.operator.location;
         switch (cast.operator.tag) {
             .keyword_to => {
+                const expression_type = try self.typeOf(expression);
+                const target_resolved = try self.resolvedOf(expression_type);
+                // integer 'to' enum: the value names the variant by tag
+                // (section 4.5)
+                if (try self.enumFrameQuery(expression_type)) |frame| {
+                    if (try self.evalPlace(cast.operand)) |place| {
+                        const value_resolved = try self.resolvedOf(place.value_type);
+                        if (value_resolved.* != .primitive) {
+                            return self.report(span, "'to' needs an integer operand to build an enum", .{});
+                        }
+                        const loaded = try self.loadPlace(place, span);
+                        return self.enumFromTag(loaded.scalar, value_resolved.primitive, frame);
+                    }
+                    const operand = try self.evalExpression(cast.operand);
+                    const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
+                    if (source_resolved.* != .primitive) {
+                        return self.report(span, "'to' needs an integer operand to build an enum", .{});
+                    }
+                    return self.enumFromTag(operand.scalar, source_resolved.primitive, frame);
+                }
+                if (target_resolved.* != .primitive) {
+                    return self.report(span, "'to' needs numeric operands", .{});
+                }
+                const target_primitive = target_resolved.primitive;
+                // a place operand reads as its pierced value (pointee
+                // transparency); an enum place converts its tag
+                if (try self.evalPlace(cast.operand)) |place| {
+                    if (try self.enumFrameQuery(place.value_type)) |frame| {
+                        return self.convertEnumTag(place.pointer, frame, target_primitive);
+                    }
+                    const value_resolved = try self.resolvedOf(place.value_type);
+                    if (value_resolved.* != .primitive) {
+                        return self.report(span, "'to' needs numeric operands", .{});
+                    }
+                    const loaded = try self.loadPlace(place, span);
+                    if (!self.release_mode) {
+                        try self.checkConvertible(loaded.scalar, value_resolved.primitive, target_primitive);
+                    }
+                    return .{ .scalar = try self.convertNumeric(loaded.scalar, value_resolved.primitive, target_primitive) };
+                }
                 const operand = try self.evalExpression(cast.operand);
-                const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
-                const target_resolved = try self.resolvedOf(try self.typeOf(expression));
-                if (source_resolved.* != .primitive or target_resolved.* != .primitive) {
+                const source_type = try self.typeOf(cast.operand);
+                const source_resolved = try self.resolvedOf(source_type);
+                // an enum temporary converts through materialized storage
+                if (try self.enumFrameQuery(source_type)) |frame| {
+                    const memory = try self.ensureMemory(operand, source_type, span);
+                    return self.convertEnumTag(memory.pointer, frame, target_primitive);
+                }
+                if (source_resolved.* != .primitive) {
                     return self.report(span, "'to' needs numeric operands", .{});
                 }
                 // 'to' keeps the value: checked builds guard against a
                 // value the target cannot represent (section 4.5)
                 if (!self.release_mode) {
-                    try self.checkConvertible(operand.scalar, source_resolved.primitive, target_resolved.primitive);
+                    try self.checkConvertible(operand.scalar, source_resolved.primitive, target_primitive);
                 }
-                return .{ .scalar = try self.convertNumeric(operand.scalar, source_resolved.primitive, target_resolved.primitive) };
+                return .{ .scalar = try self.convertNumeric(operand.scalar, source_resolved.primitive, target_primitive) };
             },
             .keyword_as => {
                 if (self.cast_shapes.get(expression)) |shapes| {
@@ -2010,6 +2055,57 @@ pub const Codegen = struct {
         const opcode: []const u8 = if (origin.isSigned()) "sext" else "zext";
         try self.instruction("{s} = {s} {s} {s} to {s}", .{ result, opcode, operand.llvm, operand.text, target_llvm });
         return .{ .text = result, .llvm = target_llvm };
+    }
+
+    // integer 'to' enum: checked builds fault when the tag names no
+    // variant or a payload-carrying one; the zeroed payload area keeps a
+    // release-mode conversion drop-safe either way (section 4.5)
+    fn enumFromTag(self: *Codegen, operand: Scalar, origin: types.Primitive, frame: Checker.EnumFrame) Error!Operand {
+        // compare in i64, where every variant count fits; an unsigned
+        // value past the signed range reappears negative and fails the
+        // lower bound
+        const wide = try self.convertNumeric(operand, origin, .i64);
+        if (!self.release_mode) {
+            const above = try self.freshTemp();
+            try self.instruction("{s} = icmp sge i64 {s}, 0", .{ above, wide.text });
+            const below = try self.freshTemp();
+            try self.instruction("{s} = icmp slt i64 {s}, {d}", .{ below, wide.text, frame.variants.len });
+            const in_range = try self.freshTemp();
+            try self.instruction("{s} = and i1 {s}, {s}", .{ in_range, above, below });
+            try self.faultUnless(in_range, "runtime fault: the value names no variant of the target enum (section 4.5)");
+            for (frame.variants, 0..) |variant, index| {
+                if (variant.payload == null) continue;
+                const differs = try self.freshTemp();
+                try self.instruction("{s} = icmp ne i64 {s}, {d}", .{ differs, wide.text, index });
+                try self.faultUnless(differs, "runtime fault: the value names a payload-carrying variant, which 'to' cannot build (section 4.5)");
+            }
+        }
+        const tag_primitive: types.Primitive = switch (frame.tag_size) {
+            1 => .u8,
+            2 => .u16,
+            else => .u32,
+        };
+        const tag = try self.convertNumeric(wide, .i64, tag_primitive);
+        const slot = try self.aggregateSlot(frame.layout);
+        try self.zeroFill(slot, frame.layout.size);
+        try self.instruction("store {s} {s}, ptr {s}", .{ tagTypeText(frame.tag_size), tag.text, slot });
+        return .{ .memory = .{ .pointer = slot, .layout = frame.layout, .fresh = true } };
+    }
+
+    // 'to' on an enum value converts its tag, the zero-based variant
+    // index, into the target integer (section 4.5)
+    fn convertEnumTag(self: *Codegen, pointer: []const u8, frame: Checker.EnumFrame, target: types.Primitive) Error!Operand {
+        const tag = try self.loadTag(pointer, frame);
+        const tag_primitive: types.Primitive = switch (frame.tag_size) {
+            1 => .u8,
+            2 => .u16,
+            else => .u32,
+        };
+        const scalar = Scalar{ .text = tag, .llvm = tagTypeText(frame.tag_size) };
+        if (!self.release_mode) {
+            try self.checkConvertible(scalar, tag_primitive, target);
+        }
+        return .{ .scalar = try self.convertNumeric(scalar, tag_primitive, target) };
     }
 
     // 'to' keeps the value (section 4.5): checked builds verify the

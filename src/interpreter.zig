@@ -1086,8 +1086,47 @@ pub const Interpreter = struct {
         const cast = expression.cast;
         switch (cast.operator.tag) {
             .keyword_to => {
-                const operand = try self.evalExpression(cast.operand);
+                var operand = try self.evalExpression(cast.operand);
+                // pointee transparency: a reference operand converts its
+                // pointee (section 4.5)
+                while (operand == .reference) operand = operand.reference.*;
+                // integer 'to' enum: the value names the variant by tag,
+                // from the recorded shape; a tag outside the enum or one
+                // naming a payload-carrying variant faults (section 4.5)
+                if (operand == .integer) {
+                    if (self.cast_shapes.get(expression)) |shapes| {
+                        if (shapes.target.* == .tagged) {
+                            const tagged = shapes.target.tagged;
+                            const index = operand.integer.value;
+                            if (index < 0 or index >= tagged.variants.len) {
+                                return self.fault("the value {d} names no variant of the target enum (section 4.5)", .{index});
+                            }
+                            const variant = tagged.variants[@intCast(index)];
+                            if (variant.payload != null) {
+                                return self.fault("the value {d} names variant '{s}', which carries a payload 'to' cannot build (section 4.5)", .{ index, variant.name });
+                            }
+                            const fresh = try self.arena.create(Value.EnumInstance);
+                            fresh.* = .{ .variant = variant.name, .payload = null };
+                            return .{ .enum_value = fresh };
+                        }
+                    }
+                }
                 const target = self.primitiveOf(expression) orelse return self.fault("'to' target is not a primitive", .{});
+                // 'to' on an enum gives its tag: the variant's declaration
+                // index, read from the recorded shape (section 4.5)
+                if (operand == .enum_value) {
+                    const shapes = self.cast_shapes.get(expression) orelse return self.fault("'to' on this enum has no recorded variant order", .{});
+                    if (shapes.source.* != .tagged) return self.fault("'to' on this enum has no recorded variant order", .{});
+                    const instance = operand.enum_value;
+                    const index = for (shapes.source.tagged.variants, 0..) |variant, position| {
+                        if (std.mem.eql(u8, variant.name, instance.variant)) break @as(i128, @intCast(position));
+                    } else return self.fault("'{s}' names no variant here", .{instance.variant});
+                    if (target.isFloat()) return .{ .float = .{ .value = @floatFromInt(index), .primitive = target } };
+                    if (index < minimumOf(target) or index > maximumOf(target)) {
+                        return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ index, @tagName(target) });
+                    }
+                    return .{ .integer = .{ .value = index, .primitive = target } };
+                }
                 if (target.isFloat()) {
                     const value = switch (operand) {
                         .integer => |integer| @as(f64, @floatFromInt(integer.value)),

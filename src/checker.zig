@@ -1918,12 +1918,16 @@ pub const Checker = struct {
             // completes and may call later definitions
             .comptime_expr => |inner| {
                 self.comptime_depth += 1;
+                const diagnostics_before = self.diagnostics.items.len;
                 const result = try self.checkExpression(inner, expected);
                 self.comptime_depth -= 1;
                 // a '#' nested inside another '#' evaluates as part of the
                 // outer expression, never on its own
                 if (self.comptime_depth > 0) return result;
                 if (self.tooling_only) return result;
+                // a broken expression never evaluates: the checking error
+                // is the diagnosis, not a comptime fault on top of it
+                if (self.diagnostics.items.len != diagnostics_before) return &unknown_type;
                 // a '#Type'-holding result cannot cross into runtime: a
                 // macro declared '-> #Type' is only for type position or a
                 // surrounding '#' expression (section 7.3)
@@ -2064,6 +2068,12 @@ pub const Checker = struct {
             },
             .extern_def => {
                 try self.report(span, "an extern function cannot be used as a function value yet (section 6.3)", .{});
+                return &unknown_type;
+            },
+            // a macro name is not a value: only its invocation is
+            .macro_def => |macro_def| {
+                const name = macro_def.name.slice(self.views[symbol.view_index].source);
+                try self.report(span, "'{s}' is a macro: invoke it as '#{s}(...)' with its argument list (section 7.3)", .{ name, name });
                 return &unknown_type;
             },
             // a bare type or interface name is not a value; '#T' reflection
@@ -2398,7 +2408,37 @@ pub const Checker = struct {
                 const target = try self.typeFromExpression(cast.target, self.scope_types);
                 const target_resolved = try self.resolveAlias(target);
                 const target_numeric = target_resolved.isNumeric() and target_resolved.* != .unknown or target_resolved.* == .type_parameter;
-                const operand_resolved = try self.resolveAlias(operand);
+                // pointee transparency: the operand reads as its pointee
+                const operand_resolved = try self.resolveAlias(try self.pierce(try self.resolveAlias(operand)));
+                // 'to' on an enum value gives its tag, the zero-based
+                // declaration index; only an integer target holds it
+                // (section 4.5)
+                if (try self.enumBody(operand_resolved)) |_| {
+                    if (!target_resolved.isInteger() and target_resolved.* != .type_parameter) {
+                        try self.report(cast.operator.location, "'to' on an enum gives its integer tag; the target must be an integer type (section 4.5)", .{});
+                    }
+                    // the recorded shape carries the variant order for the
+                    // interpreter's tag lookup
+                    const source_shape = try self.shapeOf(operand_resolved, 0);
+                    const target_shape = try self.shapeOf(target_resolved, 0);
+                    if (source_shape != null and target_shape != null) {
+                        try self.cast_shapes.put(self.arena, expression, .{ .source = source_shape.?, .target = target_shape.? });
+                    }
+                    return target;
+                }
+                // integer 'to' enum: the value names the variant by tag;
+                // bounds and payload-freedom are runtime rules (section 4.5)
+                if (try self.enumBody(target_resolved)) |_| {
+                    if (!operand_resolved.isInteger() and operand_resolved.* != .type_parameter) {
+                        try self.report(cast.operator.location, "'to' builds an enum value from its integer tag; the operand must be an integer (section 4.5)", .{});
+                    }
+                    const source_shape = try self.shapeOf(try self.resolveAlias(try self.defaulted(operand_resolved)), 0);
+                    const target_shape = try self.shapeOf(target_resolved, 0);
+                    if (source_shape != null and target_shape != null) {
+                        try self.cast_shapes.put(self.arena, expression, .{ .source = source_shape.?, .target = target_shape.? });
+                    }
+                    return target;
+                }
                 if (!operand_resolved.isNumeric() and operand_resolved.* != .type_parameter) {
                     try self.report(cast.operator.location, "'to' converts Number values; the operand is not numeric (section 4.5)", .{});
                 } else if (!target_numeric) {
