@@ -506,16 +506,36 @@ pub const Tokenizer = struct {
             self.index += 1;
         }
 
-        // per spec a float is [0-9]+ '.' [0-9]*, so '1.' is a float; the
-        // second-dot check keeps '1...' as integer then spread
-        if (self.index < self.buffer.len and self.buffer[self.index] == '.' and self.peekAt(1) != '.') {
+        // a float needs a digit after the dot -- '1.' is an integer then
+        // member access, '1..2' an integer then a range (section 2.6)
+        var is_float = false;
+        if (self.index < self.buffer.len and self.buffer[self.index] == '.' and isDecimalDigit(self.peekAt(1) orelse 0)) {
+            is_float = true;
             self.index += 1;
             while (self.index < self.buffer.len and isDecimalDigit(self.buffer[self.index])) {
                 self.index += 1;
             }
-            return .{ .tag = .float_literal, .location = .{ .start = start, .end = self.index } };
+        }
+        // an exponent makes a float even without a dot ('1e9'); it only
+        // counts when digits follow, so '1e' stays an integer then an
+        // identifier (section 2.6)
+        if (self.index < self.buffer.len and (self.buffer[self.index] == 'e' or self.buffer[self.index] == 'E')) {
+            var lookahead = self.index + 1;
+            if (lookahead < self.buffer.len and (self.buffer[lookahead] == '+' or self.buffer[lookahead] == '-')) {
+                lookahead += 1;
+            }
+            if (lookahead < self.buffer.len and isDecimalDigit(self.buffer[lookahead])) {
+                is_float = true;
+                self.index = lookahead;
+                while (self.index < self.buffer.len and isDecimalDigit(self.buffer[self.index])) {
+                    self.index += 1;
+                }
+            }
         }
 
+        if (is_float) {
+            return .{ .tag = .float_literal, .location = .{ .start = start, .end = self.index } };
+        }
         return .{ .tag = .integer_literal, .location = .{ .start = start, .end = self.index } };
     }
 
@@ -650,9 +670,16 @@ test "integer literals" {
 }
 
 test "float literals" {
-    try expectTokens("1.5 10. 0.0", &.{ .float_literal, .float_literal, .float_literal });
-    // '.5' is not a float, the spec requires leading digits
+    try expectTokens("1.5 0.0", &.{ .float_literal, .float_literal });
+    // '.5' is not a float, the spec requires leading digits; '1.' needs
+    // a digit after the dot, so it is member access on an integer
     try expectTokens(".5", &.{ .dot, .integer_literal });
+    try expectTokens("10.", &.{ .integer_literal, .dot });
+    try expectTokens("1.foo", &.{ .integer_literal, .dot, .identifier });
+    // exponents, signed either way, with or without a dot; 'e' with no
+    // digits is an identifier, not an exponent
+    try expectTokens("6.02e23 1E-9 2.5E+3 9e+0", &.{ .float_literal, .float_literal, .float_literal, .float_literal });
+    try expectTokens("1e 1e+", &.{ .integer_literal, .identifier, .integer_literal, .identifier, .plus });
 }
 
 test "string literals" {
