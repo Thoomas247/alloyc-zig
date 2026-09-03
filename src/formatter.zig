@@ -19,85 +19,146 @@ pub fn format(allocator: std.mem.Allocator, source: []const u8) FormatError![]u8
     const tokens = try lex(allocator, source);
     defer allocator.free(tokens);
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var depth: usize = 0;
-    var previous: ?Token = null;
-    // whether the previously emitted '&', '*', or '-' acted as a prefix
-    // operator or type modifier, so its operand glues to it
-    var previous_was_prefix = false;
-    // between 'type Name' and its '=', a ':' introduces interface markers
-    // and keeps a space before it, unlike annotation colons
-    var in_type_header = false;
-    var angle_depth: usize = 0;
-    // innermost open group per depth: an array fill or size colon directly
-    // inside '[' ']' spaces both sides ('[value : count]'), unlike
-    // annotation colons
-    var group_stack: std.ArrayList(Token.Tag) = .empty;
-    defer group_stack.deinit(allocator);
-
-    for (tokens) |token| {
-        const newlines = if (previous) |before| countNewlines(source[before.location.end..token.location.start]) else 0;
-
-        if (closesGroup(token.tag)) {
-            depth -|= 1;
-            _ = group_stack.pop();
-        }
-
-        if (previous == null) {
-            try emitIndent(allocator, &out, depth);
-        } else if (newlines == 0) {
-            const implements_colon = token.tag == .colon and in_type_header and angle_depth == 0;
-            const bracket_colon = token.tag == .colon and group_stack.items.len != 0 and
-                group_stack.items[group_stack.items.len - 1] == .bracket_left;
-            const spaced = implements_colon or bracket_colon or pairSpace(previous.?, token, previous_was_prefix);
-            if (spaced) try out.append(allocator, ' ');
-        } else {
-            try out.append(allocator, '\n');
-            if (newlines >= 2) try out.append(allocator, '\n');
-            // a line broken mid-statement continues one level deeper; a
-            // closing token never does - it aligns with its own group,
-            // whatever ended the line above it ('Busy: i32' + newline + '}')
-            const continuation: usize = if (closesGroup(token.tag)) 0 else switch (previous.?.tag) {
-                // an opener already deepened the indent, so the line after
-                // it starts the new level, not a continuation of the old
-                .semicolon, .comma, .brace_left, .parenthesis_left, .bracket_left, .brace_right, .line_comment, .block_comment => 0,
-                else => 1,
-            };
-            try emitIndent(allocator, &out, depth + continuation);
-        }
-
-        try out.appendSlice(allocator, token.slice(source));
-        if (opensGroup(token.tag)) {
-            depth += 1;
-            try group_stack.append(allocator, token.tag);
-        }
-
-        switch (token.tag) {
-            .keyword_type => in_type_header = true,
-            .equal, .semicolon, .brace_left => in_type_header = false,
-            .angle_left => angle_depth += 1,
-            .angle_right => angle_depth -|= 1,
-            .shift_right => angle_depth -|= 2,
-            else => {},
-        }
-        previous_was_prefix = isPrefixCandidate(token.tag) and (previous == null or !endsValue(previous.?.tag));
-        previous = token;
-    }
-    try out.append(allocator, '\n');
-
-    const result = try out.toOwnedSlice(allocator);
+    var emitter = Emitter.init(allocator, source);
+    defer emitter.deinit();
+    for (tokens) |token| try emitter.emit(token);
+    const result = try emitter.finish();
     errdefer allocator.free(result);
+
     // only whitespace may change: the token streams must match exactly
     const reformatted = try lex(allocator, result);
     defer allocator.free(reformatted);
     if (reformatted.len != tokens.len) return error.MalformedSource;
     for (tokens, reformatted) |original, emitted| {
         if (original.tag != emitted.tag) return error.MalformedSource;
-        if (!std.mem.eql(u8, original.slice(source), emitted.slice(result))) return error.MalformedSource;
+        if (!std.mem.eql(u8, tokenText(original, source), tokenText(emitted, result))) return error.MalformedSource;
     }
     return result;
+}
+
+// the state carried from one emitted token to the next: the nesting
+// depth, the previous token, and the small context flags that spacing
+// decisions depend on
+const Emitter = struct {
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    out: std.ArrayList(u8) = .empty,
+    depth: usize = 0,
+    previous: ?Token = null,
+    // whether the previously emitted '&', '*', or '-' acted as a prefix
+    // operator or type modifier, so its operand glues to it
+    previous_was_prefix: bool = false,
+    // between 'type Name' and its '=', a ':' introduces interface markers
+    // and keeps a space before it, unlike annotation colons
+    in_type_header: bool = false,
+    angle_depth: usize = 0,
+    // innermost open group per depth: an array fill or size colon directly
+    // inside '[' ']' spaces both sides ('[value : count]'), unlike
+    // annotation colons
+    group_stack: std.ArrayList(Token.Tag) = .empty,
+    // the source's own line ending is kept, so a CRLF file stays CRLF and
+    // '--check' can pass on it
+    newline: []const u8,
+
+    fn init(allocator: std.mem.Allocator, source: []const u8) Emitter {
+        return .{
+            .allocator = allocator,
+            .source = source,
+            .newline = if (std.mem.indexOf(u8, source, "\r\n") != null) "\r\n" else "\n",
+        };
+    }
+
+    fn deinit(self: *Emitter) void {
+        self.out.deinit(self.allocator);
+        self.group_stack.deinit(self.allocator);
+    }
+
+    fn emit(self: *Emitter, token: Token) FormatError!void {
+        const newlines = if (self.previous) |before| countNewlines(self.source[before.location.end..token.location.start]) else 0;
+
+        if (closesGroup(token.tag)) {
+            self.depth -|= 1;
+            _ = self.group_stack.pop();
+        }
+
+        if (self.previous == null) {
+            try self.indent(self.depth);
+        } else if (newlines == 0) {
+            if (self.spacedAfterPrevious(token)) try self.out.append(self.allocator, ' ');
+        } else {
+            try self.out.appendSlice(self.allocator, self.newline);
+            if (newlines >= 2) try self.out.appendSlice(self.allocator, self.newline);
+            try self.indent(self.depth + self.continuation(token));
+        }
+
+        try self.out.appendSlice(self.allocator, tokenText(token, self.source));
+        if (opensGroup(token.tag)) {
+            self.depth += 1;
+            try self.group_stack.append(self.allocator, token.tag);
+        }
+        self.track(token);
+    }
+
+    // whether a token on the same line as the previous one takes a space
+    fn spacedAfterPrevious(self: *const Emitter, token: Token) bool {
+        const implements_colon = token.tag == .colon and self.in_type_header and self.angle_depth == 0;
+        const bracket_colon = token.tag == .colon and self.group_stack.items.len != 0 and
+            self.group_stack.items[self.group_stack.items.len - 1] == .bracket_left;
+        return implements_colon or bracket_colon or pairSpace(self.previous.?, token, self.previous_was_prefix);
+    }
+
+    // a line broken mid-statement continues one level deeper; a closing
+    // token never does - it aligns with its own group, whatever ended the
+    // line above it ('Busy: i32' + newline + '}')
+    fn continuation(self: *const Emitter, token: Token) usize {
+        if (closesGroup(token.tag)) return 0;
+        return switch (self.previous.?.tag) {
+            // an opener already deepened the indent, so the line after it
+            // starts the new level, not a continuation of the old
+            .semicolon, .comma, .brace_left, .parenthesis_left, .bracket_left, .brace_right, .line_comment, .block_comment => 0,
+            else => 1,
+        };
+    }
+
+    // updates the context flags once a token has been emitted
+    fn track(self: *Emitter, token: Token) void {
+        switch (token.tag) {
+            .keyword_type => self.in_type_header = true,
+            .equal, .brace_left => self.in_type_header = false,
+            .angle_left => self.angle_depth += 1,
+            .angle_right => self.angle_depth -|= 1,
+            .shift_right => self.angle_depth -|= 2,
+            // a comparison's '<' never closes: the statement or group
+            // ending settles the depth so a later 'type X : I' keeps its
+            // marker spacing
+            .semicolon => {
+                self.in_type_header = false;
+                self.angle_depth = 0;
+            },
+            .brace_right, .parenthesis_right, .bracket_right => self.angle_depth = 0,
+            else => {},
+        }
+        self.previous_was_prefix = isPrefixCandidate(token.tag) and (self.previous == null or !endsValue(self.previous.?.tag));
+        self.previous = token;
+    }
+
+    fn indent(self: *Emitter, depth: usize) FormatError!void {
+        try self.out.appendSlice(self.allocator, (" " ** (indent_width * 16))[0..@min(depth, 16) * indent_width]);
+    }
+
+    // the finished text, ending in one line break
+    fn finish(self: *Emitter) FormatError![]u8 {
+        try self.out.appendSlice(self.allocator, self.newline);
+        return self.out.toOwnedSlice(self.allocator);
+    }
+};
+
+// a line comment on a CRLF line lexes with its '\r' attached; the
+// formatter owns line endings, so the comment text stops before it
+fn tokenText(token: Token, source: []const u8) []const u8 {
+    const text = token.slice(source);
+    if (token.tag == .line_comment) return std.mem.trimEnd(u8, text, "\r");
+    return text;
 }
 
 fn lex(allocator: std.mem.Allocator, source: []const u8) FormatError![]Token {
@@ -120,10 +181,6 @@ fn countNewlines(gap: []const u8) usize {
         if (byte == '\n') count += 1;
     }
     return count;
-}
-
-fn emitIndent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), depth: usize) !void {
-    try out.appendSlice(allocator, (" " ** (indent_width * 16))[0..@min(depth, 16) * indent_width]);
 }
 
 fn opensGroup(tag: Token.Tag) bool {
@@ -258,6 +315,21 @@ test "formatting is idempotent and keeps ambiguous adjacency" {
     try std.testing.expect(std.mem.indexOf(u8, once, ".left = -4") != null);
     try std.testing.expect(std.mem.indexOf(u8, once, "/* keep me */") != null);
     try std.testing.expect(std.mem.indexOf(u8, once, "[..4]) |i|") != null);
+}
+
+test "a comparison does not swallow later marker spacing, and CRLF is kept" {
+    // '<' with no closing '>' once left the angle depth stuck, dropping
+    // the space before a later 'type X : Marker'
+    const source = "fn f() { const flag = 1 < 2; }\ntype Pair : Marker = struct { x: i64 };\n";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings(source, formatted);
+    // a CRLF file stays CRLF, and a line comment's '\r' never leaks into
+    // the comment text
+    const crlf = "fn f() { // hi\r\n    return 1;\r\n}\r\n";
+    const kept = try format(std.testing.allocator, crlf);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings(crlf, kept);
 }
 
 test "closing tokens never take continuation indent" {

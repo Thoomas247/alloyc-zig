@@ -1,16 +1,20 @@
 //! Tree-walking interpreter over the checked merged unit, the execution
-//! stage behind 'alloyc run' and, later, compile-time evaluation (section
-//! 6). It consumes the checker's side tables (expression types and resolved
-//! call targets) so no semantic analysis is repeated here.
+//! stage behind 'alloyc run' and compile-time evaluation (section 7). It
+//! consumes the checker's side tables (expression types and resolved call
+//! targets); where the checker records no target (macro bodies, runtime
+//! interface dispatch), name resolution and dispatch are re-derived here
+//! from the merged unit's globals.
 //!
 //! Subset covered: integer/float/bool arithmetic with overflow faults
 //! (section 5.2), strings, structs, enums with payloads, fixed and heap
 //! arrays, slices, pointers with move semantics and deep-copy uniqueness,
 //! all control flow including value yielding, ranges, extension calls,
 //! lambdas with captured environments, interface-object dispatch with
-//! downcasting, the cursor protocol for custom iterables, and a printf
-//! extern. The checker also drives this interpreter in a sandboxed mode
-//! (comptime_mode plus step_budget) as the section 6 compile-time
+//! downcasting, the cursor protocol for custom iterables, the std::io
+//! extern family (printf, __acrt_iob_func, fopen, fclose, fread, fwrite,
+//! fseek, ftell), and the std::process::arguments lang item (section
+//! 6.1a). The checker also drives this interpreter in a sandboxed mode
+//! (comptime_mode plus step_budget) as the section 7.1 compile-time
 //! evaluator, where macros, the built-in macros, and '#Type' reflection
 //! methods (section 4.4) are available through the reflection hooks.
 //! 'as' beyond primitives (section 4.5) runs through checker-recorded byte
@@ -119,6 +123,11 @@ pub const Interpreter = struct {
     // up to the enclosing function call, carrying 'pending_return'
     pub const Error = error{ OutOfMemory, RuntimeFault, WriteFailed, Return, Break, Continue, Yield };
 
+    // fault texts shared by several sites
+    const layout_mismatch = "'as' source value does not match its checked layout";
+    const moved_from_array = "use of a moved-from array";
+    const stack_exhausted = "call stack exhausted (1024 frames)";
+
     pub const Value = union(enum) {
         void_value,
         integer: Integer,
@@ -189,7 +198,7 @@ pub const Interpreter = struct {
         pub const EnvironmentEntry = struct {
             name: []const u8,
             cell: *Value,
-            mode: CaptureMode,
+            mode: ast.CaptureMode,
         };
 
         // a first-class, mutable description of a type (section 4.4); the
@@ -310,8 +319,9 @@ pub const Interpreter = struct {
             if (candidate.definition.kind == .fn_def) break candidate;
         } else return self.fault("no 'main' function", .{});
         const result = try self.callFunction(symbol, &.{}, &.{});
+        // the exit code truncates to the platform width (section 6.4)
         return switch (result) {
-            .integer => |integer| @intCast(integer.value),
+            .integer => |integer| @bitCast(@as(u64, @truncate(@as(u128, @bitCast(integer.value))))),
             else => 0,
         };
     }
@@ -377,6 +387,16 @@ pub const Interpreter = struct {
 
     fn popFrame(self: *Interpreter) void {
         _ = self.scopes.pop();
+    }
+
+    // drops every frame above 'floor': 'return', 'break', and 'yield'
+    // unwind on the error channel past the in-line popFrame calls of a
+    // control-flow construct, so the construct defers this to leave no
+    // frame behind on any exit
+    fn unwindFrames(self: *Interpreter, floor: usize) void {
+        while (self.scopes.items.len > floor) {
+            _ = self.scopes.pop();
+        }
     }
 
     fn bind(self: *Interpreter, name: []const u8, value: Value) Error!void {
@@ -497,6 +517,14 @@ pub const Interpreter = struct {
         return current;
     }
 
+    // chases reference cells only, reaching the innermost borrowed cell;
+    // pointers are left alone (pierceCell also crosses those)
+    fn innermostCell(cell: *Value) *Value {
+        var current = cell;
+        while (current.* == .reference) current = current.reference;
+        return current;
+    }
+
     fn execStatement(self: *Interpreter, statement: *const ast.Statement) Error!Flow {
         if (self.debug_hook) |hook| {
             try hook.on_statement(hook.context, self, statement);
@@ -593,7 +621,8 @@ pub const Interpreter = struct {
         switch (expression.*) {
             .integer_literal => |token| return self.integerLiteral(expression, token),
             .float_literal => |token| return .{ .float = .{
-                .value = std.fmt.parseFloat(f64, token.slice(self.source())) catch 0,
+                .value = std.fmt.parseFloat(f64, token.slice(self.source())) catch
+                    return self.fault("invalid float literal '{s}'", .{token.slice(self.source())}),
                 .primitive = self.primitiveOf(expression),
             } },
             .bool_literal => |literal| return .{ .bool_value = literal.value },
@@ -609,19 +638,7 @@ pub const Interpreter = struct {
                     return self.fault("this inline layout could not be reflected", .{});
                 return .{ .type_value = description };
             },
-            .comptime_expr => |inner| {
-                // substituted by compile-time evaluation (section 7.1); the
-                // fallback covers '#' nodes inside other comptime evaluations
-                if (self.comptime_values.get(expression)) |value| return self.deepCopy(value);
-                // '#name(...)': the '#' selects the macro when the name is
-                // shared with functions (section 7.3); this covers macro
-                // bodies, whose calls carry no checked targets
-                if (self.comptime_mode and inner.* == .call and inner.call.callee.* == .path and inner.call.callee.path.len == 1) {
-                    const name = inner.call.callee.path[0].slice(self.source());
-                    if (try self.macroNameCall(name, inner.call)) |value| return value;
-                }
-                return self.evalExpression(inner);
-            },
+            .comptime_expr => return self.evalComptimeExpr(expression),
             .unary => return self.evalUnary(expression),
             .binary => return self.evalBinary(expression),
             .cast => return self.evalCast(expression),
@@ -635,114 +652,144 @@ pub const Interpreter = struct {
                 // reference field yields a copy of the pointee
                 return self.deepCopy((try self.pierceCell(place)).*);
             },
-            .index => |index| {
-                if (try self.evalPlace(expression)) |place| {
-                    return self.deepCopy((try self.pierceCell(place)).*);
-                }
-                // a temporary subject (a call result) indexes by value
-                const subject = try self.evalExpression(index.object);
-                const instance = switch (subject) {
-                    .array => |instance| instance,
-                    .slice => |instance| instance,
-                    .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
-                    else => return self.fault("cannot read this element", .{}),
-                };
-                const subscript = try self.integerOf(try self.evalExpression(index.subscript));
-                if (subscript < 0 or subscript >= instance.elements.len) {
-                    return self.fault("index {d} out of bounds for length {d}", .{ subscript, instance.elements.len });
-                }
-                return self.deepCopy(instance.elements[@intCast(subscript)]);
-            },
-            .subslice => |subslice| {
-                // 'arr[start..end]' borrows a slice aliasing the subject's
-                // element range in place (section 4.2)
-                var subject: Value = undefined;
-                if (try self.evalPlace(subslice.object)) |place| {
-                    subject = (try self.pierceCell(place)).*;
-                } else {
-                    subject = try self.evalExpression(subslice.object);
-                }
-                const instance = switch (subject) {
-                    .array => |instance| instance,
-                    .slice => |instance| instance,
-                    .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
-                    else => return self.fault("cannot subslice this value", .{}),
-                };
-                const start: i128 = if (subslice.start) |start_expression|
-                    try self.integerOf(try self.evalExpression(start_expression))
-                else
-                    0;
-                const end = try self.integerOf(try self.evalExpression(subslice.end));
-                if (start < 0 or end < start or end > instance.elements.len) {
-                    return self.fault("subslice {d}..{d} out of bounds for length {d}", .{ start, end, instance.elements.len });
-                }
-                const view = try self.arena.create(Value.ArrayInstance);
-                view.* = .{ .elements = instance.elements[@intCast(start)..@intCast(end)] };
-                return .{ .slice = view };
-            },
-            .struct_init => |struct_init| {
-                const fields = try self.arena.alloc(Value.Field, struct_init.members.len);
-                for (struct_init.members, fields) |member, *field| {
-                    field.* = .{
-                        .name = member.name.slice(self.source()),
-                        .value = try self.evalExpression(member.value),
-                    };
-                }
-                const recorded = self.expression_types.get(expression);
-                var type_name: []const u8 = "";
-                var identity: ?types.TypeIdentity = null;
-                if (recorded) |result_type| {
-                    const resolved = self.resolveTypeParameter(result_type);
-                    if (resolved.* == .declared) {
-                        type_name = resolved.declared.name;
-                        identity = .{
-                            .definition = resolved.declared.definition,
-                            .view_index = resolved.declared.view_index,
-                        };
-                    }
-                }
-                const instance = try self.arena.create(Value.StructInstance);
-                instance.* = .{ .fields = fields, .type_name = type_name, .identity = identity };
-                return .{ .struct_value = instance };
-            },
-            .array_literal => |elements| {
-                const values = try self.arena.alloc(Value, elements.len);
-                for (elements, values) |element, *slot| {
-                    slot.* = try self.evalExpression(element);
-                }
-                const instance = try self.arena.create(Value.ArrayInstance);
-                instance.* = .{ .elements = values };
-                // '[]' in slice position is the canonical empty view
-                // (section 4.2), not a fixed array
-                if (elements.len == 0) {
-                    if (self.expression_types.get(expression)) |recorded| {
-                        if (recorded.* == .slice) return .{ .slice = instance };
-                    }
-                }
-                return .{ .array = instance };
-            },
+            .index => return self.evalIndex(expression),
+            .subslice => return self.evalSubslice(expression),
+            .struct_init => return self.evalStructInit(expression),
+            .array_literal => return self.evalArrayLiteral(expression),
             .array_fill => |array_fill| {
                 const value = try self.evalExpression(array_fill.value);
                 const count = try self.integerOf(try self.evalExpression(array_fill.count));
                 return .{ .array = try self.filledArray(value, count) };
             },
-            .array_range => |array_range| {
-                const bounds = try self.rangeBounds(array_range);
-                const length: usize = @intCast(bounds.end - bounds.start);
-                const values = try self.arena.alloc(Value, length);
-                for (values, 0..) |*slot, offset| {
-                    slot.* = .{ .integer = .{ .value = bounds.start + @as(i128, @intCast(offset)), .primitive = .i32 } };
-                }
-                const instance = try self.arena.create(Value.ArrayInstance);
-                instance.* = .{ .elements = values };
-                return .{ .array = instance };
-            },
+            .array_range => return self.evalArrayRange(expression),
             .if_expr => |if_expr| return self.evalIf(if_expr, true),
             .while_expr => |while_expr| return self.evalWhile(while_expr, true),
             .for_expr => |for_expr| return self.evalFor(for_expr, true),
             .match_expr => |match_expr| return self.evalMatch(match_expr, true),
             .lambda => |*lambda| return self.makeClosure(lambda),
         }
+    }
+
+    fn evalComptimeExpr(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const inner = expression.comptime_expr;
+        // substituted by compile-time evaluation (section 7.1); the
+        // fallback covers '#' nodes inside other comptime evaluations
+        if (self.comptime_values.get(expression)) |value| return self.deepCopy(value);
+        // '#name(...)': the '#' selects the macro when the name is
+        // shared with functions (section 7.3); this covers macro
+        // bodies, whose calls carry no checked targets
+        if (self.comptime_mode and inner.* == .call and inner.call.callee.* == .path and inner.call.callee.path.len == 1) {
+            const name = inner.call.callee.path[0].slice(self.source());
+            if (try self.macroNameCall(name, inner.call)) |value| return value;
+        }
+        return self.evalExpression(inner);
+    }
+
+    fn evalIndex(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const index = expression.index;
+        if (try self.evalPlace(expression)) |place| {
+            return self.deepCopy((try self.pierceCell(place)).*);
+        }
+        // a temporary subject (a call result) indexes by value
+        const subject = try self.evalExpression(index.object);
+        const instance = switch (subject) {
+            .array => |instance| instance,
+            .slice => |instance| instance,
+            .heap_array => |instance| instance orelse return self.fault(moved_from_array, .{}),
+            else => return self.fault("cannot read this element", .{}),
+        };
+        const subscript = try self.integerOf(try self.evalExpression(index.subscript));
+        if (subscript < 0 or subscript >= instance.elements.len) {
+            return self.fault("index {d} out of bounds for length {d}", .{ subscript, instance.elements.len });
+        }
+        return self.deepCopy(instance.elements[@intCast(subscript)]);
+    }
+
+    fn evalSubslice(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const subslice = expression.subslice;
+        // 'arr[start..end]' borrows a slice aliasing the subject's
+        // element range in place (section 4.2)
+        var subject: Value = undefined;
+        if (try self.evalPlace(subslice.object)) |place| {
+            subject = (try self.pierceCell(place)).*;
+        } else {
+            subject = try self.evalExpression(subslice.object);
+        }
+        const instance = switch (subject) {
+            .array => |instance| instance,
+            .slice => |instance| instance,
+            .heap_array => |instance| instance orelse return self.fault(moved_from_array, .{}),
+            else => return self.fault("cannot subslice this value", .{}),
+        };
+        const start: i128 = if (subslice.start) |start_expression|
+            try self.integerOf(try self.evalExpression(start_expression))
+        else
+            0;
+        const end = try self.integerOf(try self.evalExpression(subslice.end));
+        if (start < 0 or end < start or end > instance.elements.len) {
+            return self.fault("subslice {d}..{d} out of bounds for length {d}", .{ start, end, instance.elements.len });
+        }
+        const view = try self.arena.create(Value.ArrayInstance);
+        view.* = .{ .elements = instance.elements[@intCast(start)..@intCast(end)] };
+        return .{ .slice = view };
+    }
+
+    fn evalStructInit(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const struct_init = expression.struct_init;
+        const fields = try self.arena.alloc(Value.Field, struct_init.members.len);
+        for (struct_init.members, fields) |member, *field| {
+            field.* = .{
+                .name = member.name.slice(self.source()),
+                .value = try self.evalExpression(member.value),
+            };
+        }
+        const recorded = self.expression_types.get(expression);
+        var type_name: []const u8 = "";
+        var identity: ?types.TypeIdentity = null;
+        if (recorded) |result_type| {
+            const resolved = self.resolveTypeParameter(result_type);
+            if (resolved.* == .declared) {
+                type_name = resolved.declared.name;
+                identity = .{
+                    .definition = resolved.declared.definition,
+                    .view_index = resolved.declared.view_index,
+                };
+            }
+        }
+        const instance = try self.arena.create(Value.StructInstance);
+        instance.* = .{ .fields = fields, .type_name = type_name, .identity = identity };
+        return .{ .struct_value = instance };
+    }
+
+    fn evalArrayLiteral(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const elements = expression.array_literal;
+        const values = try self.arena.alloc(Value, elements.len);
+        for (elements, values) |element, *slot| {
+            slot.* = try self.evalExpression(element);
+        }
+        const instance = try self.arena.create(Value.ArrayInstance);
+        instance.* = .{ .elements = values };
+        // '[]' in slice position is the canonical empty view
+        // (section 4.2), not a fixed array
+        if (elements.len == 0) {
+            if (self.expression_types.get(expression)) |recorded| {
+                if (recorded.* == .slice) return .{ .slice = instance };
+            }
+        }
+        return .{ .array = instance };
+    }
+
+    fn evalArrayRange(self: *Interpreter, expression: *const ast.Expression) Error!Value {
+        const array_range = expression.array_range;
+        const bounds = try self.rangeBounds(array_range);
+        const length: usize = @intCast(bounds.end - bounds.start);
+        const values = try self.arena.alloc(Value, length);
+        for (values, 0..) |*slot, offset| {
+            slot.* = .{ .integer = .{ .value = bounds.start + @as(i128, @intCast(offset)), .primitive = .i32 } };
+        }
+        const instance = try self.arena.create(Value.ArrayInstance);
+        instance.* = .{ .elements = values };
+        return .{ .array = instance };
     }
 
     fn integerLiteral(self: *Interpreter, expression: *const ast.Expression, token: Token) Error!Value {
@@ -847,7 +894,7 @@ pub const Interpreter = struct {
         for (lambda.captures, environment) |capture, *entry| {
             const name = capture.name.slice(self.source());
             const outer = self.lookup(name) orelse return self.fault("unknown capture '{s}'", .{name});
-            const mode = captureMode(capture);
+            const mode = capture.mode();
             entry.* = .{ .name = name, .cell = outer, .mode = mode };
             switch (mode) {
                 .reference => {},
@@ -922,12 +969,11 @@ pub const Interpreter = struct {
                 // '&' on something already behind a reference borrows the
                 // pointee, not the reference cell: '&x' on a reference
                 // binding is the same borrow (section 5.2)
-                var cell = place;
-                while (cell.* == .reference) cell = cell.reference;
+                const cell = innermostCell(place);
                 // borrowing a heap array yields a slice aliasing its
                 // elements in place (section 5.2)
                 if (cell.* == .heap_array) {
-                    const instance = cell.heap_array orelse return self.fault("use of a moved-from array", .{});
+                    const instance = cell.heap_array orelse return self.fault(moved_from_array, .{});
                     return .{ .slice = instance };
                 }
                 // re-borrowing a place already holding a slice yields the
@@ -1017,14 +1063,17 @@ pub const Interpreter = struct {
         const primitive = result_primitive orelse left.primitive orelse right.primitive;
         const a = left.value;
         const b = right.value;
+        // a shift amount must fit the operand's width, as in native code
+        // (section 5.2)
+        const shift_limit: i128 = if (primitive) |bound| @as(i128, bound.width()) * 8 else 64;
         const arithmetic: ?i128 = switch (operator) {
             .plus => a + b,
             .minus => a - b,
             .asterisk => a * b,
             .slash => if (b == 0) return self.fault("division by zero", .{}) else @divTrunc(a, b),
             .percent => if (b == 0) return self.fault("division by zero", .{}) else @rem(a, b),
-            .shift_left => if (b < 0 or b > 63) return self.fault("shift amount out of range", .{}) else a << @intCast(b),
-            .shift_right => if (b < 0 or b > 63) return self.fault("shift amount out of range", .{}) else a >> @intCast(b),
+            .shift_left => if (b < 0 or b >= shift_limit) return self.fault("shift amount out of range (section 5.2)", .{}) else a << @intCast(b),
+            .shift_right => if (b < 0 or b >= shift_limit) return self.fault("shift amount out of range (section 5.2)", .{}) else a >> @intCast(b),
             .ampersand => a & b,
             .pipe => a | b,
             .caret => a ^ b,
@@ -1084,131 +1133,137 @@ pub const Interpreter = struct {
 
     fn evalCast(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         const cast = expression.cast;
-        switch (cast.operator.tag) {
-            .keyword_to => {
-                var operand = try self.evalExpression(cast.operand);
-                // pointee transparency: a reference operand converts its
-                // pointee (section 4.5)
-                while (operand == .reference) operand = operand.reference.*;
-                // integer 'to' enum: the value names the variant by tag,
-                // from the recorded shape; a tag outside the enum or one
-                // naming a payload-carrying variant faults (section 4.5)
-                if (operand == .integer) {
-                    if (self.cast_shapes.get(expression)) |shapes| {
-                        if (shapes.target.* == .tagged) {
-                            const tagged = shapes.target.tagged;
-                            const index = operand.integer.value;
-                            if (index < 0 or index >= tagged.variants.len) {
-                                return self.fault("the value {d} names no variant of the target enum (section 4.5)", .{index});
-                            }
-                            const variant = tagged.variants[@intCast(index)];
-                            if (variant.payload != null) {
-                                return self.fault("the value {d} names variant '{s}', which carries a payload 'to' cannot build (section 4.5)", .{ index, variant.name });
-                            }
-                            const fresh = try self.arena.create(Value.EnumInstance);
-                            fresh.* = .{ .variant = variant.name, .payload = null };
-                            return .{ .enum_value = fresh };
-                        }
-                    }
-                }
-                const target = self.primitiveOf(expression) orelse return self.fault("'to' target is not a primitive", .{});
-                // 'to' on an enum gives its tag: the variant's declaration
-                // index, read from the recorded shape (section 4.5)
-                if (operand == .enum_value) {
-                    const shapes = self.cast_shapes.get(expression) orelse return self.fault("'to' on this enum has no recorded variant order", .{});
-                    if (shapes.source.* != .tagged) return self.fault("'to' on this enum has no recorded variant order", .{});
-                    const instance = operand.enum_value;
-                    const index = for (shapes.source.tagged.variants, 0..) |variant, position| {
-                        if (std.mem.eql(u8, variant.name, instance.variant)) break @as(i128, @intCast(position));
-                    } else return self.fault("'{s}' names no variant here", .{instance.variant});
-                    if (target.isFloat()) return .{ .float = .{ .value = @floatFromInt(index), .primitive = target } };
-                    if (index < minimumOf(target) or index > maximumOf(target)) {
-                        return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ index, @tagName(target) });
-                    }
-                    return .{ .integer = .{ .value = index, .primitive = target } };
-                }
-                if (target.isFloat()) {
-                    const value = switch (operand) {
-                        .integer => |integer| @as(f64, @floatFromInt(integer.value)),
-                        .float => |float| float.value,
-                        else => return self.fault("'to' needs a numeric operand", .{}),
-                    };
-                    return .{ .float = .{ .value = value, .primitive = target } };
-                }
-                // 'to' keeps the value: a float loses only its fractional
-                // part, and a value the target cannot represent is a fault
-                // (section 4.5)
-                const wide: i128 = switch (operand) {
-                    .integer => |integer| integer.value,
-                    .float => |float| whole: {
-                        if (std.math.isNan(float.value) or
-                            float.value < @as(f64, @floatFromInt(minimumOf(target))) - 1.0 or
-                            float.value > @as(f64, @floatFromInt(maximumOf(target))) + 1.0)
-                        {
-                            return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ float.value, @tagName(target) });
-                        }
-                        break :whole @intFromFloat(float.value);
-                    },
-                    else => return self.fault("'to' needs a numeric operand", .{}),
-                };
-                if (wide < minimumOf(target) or wide > maximumOf(target)) {
-                    return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ wide, @tagName(target) });
-                }
-                return .{ .integer = .{ .value = wide, .primitive = target } };
-            },
-            .keyword_is => {
-                if (cast.capture) |capture| {
-                    return .{ .bool_value = try self.evalIsWithCapture(expression, cast, capture) };
-                }
-                const operand = try self.evalExpression(cast.operand);
-                const target_token = cast.target.named.path[cast.target.named.path.len - 1];
-                const target_name = target_token.slice(self.source());
-                return switch (operand) {
-                    .enum_value => |instance| .{ .bool_value = std.mem.eql(u8, instance.variant, target_name) },
-                    // an interface object's concrete-type test compares the
-                    // checker-resolved identity (section 4.2)
-                    .struct_value => |instance| verdict: {
-                        if (self.type_targets.get(expression)) |target| {
-                            const identity = instance.identity orelse break :verdict .{ .bool_value = false };
-                            break :verdict .{ .bool_value = identity.definition == target.definition };
-                        }
-                        break :verdict .{ .bool_value = std.mem.eql(u8, instance.type_name, target_name) };
-                    },
-                    else => self.fault("'is' needs an enum or interface-object subject", .{}),
-                };
-            },
-            .keyword_as => {
-                const operand = try self.evalExpression(cast.operand);
-                // a shaped cast reinterprets through a byte image (section
-                // 3.5); the checker records shapes for non-primitive sides
-                if (self.cast_shapes.get(expression)) |shapes| {
-                    return self.reinterpretShaped(operand, shapes);
-                }
-                if (self.primitiveOf(expression)) |target| return self.reinterpret(operand, target);
-                // inside a macro body nothing is recorded: an integer
-                // reinterpreted as a named enum picks the variant by tag,
-                // through reflection (section 4.5)
-                if (operand == .integer and cast.target.* == .named) {
-                    const path = cast.target.named.path;
-                    if (try self.reflectName(path[path.len - 1].slice(self.source()))) |described| {
-                        const description = described.type_value;
-                        if (description.kind == .enum_kind) {
-                            const tag = operand.integer.value;
-                            if (tag < 0 or tag >= description.members.items.len) {
-                                return self.fault("tag {d} names no variant of '{s}'", .{ tag, description.name });
-                            }
-                            const member = description.members.items[@intCast(tag)];
-                            if (member.description.kind != .other_kind) {
-                                return self.fault("'as' cannot build the payload-carrying variant '{s}' of '{s}'", .{ member.name, description.name });
-                            }
-                            return self.makeEnum(member.name, null);
-                        }
-                    }
-                }
-                return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});
-            },
-            else => return self.fault("unsupported cast", .{}),
+        return switch (cast.operator.tag) {
+            .keyword_to => self.evalToCast(expression, cast),
+            .keyword_is => self.evalIsCast(expression, cast),
+            .keyword_as => self.evalAsCast(expression, cast),
+            else => self.fault("unsupported cast", .{}),
+        };
+    }
+
+    // 'to' keeps the value in a different format (section 4.5): numbers
+    // convert with range faults, an enum gives its tag, and an integer
+    // names a payload-free variant by tag
+    fn evalToCast(self: *Interpreter, expression: *const ast.Expression, cast: anytype) Error!Value {
+        var operand = try self.evalExpression(cast.operand);
+        // pointee transparency: a reference operand converts its pointee
+        while (operand == .reference) operand = operand.reference.*;
+        if (operand == .integer) {
+            if (self.cast_shapes.get(expression)) |shapes| {
+                if (shapes.target.* == .tagged) return self.enumFromTag(operand.integer.value, shapes.target.tagged);
+            }
         }
+        const target = self.primitiveOf(expression) orelse return self.fault("'to' target is not a primitive", .{});
+        if (operand == .enum_value) {
+            const shapes = self.cast_shapes.get(expression) orelse return self.fault("'to' on this enum has no recorded variant order", .{});
+            if (shapes.source.* != .tagged) return self.fault("'to' on this enum has no recorded variant order", .{});
+            const position = variantPosition(shapes.source.tagged.variants, operand.enum_value.variant) orelse
+                return self.fault("'{s}' names no variant here", .{operand.enum_value.variant});
+            return self.numberFromTag(@intCast(position), target);
+        }
+        if (target.isFloat()) {
+            const value = switch (operand) {
+                .integer => |integer| @as(f64, @floatFromInt(integer.value)),
+                .float => |float| float.value,
+                else => return self.fault("'to' needs a numeric operand", .{}),
+            };
+            return .{ .float = .{ .value = value, .primitive = target } };
+        }
+        // a float loses only its fractional part, and a value the target
+        // cannot represent is a fault
+        const wide: i128 = switch (operand) {
+            .integer => |integer| integer.value,
+            .float => |float| whole: {
+                if (std.math.isNan(float.value) or
+                    float.value < @as(f64, @floatFromInt(minimumOf(target))) - 1.0 or
+                    float.value > @as(f64, @floatFromInt(maximumOf(target))) + 1.0)
+                {
+                    return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ float.value, @tagName(target) });
+                }
+                break :whole @intFromFloat(float.value);
+            },
+            else => return self.fault("'to' needs a numeric operand", .{}),
+        };
+        return self.numberFromTag(wide, target);
+    }
+
+    // integer 'to' enum: the value names the variant by tag, from the
+    // recorded shape; a tag outside the enum or one naming a
+    // payload-carrying variant faults (section 4.5)
+    fn enumFromTag(self: *Interpreter, index: i128, tagged: anytype) Error!Value {
+        if (index < 0 or index >= tagged.variants.len) {
+            return self.fault("the value {d} names no variant of the target enum (section 4.5)", .{index});
+        }
+        const variant = tagged.variants[@intCast(index)];
+        if (variant.payload != null) {
+            return self.fault("the value {d} names variant '{s}', which carries a payload 'to' cannot build (section 4.5)", .{ index, variant.name });
+        }
+        const fresh = try self.arena.create(Value.EnumInstance);
+        fresh.* = .{ .variant = variant.name, .payload = null };
+        return .{ .enum_value = fresh };
+    }
+
+    // a whole number as the target primitive: exact for floats, a range
+    // fault for integers it does not fit (section 4.5)
+    fn numberFromTag(self: *Interpreter, value: i128, target: types.Primitive) Error!Value {
+        if (target.isFloat()) return .{ .float = .{ .value = @floatFromInt(value), .primitive = target } };
+        if (value < minimumOf(target) or value > maximumOf(target)) {
+            return self.fault("'to' keeps the value: {d} does not fit {s} (section 4.5)", .{ value, @tagName(target) });
+        }
+        return .{ .integer = .{ .value = value, .primitive = target } };
+    }
+
+    fn evalIsCast(self: *Interpreter, expression: *const ast.Expression, cast: anytype) Error!Value {
+        if (cast.capture) |capture| {
+            return .{ .bool_value = try self.evalIsWithCapture(expression, cast, capture) };
+        }
+        const operand = try self.evalExpression(cast.operand);
+        const target_token = cast.target.named.path[cast.target.named.path.len - 1];
+        const target_name = target_token.slice(self.source());
+        return switch (operand) {
+            .enum_value => |instance| .{ .bool_value = std.mem.eql(u8, instance.variant, target_name) },
+            // an interface object's concrete-type test compares the
+            // checker-resolved identity (section 4.2)
+            .struct_value => |instance| verdict: {
+                if (self.type_targets.get(expression)) |target| {
+                    const identity = instance.identity orelse break :verdict .{ .bool_value = false };
+                    break :verdict .{ .bool_value = identity.definition == target.definition };
+                }
+                break :verdict .{ .bool_value = std.mem.eql(u8, instance.type_name, target_name) };
+            },
+            else => self.fault("'is' needs an enum or interface-object subject", .{}),
+        };
+    }
+
+    fn evalAsCast(self: *Interpreter, expression: *const ast.Expression, cast: anytype) Error!Value {
+        const operand = try self.evalExpression(cast.operand);
+        // a shaped cast reinterprets through a byte image (section 4.5);
+        // the checker records shapes for non-primitive sides
+        if (self.cast_shapes.get(expression)) |shapes| {
+            return self.reinterpretShaped(operand, shapes);
+        }
+        if (self.primitiveOf(expression)) |target| return self.reinterpret(operand, target);
+        // inside a macro body nothing is recorded: an integer reinterpreted
+        // as a named enum picks the variant by tag, through reflection
+        // (section 4.5)
+        if (operand == .integer and cast.target.* == .named) {
+            const path = cast.target.named.path;
+            if (try self.reflectName(path[path.len - 1].slice(self.source()))) |described| {
+                const description = described.type_value;
+                if (description.kind == .enum_kind) {
+                    const tag = operand.integer.value;
+                    if (tag < 0 or tag >= description.members.items.len) {
+                        return self.fault("tag {d} names no variant of '{s}'", .{ tag, description.name });
+                    }
+                    const member = description.members.items[@intCast(tag)];
+                    if (member.description.kind != .other_kind) {
+                        return self.fault("'as' cannot build the payload-carrying variant '{s}' of '{s}'", .{ member.name, description.name });
+                    }
+                    return self.makeEnum(member.name, null);
+                }
+            }
+        }
+        return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});
     }
 
     // 'as' reinterprets the bytes of same-width primitives (section 4.5)
@@ -1248,39 +1303,36 @@ pub const Interpreter = struct {
         switch (shape.*) {
             .primitive => |primitive| try self.serializePrimitive(value, primitive, bytes),
             .record => |record| {
-                if (value != .struct_value) return self.fault("'as' source value does not match its checked layout", .{});
+                if (value != .struct_value) return self.fault(layout_mismatch, .{});
                 for (record.fields) |field| {
                     const found = for (value.struct_value.fields) |candidate| {
                         if (std.mem.eql(u8, candidate.name, field.name)) break candidate.value;
-                    } else return self.fault("'as' source value does not match its checked layout", .{});
-                    try self.serializeValue(found, field.shape, bytes[@intCast(field.offset)..][0..@intCast(field.shape.byteSize())]);
+                    } else return self.fault(layout_mismatch, .{});
+                    try self.serializeValue(found, field.shape, subrange(bytes, field.offset, field.shape));
                 }
             },
             .array => |array| {
                 const instance = switch (value) {
                     .array => |instance| instance,
                     .slice => |instance| instance,
-                    else => return self.fault("'as' source value does not match its checked layout", .{}),
+                    else => return self.fault(layout_mismatch, .{}),
                 };
                 if (instance.elements.len != array.count) {
-                    return self.fault("'as' source value does not match its checked layout", .{});
+                    return self.fault(layout_mismatch, .{});
                 }
                 const stride: usize = @intCast(array.stride);
-                const element_size: usize = @intCast(array.element.byteSize());
                 for (instance.elements, 0..) |element, index| {
-                    try self.serializeValue(element, array.element, bytes[index * stride ..][0..element_size]);
+                    try self.serializeValue(element, array.element, subrange(bytes, index * stride, array.element));
                 }
             },
             .tagged => |tagged| {
-                if (value != .enum_value) return self.fault("'as' source value does not match its checked layout", .{});
+                if (value != .enum_value) return self.fault(layout_mismatch, .{});
                 const instance = value.enum_value;
-                const index = for (tagged.variants, 0..) |variant, position| {
-                    if (std.mem.eql(u8, variant.name, instance.variant)) break position;
-                } else return self.fault("'as' source value does not match its checked layout", .{});
+                const index = variantPosition(tagged.variants, instance.variant) orelse return self.fault(layout_mismatch, .{});
                 writeUnsigned(bytes[0..@intCast(tagged.tag_size)], index);
                 const payload_shape = tagged.variants[index].payload orelse return;
-                const payload = instance.payload orelse return self.fault("'as' source value does not match its checked layout", .{});
-                try self.serializeValue(payload, payload_shape, bytes[@intCast(tagged.payload_offset)..][0..@intCast(payload_shape.byteSize())]);
+                const payload = instance.payload orelse return self.fault(layout_mismatch, .{});
+                try self.serializeValue(payload, payload_shape, subrange(bytes, tagged.payload_offset, payload_shape));
             },
         }
     }
@@ -1288,11 +1340,11 @@ pub const Interpreter = struct {
     fn serializePrimitive(self: *Interpreter, value: Value, primitive: types.Primitive, bytes: []u8) Error!void {
         switch (primitive) {
             .bool => {
-                if (value != .bool_value) return self.fault("'as' source value does not match its checked layout", .{});
+                if (value != .bool_value) return self.fault(layout_mismatch, .{});
                 bytes[0] = @intFromBool(value.bool_value);
             },
             .f32, .f64 => {
-                if (value != .float) return self.fault("'as' source value does not match its checked layout", .{});
+                if (value != .float) return self.fault(layout_mismatch, .{});
                 if (primitive == .f32) {
                     std.mem.writeInt(u32, bytes[0..4], @bitCast(@as(f32, @floatCast(value.float.value))), .little);
                 } else {
@@ -1300,10 +1352,20 @@ pub const Interpreter = struct {
                 }
             },
             else => {
-                if (value != .integer) return self.fault("'as' source value does not match its checked layout", .{});
+                if (value != .integer) return self.fault(layout_mismatch, .{});
                 writeUnsigned(bytes, @truncate(@as(u128, @bitCast(value.integer.value))));
             },
         }
+    }
+
+    // the byte image of one component (a field, an element, a payload) at
+    // 'offset' within its container's image
+    fn subrange(bytes: []u8, offset: u64, shape: *const types.Shape) []u8 {
+        return bytes[@intCast(offset)..][0..@intCast(shape.byteSize())];
+    }
+
+    fn constSubrange(bytes: []const u8, offset: u64, shape: *const types.Shape) []const u8 {
+        return bytes[@intCast(offset)..][0..@intCast(shape.byteSize())];
     }
 
     fn writeUnsigned(bytes: []u8, value: u64) void {
@@ -1322,13 +1384,13 @@ pub const Interpreter = struct {
 
     fn deserializeValue(self: *Interpreter, shape: *const types.Shape, bytes: []const u8) Error!Value {
         switch (shape.*) {
-            .primitive => |primitive| return self.deserializePrimitive(primitive, bytes),
+            .primitive => |primitive| return deserializePrimitive(primitive, bytes),
             .record => |record| {
                 const fields = try self.arena.alloc(Value.Field, record.fields.len);
                 for (record.fields, fields) |field, *slot| {
                     slot.* = .{
                         .name = field.name,
-                        .value = try self.deserializeValue(field.shape, bytes[@intCast(field.offset)..][0..@intCast(field.shape.byteSize())]),
+                        .value = try self.deserializeValue(field.shape, constSubrange(bytes, field.offset, field.shape)),
                     };
                 }
                 const instance = try self.arena.create(Value.StructInstance);
@@ -1338,9 +1400,8 @@ pub const Interpreter = struct {
             .array => |array| {
                 const elements = try self.arena.alloc(Value, @intCast(array.count));
                 const stride: usize = @intCast(array.stride);
-                const element_size: usize = @intCast(array.element.byteSize());
                 for (elements, 0..) |*slot, index| {
-                    slot.* = try self.deserializeValue(array.element, bytes[index * stride ..][0..element_size]);
+                    slot.* = try self.deserializeValue(array.element, constSubrange(bytes, index * stride, array.element));
                 }
                 const instance = try self.arena.create(Value.ArrayInstance);
                 instance.* = .{ .elements = elements };
@@ -1354,7 +1415,7 @@ pub const Interpreter = struct {
                 const variant = tagged.variants[@intCast(index)];
                 var payload: ?Value = null;
                 if (variant.payload) |payload_shape| {
-                    payload = try self.deserializeValue(payload_shape, bytes[@intCast(tagged.payload_offset)..][0..@intCast(payload_shape.byteSize())]);
+                    payload = try self.deserializeValue(payload_shape, constSubrange(bytes, tagged.payload_offset, payload_shape));
                 }
                 const instance = try self.arena.create(Value.EnumInstance);
                 instance.* = .{ .variant = variant.name, .payload = payload };
@@ -1363,8 +1424,7 @@ pub const Interpreter = struct {
         }
     }
 
-    fn deserializePrimitive(self: *Interpreter, primitive: types.Primitive, bytes: []const u8) Error!Value {
-        _ = self;
+    fn deserializePrimitive(primitive: types.Primitive, bytes: []const u8) Value {
         switch (primitive) {
             .bool => return .{ .bool_value = bytes[0] != 0 },
             .f32 => return .{ .float = .{ .value = @as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], .little))), .primitive = primitive } },
@@ -1406,7 +1466,7 @@ pub const Interpreter = struct {
                 const instance = switch (pierced.*) {
                     .array => |instance| instance,
                     .slice => |instance| instance,
-                    .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+                    .heap_array => |instance| instance orelse return self.fault(moved_from_array, .{}),
                     else => return null,
                 };
                 const subscript = try self.integerOf(try self.evalExpression(index.subscript));
@@ -1492,7 +1552,7 @@ pub const Interpreter = struct {
             },
             .fn_def => |fn_def| {
                 // std::process::arguments is compiler-provided (section
-                // 5.1a): the host argv materializes as a slice of slices
+                // 6.1a): the host argv materializes as a slice of slices
                 if (self.processArgumentsLangItem(symbol)) {
                     return self.processArgumentsValue();
                 }
@@ -1523,7 +1583,7 @@ pub const Interpreter = struct {
             const length: ?usize = switch (receiver) {
                 .array => |instance| instance.elements.len,
                 .slice => |instance| instance.elements.len,
-                .heap_array => |instance| if (instance) |alive| alive.elements.len else return self.fault("use of a moved-from array", .{}),
+                .heap_array => |instance| if (instance) |alive| alive.elements.len else return self.fault(moved_from_array, .{}),
                 else => null,
             };
             if (length) |value| return .{ .integer = .{ .value = @intCast(value), .primitive = .u64 } };
@@ -1546,7 +1606,7 @@ pub const Interpreter = struct {
                     }
                 }
                 // a function-typed field calls through its value (section
-                // 4.4) when no extension implements the name
+                // 5.4) when no extension implements the name
                 for (pierced.struct_value.fields) |*field| {
                     if (!std.mem.eql(u8, field.name, name)) continue;
                     switch (field.value) {
@@ -1649,19 +1709,13 @@ pub const Interpreter = struct {
             }
             return self.fault("no member '{s}' to remove (section 4.4)", .{member_name});
         }
-        if (std.mem.eql(u8, name, "member_names")) {
+        // 'member_names' and 'member_types' list the same members, one as
+        // names and the other as descriptions
+        const wants_names = std.mem.eql(u8, name, "member_names");
+        if (wants_names or std.mem.eql(u8, name, "member_types")) {
             const values = try self.arena.alloc(Value, description.members.items.len);
             for (description.members.items, values) |member, *slot| {
-                slot.* = try self.bytesValue(member.name);
-            }
-            const instance = try self.arena.create(Value.ArrayInstance);
-            instance.* = .{ .elements = values };
-            return .{ .slice = instance };
-        }
-        if (std.mem.eql(u8, name, "member_types")) {
-            const values = try self.arena.alloc(Value, description.members.items.len);
-            for (description.members.items, values) |member, *slot| {
-                slot.* = .{ .type_value = member.description };
+                slot.* = if (wants_names) try self.bytesValue(member.name) else .{ .type_value = member.description };
             }
             const instance = try self.arena.create(Value.ArrayInstance);
             instance.* = .{ .elements = values };
@@ -1774,14 +1828,69 @@ pub const Interpreter = struct {
         };
     }
 
+    // the prologue every call shares (functions, macros, closures): the
+    // depth guard, the comptime call-chain entry, the switch to the
+    // callee's view, and the barrier frame; 'leave' undoes them in reverse
+    // order, so a call defers it right after entering. The two halves are
+    // separable: a macro evaluates its arguments after 'enterChain' (a
+    // fault there reports the macro in the chain) but before 'enterBody'
+    // (in the caller's view, outside the barrier frame)
+    const CallGuard = struct {
+        // the caller's view, once enterBody has switched away from it
+        saved_view: ?usize = null,
+
+        fn enter(self: *Interpreter, name: []const u8, view_index: usize) Error!CallGuard {
+            var guard = try enterChain(self, name);
+            errdefer guard.leave(self);
+            try guard.enterBody(self, view_index);
+            return guard;
+        }
+
+        fn enterChain(self: *Interpreter, name: []const u8) Error!CallGuard {
+            if (self.call_depth >= 1024) return self.fault(stack_exhausted, .{});
+            self.call_depth += 1;
+            errdefer self.call_depth -= 1;
+            try self.pushComptimeName(name);
+            return .{};
+        }
+
+        fn enterBody(guard: *CallGuard, self: *Interpreter, view_index: usize) Error!void {
+            const saved_view = self.current_view;
+            self.current_view = view_index;
+            errdefer self.current_view = saved_view;
+            try self.pushFrame(true);
+            guard.saved_view = saved_view;
+        }
+
+        fn leave(guard: CallGuard, self: *Interpreter) void {
+            if (guard.saved_view) |saved_view| {
+                self.popFrame();
+                self.current_view = saved_view;
+            }
+            self.popComptimeName();
+            self.call_depth -= 1;
+        }
+    };
+
+    // the epilogue every call shares: a 'return' raised inside a
+    // value-yielding construct lands here on the error channel with its
+    // pending value; otherwise the body's flow gives the result
+    fn finishCall(self: *Interpreter, result: Error!Flow) Error!Value {
+        const flow = result catch |err| switch (err) {
+            error.Return => return self.pending_return orelse .void_value,
+            else => return err,
+        };
+        return switch (flow) {
+            .return_value => |value| value,
+            else => .void_value,
+        };
+    }
+
     fn callFunction(self: *Interpreter, symbol: resolution.Symbol, arguments: []const Value, type_bindings: []const Type.Binding) Error!Value {
         if (symbol.definition.kind != .fn_def) return self.fault("this callee is not callable", .{});
         const fn_def = symbol.definition.kind.fn_def;
-        if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
-        self.call_depth += 1;
-        defer self.call_depth -= 1;
-        try self.pushComptimeName(fn_def.name.slice(self.views[symbol.view_index].source));
-        defer self.popComptimeName();
+        // the debug frame records the scope floor before the call's own
+        // barrier frame goes up
         if (self.debug_hook != null) {
             try self.debug_stack.append(self.arena, .{
                 .name = fn_def.name.slice(self.views[symbol.view_index].source),
@@ -1793,31 +1902,19 @@ pub const Interpreter = struct {
         defer if (self.debug_hook != null) {
             _ = self.debug_stack.pop();
         };
-
-        const saved_view = self.current_view;
-        self.current_view = symbol.view_index;
-        defer self.current_view = saved_view;
+        const guard = try CallGuard.enter(self, fn_def.name.slice(self.views[symbol.view_index].source), symbol.view_index);
+        defer guard.leave(self);
 
         const saved_bindings = self.current_type_bindings;
         self.current_type_bindings = type_bindings;
         defer self.current_type_bindings = saved_bindings;
 
-        try self.pushFrame(true);
-        defer self.popFrame();
         const view_source = self.views[symbol.view_index].source;
         for (fn_def.function.parameters, 0..) |parameter, index| {
             const value: Value = if (index < arguments.len) arguments[index] else .void_value;
             try self.bind(parameter.name.slice(view_source), value);
         }
-        const flow = self.execStatement(fn_def.function.body) catch |err| switch (err) {
-            // a 'return' raised inside a value-yielding construct lands here
-            error.Return => return self.pending_return orelse .void_value,
-            else => return err,
-        };
-        return switch (flow) {
-            .return_value => |value| value,
-            else => .void_value,
-        };
+        return self.finishCall(self.execStatement(fn_def.function.body));
     }
 
     // the built-in macros (section 7.4)
@@ -1896,9 +1993,9 @@ pub const Interpreter = struct {
     }
 
     // compile-time name resolution for macro bodies, which carry no checked
-    // call targets: functions match by name and arity first — a bare call
-    // never means a macro sharing the name (section 7.3, '#name' does) —
-    // with the macro as the fallback
+    // call targets: a bare call matches functions by name and arity first
+    // and falls back to a macro sharing the name; '#name' selects the
+    // macro outright (section 7.3)
     fn comptimeNameCall(self: *Interpreter, name: []const u8, call: anytype) Error!?Value {
         const symbols = self.globals.get(name) orelse return null;
         for (symbols.items) |symbol| {
@@ -1939,33 +2036,18 @@ pub const Interpreter = struct {
             return (try self.builtinMacroCall(name, call)) orelse
                 self.fault("macro '{s}' is declared but not implemented (section 7.4)", .{name});
         }
-        if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
-        self.call_depth += 1;
-        defer self.call_depth -= 1;
-        try self.pushComptimeName(macro_def.name.slice(self.views[symbol.view_index].source));
-        defer self.popComptimeName();
+        var guard = try CallGuard.enterChain(self, macro_def.name.slice(self.views[symbol.view_index].source));
+        defer guard.leave(self);
 
         // arguments evaluate in the caller's view, the body in its own
         const arguments = try self.evalArguments(call.arguments);
-        const saved_view = self.current_view;
-        self.current_view = symbol.view_index;
-        defer self.current_view = saved_view;
-
-        try self.pushFrame(true);
-        defer self.popFrame();
+        try guard.enterBody(self, symbol.view_index);
         const view_source = self.views[symbol.view_index].source;
         for (macro_def.parameters, 0..) |parameter, index| {
             const value: Value = if (index < arguments.len) arguments[index] else .void_value;
             try self.bind(parameter.name.slice(view_source), value);
         }
-        const flow = self.execStatement(macro_def.body.?) catch |err| switch (err) {
-            error.Return => return self.pending_return orelse .void_value,
-            else => return err,
-        };
-        return switch (flow) {
-            .return_value => |value| value,
-            else => .void_value,
-        };
+        return self.finishCall(self.execStatement(macro_def.body.?));
     }
 
     // calls an extension on a value cell, shaping the self argument to the
@@ -1981,22 +2063,13 @@ pub const Interpreter = struct {
     }
 
     fn callClosure(self: *Interpreter, instance: *Value.Closure, arguments: []const Value) Error!Value {
-        if (self.call_depth >= 1024) return self.fault("call stack exhausted (1024 frames)", .{});
-        self.call_depth += 1;
-        defer self.call_depth -= 1;
-        try self.pushComptimeName("|lambda|");
-        defer self.popComptimeName();
-
-        const saved_view = self.current_view;
-        self.current_view = instance.view_index;
-        defer self.current_view = saved_view;
+        const guard = try CallGuard.enter(self, "|lambda|", instance.view_index);
+        defer guard.leave(self);
 
         const saved_bindings = self.current_type_bindings;
         self.current_type_bindings = instance.type_bindings;
         defer self.current_type_bindings = saved_bindings;
 
-        try self.pushFrame(true);
-        defer self.popFrame();
         // captured cells first, then parameters (which may shadow them)
         for (instance.environment) |entry| {
             try self.bindCell(entry.name, entry.cell);
@@ -2006,14 +2079,7 @@ pub const Interpreter = struct {
             const value: Value = if (index < arguments.len) arguments[index] else .void_value;
             try self.bind(parameter.name.slice(view_source), value);
         }
-        const flow = self.execStatement(instance.lambda.function.body) catch |err| switch (err) {
-            error.Return => return self.pending_return orelse .void_value,
-            else => return err,
-        };
-        return switch (flow) {
-            .return_value => |value| value,
-            else => .void_value,
-        };
+        return self.finishCall(self.execStatement(instance.lambda.function.body));
     }
 
     // the std::process::arguments lang item (section 6.1a), recognized by
@@ -2133,7 +2199,7 @@ pub const Interpreter = struct {
         const instance = switch (arguments[0]) {
             .slice => |instance| instance,
             .array => |instance| instance,
-            .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+            .heap_array => |instance| instance orelse return self.fault(moved_from_array, .{}),
             else => return self.fault("fread needs a byte buffer", .{}),
         };
         const size = try self.integerOf(arguments[1]);
@@ -2206,41 +2272,106 @@ pub const Interpreter = struct {
                 continue;
             }
             index += 1;
-            const specifier = format[index];
-            if (specifier == '%') {
+            if (format[index] == '%') {
                 try self.output.writeByte('%');
                 continue;
             }
-            const argument: Value = if (argument_index < arguments.len) arguments[argument_index] else .void_value;
-            argument_index += 1;
+            // '%[flags][width][.precision][length]conversion': the C subset
+            // the native printf honors, so both engines print alike
+            var left_align = false;
+            var zero_pad = false;
+            while (index < format.len) : (index += 1) {
+                switch (format[index]) {
+                    '-' => left_align = true,
+                    '0' => zero_pad = true,
+                    '+', ' ', '#' => {},
+                    else => break,
+                }
+            }
+            var width: usize = 0;
+            if (index < format.len and format[index] == '*') {
+                width = @intCast(@max(0, try self.integerOf(nextPrintfArgument(arguments, &argument_index))));
+                index += 1;
+            } else while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {
+                width = width * 10 + (format[index] - '0');
+            }
+            var precision: ?usize = null;
+            if (index < format.len and format[index] == '.') {
+                index += 1;
+                if (index < format.len and format[index] == '*') {
+                    precision = @intCast(@max(0, try self.integerOf(nextPrintfArgument(arguments, &argument_index))));
+                    index += 1;
+                } else {
+                    var digits: usize = 0;
+                    while (index < format.len and std.ascii.isDigit(format[index])) : (index += 1) {
+                        digits = digits * 10 + (format[index] - '0');
+                    }
+                    precision = digits;
+                }
+            }
+            while (index < format.len) : (index += 1) {
+                switch (format[index]) {
+                    'l', 'h', 'z', 'j', 't' => {},
+                    else => break,
+                }
+            }
+            if (index >= format.len) return self.fault("printf format ends inside a specifier", .{});
+            const specifier = format[index];
+            const argument = nextPrintfArgument(arguments, &argument_index);
+            var text: std.Io.Writer.Allocating = .init(self.arena);
+            defer text.deinit();
+            var numeric = false;
             switch (specifier) {
                 'd', 'i', 'u' => {
-                    const value = try self.integerOf(argument);
-                    try self.output.print("{d}", .{value});
+                    numeric = true;
+                    try text.writer.print("{d}", .{try self.integerOf(argument)});
+                },
+                'x', 'X', 'o' => {
+                    numeric = true;
+                    const bits: u64 = @truncate(@as(u128, @bitCast(try self.integerOf(argument))));
+                    switch (specifier) {
+                        'x' => try text.writer.print("{x}", .{bits}),
+                        'X' => try text.writer.print("{X}", .{bits}),
+                        else => try text.writer.print("{o}", .{bits}),
+                    }
                 },
                 'f' => {
-                    const value = try self.floatOf(argument);
-                    try self.output.print("{d:.6}", .{value});
+                    numeric = true;
+                    try text.writer.print("{[value]d:.[precision]}", .{ .value = try self.floatOf(argument), .precision = precision orelse 6 });
                 },
                 'c' => {
                     const value = try self.integerOf(argument);
-                    try self.output.writeByte(@intCast(@as(u8, @truncate(@as(u128, @bitCast(value))))));
+                    try text.writer.writeByte(@as(u8, @truncate(@as(u128, @bitCast(value)))));
                 },
                 's' => {
                     const bytes = try self.byteSlice(argument);
-                    try self.output.writeAll(bytes);
+                    const shown = if (precision) |limit| bytes[0..@min(limit, bytes.len)] else bytes;
+                    try text.writer.writeAll(shown);
                 },
                 else => return self.fault("printf specifier '%{c}' is not supported", .{specifier}),
             }
+            const rendered = text.writer.buffered();
+            const padding = if (width > rendered.len) width - rendered.len else 0;
+            if (!left_align) {
+                try self.output.splatByteAll(if (zero_pad and numeric) '0' else ' ', padding);
+            }
+            try self.output.writeAll(rendered);
+            if (left_align) try self.output.splatByteAll(' ', padding);
         }
         return .{ .integer = .{ .value = @intCast(format.len), .primitive = .i32 } };
+    }
+
+    fn nextPrintfArgument(arguments: []const Value, argument_index: *usize) Value {
+        const argument: Value = if (argument_index.* < arguments.len) arguments[argument_index.*] else .void_value;
+        argument_index.* += 1;
+        return argument;
     }
 
     fn byteSlice(self: *Interpreter, value: Value) Error![]const u8 {
         const instance = switch (value) {
             .slice => |instance| instance,
             .array => |instance| instance,
-            .heap_array => |instance| instance orelse return self.fault("use of a moved-from array", .{}),
+            .heap_array => |instance| instance orelse return self.fault(moved_from_array, .{}),
             else => return self.fault("expected a byte array", .{}),
         };
         const bytes = try self.arena.alloc(u8, instance.elements.len);
@@ -2253,15 +2384,10 @@ pub const Interpreter = struct {
     // a statement-position if passes 'yield' through to the enclosing
     // value construct; only a value-position if consumes it (section 5.3)
     fn evalIf(self: *Interpreter, if_expr: ast.IfExpression, as_value: bool) Error!Value {
-        // 'return', 'break', and 'yield' unwind on the error channel and
-        // skip the in-line popFrame calls below: this guard drops whatever
-        // frames this construct still holds on ANY exit (the fix for the
-        // leaked-frame corruption where a caller's bindings vanish behind
-        // a stale barrier)
+        // an early return, break, or yield unwinding on the error channel
+        // must not leave this construct's frames behind
         const frame_floor = self.scopes.items.len;
-        defer while (self.scopes.items.len > frame_floor) {
-            _ = self.scopes.pop();
-        };
+        defer self.unwindFrames(frame_floor);
         // the frame spans condition and then-branch: inline 'is' captures
         // bind during the condition (section 4.2)
         try self.pushFrame(false);
@@ -2270,27 +2396,42 @@ pub const Interpreter = struct {
         if (taken) {
             const flow = if (as_value) try self.execValueBranch(if_expr.then_branch) else try self.execStatement(if_expr.then_branch);
             self.popFrame();
-            switch (flow) {
-                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
-                .break_value => return self.flowBreak(flow),
-                .continue_flow => return error.Continue,
-                .return_value => return self.flowReturn(flow),
-                .normal => {},
-            }
+            if (try self.branchFlow(flow, as_value)) |value| return value;
         } else {
             self.popFrame();
             if (if_expr.else_branch) |else_branch| {
                 const flow = if (as_value) try self.execValueBranch(else_branch) else try self.execStatement(else_branch);
-                switch (flow) {
-                    .yield_value => |value| return if (as_value) value else self.flowYield(flow),
-                    .break_value => return self.flowBreak(flow),
-                    .continue_flow => return error.Continue,
-                    .return_value => return self.flowReturn(flow),
-                    .normal => {},
-                }
+                if (try self.branchFlow(flow, as_value)) |value| return value;
             }
         }
         return .void_value;
+    }
+
+    // resolves the flow out of an if or match branch: a value-position
+    // construct consumes 'yield', everything else rethrows to its enclosing
+    // construct on the error channel; null means the branch completed
+    // normally and the construct carries on
+    fn branchFlow(self: *Interpreter, flow: Flow, as_value: bool) Error!?Value {
+        switch (flow) {
+            .yield_value => |value| return if (as_value) value else try self.flowYield(flow),
+            .break_value => return try self.flowBreak(flow),
+            .continue_flow => return error.Continue,
+            .return_value => return try self.flowReturn(flow),
+            .normal => return null,
+        }
+    }
+
+    // resolves the flow out of one loop pass: 'break' ends the loop with
+    // its value, a value loop consumes 'yield'; null means the loop goes
+    // on to its next pass
+    fn loopFlow(self: *Interpreter, flow: Flow, as_value: bool) Error!?Value {
+        switch (flow) {
+            .break_value => |value| return value orelse .void_value,
+            .continue_flow => return null,
+            .yield_value => |value| return if (as_value) value else try self.flowYield(flow),
+            .return_value => return try self.flowReturn(flow),
+            .normal => return null,
+        }
     }
 
     // a 'return' inside a value-yielding construct unwinds to the enclosing
@@ -2340,18 +2481,15 @@ pub const Interpreter = struct {
         };
     }
 
-    // 'x is Enum::Variant |capture|' evaluates the test and binds the
-    // payload (or the downcast value) into the current frame on a match
     // an interface-object capture: '|&c|' / '|&var c|' borrow the concrete
     // value in place, '|move c|' takes the owning pointer out of the object
     // and clears it, leaving the subject moved-from (section 4.2)
     fn bindDowncast(self: *Interpreter, capture: ast.Capture, place: ?*Value, concrete: *Value) Error!void {
         const name = capture.name.slice(self.source());
-        if (captureMode(capture) == .owning) {
+        if (capture.mode() == .owning) {
             const cell = place orelse return self.fault("a '|move {s}|' capture needs an owning interface object", .{name});
             // the object may sit behind a reference cell (a reborrowed parameter)
-            var owner = cell;
-            while (owner.* == .reference) owner = owner.reference;
+            const owner = innermostCell(cell);
             if (owner.* != .pointer or owner.pointer == null) return self.fault("a '|move {s}|' capture needs an owning interface object", .{name});
             const taken = owner.pointer;
             owner.* = .{ .pointer = null };
@@ -2361,6 +2499,9 @@ pub const Interpreter = struct {
         try self.bind(name, .{ .reference = concrete });
     }
 
+    // 'x is Enum::Variant |capture|' evaluates the test and binds the
+    // payload (or, for an interface object, the downcast value) into the
+    // current frame on a match (section 4.2)
     fn evalIsWithCapture(self: *Interpreter, expression: *const ast.Expression, cast: anytype, capture: ast.Capture) Error!bool {
         const place = (try self.evalPlace(cast.operand)) orelse temporary: {
             // an 'is' subject may be a temporary (a call result); it lives
@@ -2391,11 +2532,13 @@ pub const Interpreter = struct {
         return true;
     }
 
-    // capture typing (section 3.1): deep copy by default, '&' borrows in
-    // place, '*' takes a pointer payload out of the subject
+    // capture typing (section 3.1): deep copy by default; '&' borrows the
+    // payload in place for an enum subject and deep copies otherwise;
+    // '|move x|' takes the owning payload out, leaving the subject
+    // moved-from
     fn bindCaptured(self: *Interpreter, capture: ast.Capture, payload: Value, subject: *Value) Error!void {
         const name = capture.name.slice(self.source());
-        const mode = captureMode(capture);
+        const mode = capture.mode();
         switch (mode) {
             .copy => try self.bind(name, try self.deepCopy(payload)),
             .reference => {
@@ -2420,32 +2563,15 @@ pub const Interpreter = struct {
         }
     }
 
-    const CaptureMode = enum { copy, reference, owning };
-
-    fn captureMode(capture: ast.Capture) CaptureMode {
-        if (capture.modifier) |modifier| {
-            return switch (modifier) {
-                .reference, .reference_var => .reference,
-                .pointer, .pointer_var => .owning,
-            };
-        }
-        return .copy;
-    }
-
     // 'as_value': a loop with an 'else' in value position receives 'yield'
     // and 'break value' from its body and 'yield' from the else; a
     // statement loop passes 'yield' through to the enclosing value
     // construct (section 5.3)
     fn evalWhile(self: *Interpreter, while_expr: ast.WhileExpression, as_value: bool) Error!Value {
-        // 'return', 'break', and 'yield' unwind on the error channel and
-        // skip the in-line popFrame calls below: this guard drops whatever
-        // frames this construct still holds on ANY exit (the fix for the
-        // leaked-frame corruption where a caller's bindings vanish behind
-        // a stale barrier)
+        // an early return, break, or yield unwinding on the error channel
+        // must not leave this construct's frames behind
         const frame_floor = self.scopes.items.len;
-        defer while (self.scopes.items.len > frame_floor) {
-            _ = self.scopes.pop();
-        };
+        defer self.unwindFrames(frame_floor);
         while (true) {
             // condition captures live for one iteration (section 4.2)
             try self.pushFrame(false);
@@ -2456,13 +2582,7 @@ pub const Interpreter = struct {
             }
             const flow = if (as_value) try self.execValueLoopBody(while_expr.body) else try self.execLoopBody(while_expr.body);
             self.popFrame();
-            switch (flow) {
-                .break_value => |value| return value orelse .void_value,
-                .continue_flow => {},
-                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
-                .return_value => return self.flowReturn(flow),
-                .normal => {},
-            }
+            if (try self.loopFlow(flow, as_value)) |value| return value;
         }
         if (while_expr.else_branch) |else_branch| {
             return self.evalLoopElse(else_branch);
@@ -2476,9 +2596,9 @@ pub const Interpreter = struct {
         const flow = try self.execYieldingBody(else_branch);
         switch (flow) {
             .yield_value => |value| return value,
-            .break_value => return self.flowBreak(flow),
+            .break_value => return try self.flowBreak(flow),
             .continue_flow => return error.Continue,
-            .return_value => return self.flowReturn(flow),
+            .return_value => return try self.flowReturn(flow),
             .normal => return .void_value,
         }
     }
@@ -2494,15 +2614,10 @@ pub const Interpreter = struct {
     }
 
     fn evalFor(self: *Interpreter, for_expr: ast.ForExpression, as_value: bool) Error!Value {
-        // 'return', 'break', and 'yield' unwind on the error channel and
-        // skip the in-line popFrame calls below: this guard drops whatever
-        // frames this construct still holds on ANY exit (the fix for the
-        // leaked-frame corruption where a caller's bindings vanish behind
-        // a stale barrier)
+        // an early return, break, or yield unwinding on the error channel
+        // must not leave this construct's frames behind
         const frame_floor = self.scopes.items.len;
-        defer while (self.scopes.items.len > frame_floor) {
-            _ = self.scopes.pop();
-        };
+        defer self.unwindFrames(frame_floor);
         const Subject = union(enum) {
             counter: struct { next: i128, end: i128, primitive: types.Primitive },
             elements: *Value.ArrayInstance,
@@ -2547,6 +2662,8 @@ pub const Interpreter = struct {
             try self.checkLockstep(&length, instance.elements.len);
         }
 
+        // each pass rewrites every cursor's payload slot before reading it
+        const payloads = try self.arena.alloc(?Value, subjects.items.len);
         var iteration: usize = 0;
         while (true) : (iteration += 1) {
             // every subject must produce an element this pass or the loop
@@ -2556,7 +2673,6 @@ pub const Interpreter = struct {
             if (length) |total| {
                 if (iteration < total) any_produced = true else any_exhausted = true;
             }
-            const payloads = try self.arena.alloc(?Value, subjects.items.len);
             for (subjects.items, payloads) |subject, *payload| {
                 payload.* = null;
                 if (subject != .cursor) continue;
@@ -2584,7 +2700,7 @@ pub const Interpreter = struct {
                     },
                     .elements => |instance| {
                         const cell = &instance.elements[iteration];
-                        switch (captureMode(capture)) {
+                        switch (capture.mode()) {
                             .copy => try self.bind(capture.name.slice(self.source()), try self.deepCopy(cell.*)),
                             .reference => try self.bind(capture.name.slice(self.source()), .{ .reference = cell }),
                             .owning => try self.bind(capture.name.slice(self.source()), cell.*),
@@ -2598,13 +2714,7 @@ pub const Interpreter = struct {
             }
             const flow = if (as_value) try self.execValueLoopBody(for_expr.body) else try self.execLoopBody(for_expr.body);
             self.popFrame();
-            switch (flow) {
-                .break_value => |value| return value orelse .void_value,
-                .continue_flow => {},
-                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
-                .return_value => return self.flowReturn(flow),
-                .normal => {},
-            }
+            if (try self.loopFlow(flow, as_value)) |value| return value;
         }
         if (for_expr.else_branch) |else_branch| {
             return self.evalLoopElse(else_branch);
@@ -2613,7 +2723,7 @@ pub const Interpreter = struct {
     }
 
     // multi-subject loops iterate in lockstep over equal lengths (section
-    // 4.3); a mismatch is a runtime fault
+    // 5.3); a mismatch is a runtime fault
     fn checkLockstep(self: *Interpreter, length: *?usize, candidate: usize) Error!void {
         if (length.*) |existing| {
             if (existing != candidate) {
@@ -2628,7 +2738,7 @@ pub const Interpreter = struct {
         return switch (value.*) {
             .array => |instance| instance,
             .slice => |instance| instance,
-            .heap_array => |instance| instance orelse self.fault("use of a moved-from array", .{}),
+            .heap_array => |instance| instance orelse self.fault(moved_from_array, .{}),
             else => self.fault("this subject is not iterable", .{}),
         };
     }
@@ -2644,15 +2754,10 @@ pub const Interpreter = struct {
 
     // a statement-position match passes 'yield' through like an if
     fn evalMatch(self: *Interpreter, match_expr: ast.MatchExpression, as_value: bool) Error!Value {
-        // 'return', 'break', and 'yield' unwind on the error channel and
-        // skip the in-line popFrame calls below: this guard drops whatever
-        // frames this construct still holds on ANY exit (the fix for the
-        // leaked-frame corruption where a caller's bindings vanish behind
-        // a stale barrier)
+        // an early return, break, or yield unwinding on the error channel
+        // must not leave this construct's frames behind
         const frame_floor = self.scopes.items.len;
-        defer while (self.scopes.items.len > frame_floor) {
-            _ = self.scopes.pop();
-        };
+        defer self.unwindFrames(frame_floor);
         const subject_place = try self.evalPlace(match_expr.subject);
         var subject_storage: Value = undefined;
         const subject: *Value = if (subject_place) |place| try self.pierceCell(place) else subject: {
@@ -2676,21 +2781,15 @@ pub const Interpreter = struct {
             const flow = if (as_value) try self.execValueBranch(arm.body) else try self.execStatement(arm.body);
             self.popFrame();
             switch (flow) {
-                .yield_value => |value| return if (as_value) value else self.flowYield(flow),
-                .break_value => return self.flowBreak(flow),
+                .yield_value => |value| return if (as_value) value else try self.flowYield(flow),
+                .break_value => return try self.flowBreak(flow),
                 .continue_flow => return error.Continue,
-                .return_value => return self.flowReturn(flow),
+                .return_value => return try self.flowReturn(flow),
                 // the arm completed without 'yield': the external else runs
                 .normal => {
                     if (match_expr.else_branch) |else_branch| {
                         const else_flow = if (as_value) try self.execYieldingBody(else_branch) else try self.execStatement(else_branch);
-                        switch (else_flow) {
-                            .yield_value => |value| return if (as_value) value else self.flowYield(else_flow),
-                            .break_value => return self.flowBreak(else_flow),
-                            .continue_flow => return error.Continue,
-                            .return_value => return self.flowReturn(else_flow),
-                            .normal => {},
-                        }
+                        if (try self.branchFlow(else_flow, as_value)) |value| return value;
                     }
                     return .void_value;
                 },
@@ -2767,6 +2866,15 @@ pub const Interpreter = struct {
         return instance;
     }
 };
+
+// the declaration index of the variant called 'name' in a recorded enum
+// shape, which is its tag (section 4.5)
+fn variantPosition(variants: anytype, name: []const u8) ?usize {
+    for (variants, 0..) |variant, position| {
+        if (std.mem.eql(u8, variant.name, name)) return position;
+    }
+    return null;
+}
 
 fn unwrapGrouped(expression: *const ast.Expression) *const ast.Expression {
     var current = expression;

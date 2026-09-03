@@ -42,6 +42,17 @@ pub const Definition = struct {
         interface_def: InterfaceDef,
         macro_def: MacroDef,
     },
+
+    // the token naming the definition, whatever its kind
+    pub fn name(definition: *const Definition) Token {
+        return switch (definition.kind) {
+            .type_def => |def| def.name,
+            .fn_def => |def| def.name,
+            .extern_def => |def| def.name,
+            .interface_def => |def| def.name,
+            .macro_def => |def| def.name,
+        };
+    }
 };
 
 pub const TypeDef = struct {
@@ -104,7 +115,6 @@ pub const InterfaceDef = struct {
 pub const InterfaceFn = struct {
     name: Token,
     receiver: TypeModifier,
-    receiver_token: Token,
     parameters: []const Parameter,
     return_type: ?*const TypeExpression,
 };
@@ -232,8 +242,9 @@ pub const Expression = union(enum) {
     },
     member: struct { object: *const Expression, name: Token },
     index: struct { object: *const Expression, subscript: *const Expression },
-    // 'arr[start..end]' borrows a slice viewing the element range
-    // start..end-1 in place (section 4.2); a null start means 0
+    // 'arr[start..end]' denotes the unsized range value of elements
+    // start..end-1 (section 3.1): '&' / '&var' borrow the view, 'new'
+    // copies it; a null start means 0
     subslice: struct {
         object: *const Expression,
         operator: Token,
@@ -270,7 +281,19 @@ pub const MemberInit = struct {
 pub const Capture = struct {
     modifier: ?TypeModifier,
     name: Token,
+
+    pub fn mode(self: Capture) CaptureMode {
+        const modifier = self.modifier orelse return .copy;
+        return switch (modifier) {
+            .reference, .reference_var => .reference,
+            .pointer, .pointer_var => .owning,
+        };
+    }
 };
+
+// capture typing (section 3.1): deep copy by default, '&' borrows the
+// payload in place, '*' moves the owning payload out of its source
+pub const CaptureMode = enum { copy, reference, owning };
 
 pub const IfExpression = struct {
     condition: *const Expression,

@@ -1,6 +1,5 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
-const Io = std.Io;
 
 pub const tokenizer = @import("tokenizer.zig");
 pub const Token = tokenizer.Token;
@@ -42,6 +41,16 @@ pub const formatter = @import("formatter.zig");
 
 pub const dap = @import("dap.zig");
 pub const DebugAdapter = dap.Server;
+
+pub const library = @import("library.zig");
+
+pub const rpc = @import("rpc.zig");
+pub const paths = @import("paths.zig");
+pub const toolchain = @import("toolchain.zig");
+
+// the conformance suite has no declarations to export; naming it here is
+// what pulls its tests into 'zig build test'
+pub const conformance_tests = @import("conformance_tests.zig");
 
 test {
     std.testing.refAllDecls(@This());

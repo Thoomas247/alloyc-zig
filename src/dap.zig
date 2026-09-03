@@ -16,6 +16,9 @@ const ast = @import("ast.zig");
 const tokenizer_module = @import("tokenizer.zig");
 const Token = tokenizer_module.Token;
 const Parser = @import("parser.zig").Parser;
+const rpc = @import("rpc.zig");
+const paths = @import("paths.zig");
+const toolchain = @import("toolchain.zig");
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -81,7 +84,7 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         while (!self.disconnected) {
             _ = self.message_arena.reset(.retain_capacity);
-            const body = self.readMessage() catch |err| switch (err) {
+            const body = rpc.readMessage(self.reader, self.message_arena.allocator()) catch |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
             };
@@ -89,55 +92,28 @@ pub const Server = struct {
         }
     }
 
-    fn readMessage(self: *Server) ![]u8 {
-        const arena = self.message_arena.allocator();
-        var content_length: ?usize = null;
-        while (true) {
-            const raw_line = (try self.reader.takeDelimiter('\n')) orelse return error.EndOfStream;
-            const line = std.mem.trimEnd(u8, raw_line, "\r");
-            if (line.len == 0) break;
-            const prefix = "Content-Length:";
-            if (std.ascii.startsWithIgnoreCase(line, prefix)) {
-                const digits = std.mem.trim(u8, line[prefix.len..], " ");
-                content_length = std.fmt.parseInt(usize, digits, 10) catch null;
-            }
-        }
-        const length = content_length orelse return error.MissingContentLength;
-        const body = try arena.alloc(u8, length);
-        try self.reader.readSliceAll(body);
-        return body;
-    }
-
-    fn send(self: *Server, payload: []const u8) !void {
-        try self.writer.print("Content-Length: {d}\r\n\r\n", .{payload.len});
-        try self.writer.writeAll(payload);
-        try self.writer.flush();
-    }
-
     fn respond(self: *Server, request_seq: i64, command: []const u8, body: anytype) !void {
         const arena = self.message_arena.allocator();
-        const concrete = if (@TypeOf(body) == @TypeOf(null)) @as(?u8, null) else body;
         const payload = try std.json.Stringify.valueAlloc(arena, .{
             .seq = self.nextSequence(),
             .type = "response",
             .request_seq = request_seq,
             .success = true,
             .command = command,
-            .body = concrete,
+            .body = rpc.jsonNullable(body),
         }, .{});
-        try self.send(payload);
+        try rpc.send(self.writer, payload);
     }
 
     fn sendEvent(self: *Server, name: []const u8, body: anytype) !void {
         const arena = self.message_arena.allocator();
-        const concrete = if (@TypeOf(body) == @TypeOf(null)) @as(?u8, null) else body;
         const payload = try std.json.Stringify.valueAlloc(arena, .{
             .seq = self.nextSequence(),
             .type = "event",
             .event = name,
-            .body = concrete,
+            .body = rpc.jsonNullable(body),
         }, .{});
-        try self.send(payload);
+        try rpc.send(self.writer, payload);
     }
 
     fn nextSequence(self: *Server) usize {
@@ -193,7 +169,7 @@ pub const Server = struct {
                     }
                 }
             }
-            const key = try normalizePath(session, path);
+            const key = try paths.normalized(session, path);
             const stored = try session.dupe(Breakpoint, requested.items);
             try self.breakpoints.put(self.gpa, key, stored);
             const Verified = struct { verified: bool, line: u32 };
@@ -292,14 +268,14 @@ pub const Server = struct {
         fn readRelative(loader: *DiskLoader, allocator: std.mem.Allocator, base: []const u8, relative: []const u8) ?[]const u8 {
             const joined = std.fs.path.join(allocator, &.{ base, relative }) catch return null;
             defer allocator.free(joined);
-            return Io.Dir.cwd().readFileAlloc(loader.io, joined, allocator, .limited(10 * 1024 * 1024)) catch null;
+            return Io.Dir.cwd().readFileAlloc(loader.io, joined, allocator, .limited(toolchain.source_read_limit)) catch null;
         }
 
         // the working directory first, then the program's directory, then
         // - for std/ imports - the configured search bases (section 6.4)
         fn loadModule(context: ?*anyopaque, allocator: std.mem.Allocator, file_path: []const u8) anyerror!?[]const u8 {
             const loader: *DiskLoader = @ptrCast(@alignCast(context.?));
-            if (Io.Dir.cwd().readFileAlloc(loader.io, file_path, allocator, .limited(10 * 1024 * 1024))) |source| {
+            if (Io.Dir.cwd().readFileAlloc(loader.io, file_path, allocator, .limited(toolchain.source_read_limit))) |source| {
                 return source;
             } else |err| if (err != error.FileNotFound) return null;
             if (loader.readRelative(allocator, loader.program_directory, file_path)) |source| return source;
@@ -314,7 +290,7 @@ pub const Server = struct {
             const loader: *DiskLoader = @ptrCast(@alignCast(context.?));
             var buffer: [512]u8 = undefined;
             const path = std.fmt.bufPrint(&buffer, "pkg/{s}.alloylib", .{package_name}) catch return null;
-            return Io.Dir.cwd().readFileAlloc(loader.io, path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+            return Io.Dir.cwd().readFileAlloc(loader.io, path, allocator, .limited(toolchain.library_read_limit)) catch |err| switch (err) {
                 error.FileNotFound => null,
                 else => null,
             };
@@ -323,7 +299,7 @@ pub const Server = struct {
 
     fn execute(self: *Server, program: []const u8) !void {
         const session = self.session_arena.allocator();
-        const source = Io.Dir.cwd().readFileAlloc(self.io, program, session, .limited(10 * 1024 * 1024)) catch {
+        const source = Io.Dir.cwd().readFileAlloc(self.io, program, session, .limited(toolchain.source_read_limit)) catch {
             try self.sendEvent("output", .{ .category = "stderr", .output = "cannot read the program file\n" });
             return self.finish(1);
         };
@@ -381,7 +357,13 @@ pub const Server = struct {
                 break :fault 1;
             },
             error.Return => 0,
-            error.WriteFailed, error.OutOfMemory => return err,
+            // a disconnect while paused unwinds the program through the
+            // hook; there is no client left to report an exit to
+            error.WriteFailed => if (self.disconnected) {
+                self.machine = null;
+                return;
+            } else return err,
+            error.OutOfMemory => return err,
             else => 1,
         };
         try self.flushProgramOutput();
@@ -432,7 +414,7 @@ pub const Server = struct {
             const view = machine.views[frame.view_index];
             const line = lineOf(view.source, offset);
             const arena = self.message_arena.allocator();
-            const normalized = normalizePath(arena, view.path) catch break :breakpoint null;
+            const normalized = paths.normalized(arena, view.path) catch break :breakpoint null;
             var iterator = self.breakpoints.iterator();
             while (iterator.next()) |entry| {
                 if (!pathsMatch(entry.key_ptr.*, normalized)) continue;
@@ -459,6 +441,9 @@ pub const Server = struct {
             .allThreadsStopped = true,
         });
         try self.pauseLoop();
+        // a disconnect while paused stops the program instead of letting it
+        // run on with nobody listening
+        if (self.disconnected) return error.Disconnected;
     }
 
     // while paused, requests answer against the live interpreter until a
@@ -466,7 +451,7 @@ pub const Server = struct {
     fn pauseLoop(self: *Server) !void {
         while (!self.disconnected and self.step == .running) {
             _ = self.message_arena.reset(.retain_capacity);
-            const body = self.readMessage() catch |err| switch (err) {
+            const body = rpc.readMessage(self.reader, self.message_arena.allocator()) catch |err| switch (err) {
                 error.EndOfStream => {
                     self.disconnected = true;
                     return;
@@ -865,19 +850,6 @@ fn renderValue(arena: std.mem.Allocator, value: Interpreter.Value, depth: usize)
     }
 }
 
-// forward slashes, lowercased drive letter, so client and compiler paths
-// compare equal
-fn normalizePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const normalized = try allocator.dupe(u8, path);
-    for (normalized) |*byte| {
-        if (byte.* == '\\') byte.* = '/';
-    }
-    if (normalized.len >= 2 and normalized[1] == ':') {
-        normalized[0] = std.ascii.toLower(normalized[0]);
-    }
-    return normalized;
-}
-
 // module paths may be relative while the client sends absolute paths;
 // a suffix match on path components bridges the two
 fn pathsMatch(breakpoint_path: []const u8, module_path: []const u8) bool {
@@ -904,10 +876,9 @@ fn lineOf(source: []const u8, offset: usize) u32 {
 
 fn stringPath(value: std.json.Value, keys: []const []const u8) ?[]const u8 {
     var current = value;
-    for (keys, 0..) |key, index| {
+    for (keys) |key| {
         if (current != .object) return null;
         current = current.object.get(key) orelse return null;
-        _ = index;
     }
     if (current != .string) return null;
     return current.string;
@@ -1011,4 +982,49 @@ test "the adapter stops, walks frames, expands values, and evaluates watches" {
     // 8 + 0+1+2+3 + pair.left = 15
     try std.testing.expect(std.mem.indexOf(u8, transcript, "\"exitCode\":15") != null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "\"event\":\"terminated\"") != null);
+}
+
+test "a disconnect while paused stops the program" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    const program_source =
+        "fn main() -> i32 {\n" ++
+        "    const started = 1;\n" ++
+        "    return started + 1;\n" ++
+        "}\n";
+    try Io.Dir.cwd().createDirPath(io, ".zig-cache/alloyc-dap-tests");
+    const program_path = ".zig-cache/alloyc-dap-tests/disconnect.alloy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = program_path, .data = program_source });
+    // the entry stop pauses before the first statement; disconnecting
+    // there must not let the program run to completion
+    const messages = [_][]const u8{
+        "{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\",\"arguments\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .seq = 2,
+            .type = "request",
+            .command = "launch",
+            .arguments = .{ .program = program_path },
+        }, .{}),
+        "{\"seq\":3,\"type\":\"request\",\"command\":\"configurationDone\",\"arguments\":{}}",
+        "{\"seq\":4,\"type\":\"request\",\"command\":\"disconnect\",\"arguments\":{}}",
+    };
+    var frames: std.ArrayList(u8) = .empty;
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"reason\":\"step\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"command\":\"disconnect\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "\"event\":\"exited\"") == null);
 }

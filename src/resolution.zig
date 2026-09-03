@@ -324,7 +324,7 @@ pub const Resolver = struct {
                 // qualified functions live in their type's namespace, not
                 // the flat map; collectAssociated registers them
                 if (definition.kind == .fn_def and definition.kind.fn_def.qualifier != null) continue;
-                const name_token = definitionName(definition);
+                const name_token = definition.name();
                 const name = name_token.slice(view.source);
                 const symbol: Symbol = .{
                     .visibility = definition.visibility,
@@ -884,7 +884,7 @@ pub const Resolver = struct {
         for (self.associated.items) |entry| {
             if (entry.type_definition == symbol.definition and std.mem.eql(u8, entry.name, variant_name)) return;
         }
-        const type_name = definitionName(symbol.definition).slice(definition_source);
+        const type_name = symbol.definition.name().slice(definition_source);
         try self.report(span, "enum '{s}' has no variant '{s}'", .{ type_name, variant_name });
     }
 
@@ -951,16 +951,6 @@ pub const Resolver = struct {
         });
     }
 };
-
-fn definitionName(definition: *const ast.Definition) Token {
-    return switch (definition.kind) {
-        .type_def => |def| def.name,
-        .fn_def => |def| def.name,
-        .extern_def => |def| def.name,
-        .interface_def => |def| def.name,
-        .macro_def => |def| def.name,
-    };
-}
 
 fn definitionKindName(definition: *const ast.Definition) []const u8 {
     return switch (definition.kind) {

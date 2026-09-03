@@ -342,50 +342,21 @@ pub const Tokenizer = struct {
             '"' => return self.stringLiteral(),
             '\'' => return self.characterLiteral(),
 
-            '+' => self.singleOrDouble('=', .plus_equal, .plus),
-            '-' => result: {
-                if (self.peekAt(1) == '=') break :result self.take(2, .minus_equal);
-                if (self.peekAt(1) == '>') break :result self.take(2, .arrow);
-                break :result self.take(1, .minus);
-            },
-            '*' => self.singleOrDouble('=', .asterisk_equal, .asterisk),
-            '/' => self.singleOrDouble('=', .slash_equal, .slash),
-            '%' => self.singleOrDouble('=', .percent_equal, .percent),
-            '<' => result: {
-                if (self.peekAt(1) == '<') {
-                    if (self.peekAt(2) == '=') break :result self.take(3, .shift_left_equal);
-                    break :result self.take(2, .shift_left);
-                }
-                if (self.peekAt(1) == '=') break :result self.take(2, .angle_left_equal);
-                break :result self.take(1, .angle_left);
-            },
-            '>' => result: {
-                if (self.peekAt(1) == '>') {
-                    if (self.peekAt(2) == '=') break :result self.take(3, .shift_right_equal);
-                    break :result self.take(2, .shift_right);
-                }
-                if (self.peekAt(1) == '=') break :result self.take(2, .angle_right_equal);
-                break :result self.take(1, .angle_right);
-            },
-            '&' => result: {
-                if (self.peekAt(1) == '&') break :result self.take(2, .ampersand_ampersand);
-                if (self.peekAt(1) == '=') break :result self.take(2, .ampersand_equal);
-                break :result self.take(1, .ampersand);
-            },
-            '|' => result: {
-                if (self.peekAt(1) == '|') break :result self.take(2, .pipe_pipe);
-                if (self.peekAt(1) == '=') break :result self.take(2, .pipe_equal);
-                break :result self.take(1, .pipe);
-            },
-            '^' => self.singleOrDouble('=', .caret_equal, .caret),
-            '=' => self.singleOrDouble('=', .equal_equal, .equal),
-            '!' => self.singleOrDouble('=', .bang_equal, .bang),
-            ':' => self.singleOrDouble(':', .colon_colon, .colon),
-            '.' => result: {
-                if (self.peekAt(1) == '.' and self.peekAt(2) == '.') break :result self.take(3, .ellipsis);
-                if (self.peekAt(1) == '.') break :result self.take(2, .dot_dot);
-                break :result self.take(1, .dot);
-            },
+            // multi-character operators resolve longest-first
+            '+' => self.operator(&.{ .plus_equal, .plus }),
+            '-' => self.operator(&.{ .minus_equal, .arrow, .minus }),
+            '*' => self.operator(&.{ .asterisk_equal, .asterisk }),
+            '/' => self.operator(&.{ .slash_equal, .slash }),
+            '%' => self.operator(&.{ .percent_equal, .percent }),
+            '<' => self.operator(&.{ .shift_left_equal, .shift_left, .angle_left_equal, .angle_left }),
+            '>' => self.operator(&.{ .shift_right_equal, .shift_right, .angle_right_equal, .angle_right }),
+            '&' => self.operator(&.{ .ampersand_ampersand, .ampersand_equal, .ampersand }),
+            '|' => self.operator(&.{ .pipe_pipe, .pipe_equal, .pipe }),
+            '^' => self.operator(&.{ .caret_equal, .caret }),
+            '=' => self.operator(&.{ .equal_equal, .equal }),
+            '!' => self.operator(&.{ .bang_equal, .bang }),
+            ':' => self.operator(&.{ .colon_colon, .colon }),
+            '.' => self.operator(&.{ .ellipsis, .dot_dot, .dot }),
             '~' => self.take(1, .tilde),
             ',' => self.take(1, .comma),
             ';' => self.take(1, .semicolon),
@@ -407,7 +378,8 @@ pub const Tokenizer = struct {
     }
 
     /// Tokenize the remaining input, appending tokens (including the final
-    /// `.end_of_file`) to `list`.
+    /// `.end_of_file`) to `list`. This is the canonical whole-input loop;
+    /// callers should use it rather than hand-rolling one around `next`.
     pub fn tokenizeAll(self: *Tokenizer, allocator: std.mem.Allocator, list: *std.ArrayList(Token)) !void {
         while (true) {
             const token = self.next();
@@ -575,7 +547,7 @@ pub const Tokenizer = struct {
                 self.index += 1;
                 if (self.index >= self.buffer.len) break;
                 switch (self.buffer[self.index]) {
-                    'n', 'r', 't', '0', '\\', '\'', '"', 'x', 'X', 'u', 'U' => {},
+                    'n', 'r', 't', '0', '\\', '\'', '"', 'x', 'u' => {},
                     else => if (bad_escape == null) {
                         bad_escape = .{ .start = self.index - 1, .end = self.index + 1 };
                     },
@@ -596,9 +568,17 @@ pub const Tokenizer = struct {
         return tag;
     }
 
-    fn singleOrDouble(self: *Tokenizer, second: u8, double: Token.Tag, single: Token.Tag) Token.Tag {
-        if (self.peekAt(1) == second) return self.take(2, double);
-        return self.take(1, single);
+    // takes the first of 'tags' whose lexeme starts at the current index;
+    // the list holds the operators sharing a first byte, longest first,
+    // ending with the single-byte tag that always matches
+    fn operator(self: *Tokenizer, comptime tags: []const Token.Tag) Token.Tag {
+        inline for (tags) |tag| {
+            const text = comptime tag.lexeme().?;
+            if (std.mem.startsWith(u8, self.buffer[self.index..], text)) {
+                return self.take(text.len, tag);
+            }
+        }
+        unreachable;
     }
 
     fn isDecimalDigit(byte: u8) bool {
@@ -755,8 +735,8 @@ test "comments" {
     try std.testing.expectEqual(Token.Tag.end_of_file, tokenizer.next().tag);
 }
 
-test "spread vs float vs member access" {
-    // '1...' lexes as integer then spread, not '1.' float then '..'
+test "longest match among '.', '..', and '...'" {
+    // '1...' lexes as integer then ellipsis, not '1.' float then '..'
     try expectTokens("1...", &.{ .integer_literal, .ellipsis });
     try expectTokens("a.b", &.{ .identifier, .dot, .identifier });
 }

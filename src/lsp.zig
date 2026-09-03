@@ -16,6 +16,10 @@ const tokenizer_module = @import("tokenizer.zig");
 const Token = tokenizer_module.Token;
 const ast = @import("ast.zig");
 const formatter = @import("formatter.zig");
+const Checker = @import("checker.zig").Checker;
+const rpc = @import("rpc.zig");
+const paths = @import("paths.zig");
+const toolchain = @import("toolchain.zig");
 
 // the '#Type' reflection methods (section 4.4), offered after '.' on a
 // value the tooling pass typed as a '#Type'
@@ -152,7 +156,7 @@ pub const Server = struct {
             if (self.dirty.count() != 0 and self.reader.bufferedLen() == 0) {
                 try self.flushDirty();
             }
-            const body = self.readMessage() catch |err| switch (err) {
+            const body = rpc.readMessage(self.reader, self.message_arena.allocator()) catch |err| switch (err) {
                 error.EndOfStream => {
                     // a test transcript (or a closing client) ends the
                     // stream with edits still pending; publish for them
@@ -168,53 +172,22 @@ pub const Server = struct {
 
     fn flushDirty(self: *Server) !void {
         while (true) {
-            var paths = self.dirty.keyIterator();
-            const path = (paths.next() orelse return).*;
+            var keys = self.dirty.keyIterator();
+            const path = (keys.next() orelse return).*;
             _ = self.dirty.remove(path);
             const entry = self.documents.getEntry(path) orelse continue;
             try self.analyze(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
-    // one framed message: 'Content-Length: N' headers, a blank line, then
-    // exactly N payload bytes
-    fn readMessage(self: *Server) ![]u8 {
-        const arena = self.message_arena.allocator();
-        var content_length: ?usize = null;
-        while (true) {
-            // takeDelimiter advances PAST the newline; the exclusive
-            // variant would leave it buffered and desync the framing
-            const raw_line = (try self.reader.takeDelimiter('\n')) orelse return error.EndOfStream;
-            const line = std.mem.trimEnd(u8, raw_line, "\r");
-            if (line.len == 0) break;
-            const prefix = "Content-Length:";
-            if (std.ascii.startsWithIgnoreCase(line, prefix)) {
-                const digits = std.mem.trim(u8, line[prefix.len..], " ");
-                content_length = std.fmt.parseInt(usize, digits, 10) catch null;
-            }
-        }
-        const length = content_length orelse return error.MissingContentLength;
-        const body = try arena.alloc(u8, length);
-        try self.reader.readSliceAll(body);
-        return body;
-    }
-
-    fn send(self: *Server, payload: []const u8) !void {
-        try self.writer.print("Content-Length: {d}\r\n\r\n", .{payload.len});
-        try self.writer.writeAll(payload);
-        try self.writer.flush();
-    }
-
     fn respond(self: *Server, id: std.json.Value, result: anytype) !void {
         const arena = self.message_arena.allocator();
-        // a bare 'null' literal needs a concrete optional type to stringify
-        const concrete = if (@TypeOf(result) == @TypeOf(null)) @as(?u8, null) else result;
         const payload = try std.json.Stringify.valueAlloc(arena, .{
             .jsonrpc = "2.0",
             .id = id,
-            .result = concrete,
+            .result = rpc.jsonNullable(result),
         }, .{});
-        try self.send(payload);
+        try rpc.send(self.writer, payload);
     }
 
     fn respondError(self: *Server, id: std.json.Value, code: i64, message: []const u8) !void {
@@ -224,7 +197,7 @@ pub const Server = struct {
             .id = id,
             .@"error" = .{ .code = code, .message = message },
         }, .{});
-        try self.send(payload);
+        try rpc.send(self.writer, payload);
     }
 
     fn notify(self: *Server, method: []const u8, params: anytype) !void {
@@ -234,7 +207,7 @@ pub const Server = struct {
             .method = method,
             .params = params,
         }, .{});
-        try self.send(payload);
+        try rpc.send(self.writer, payload);
     }
 
     // returns false when the client asked the server to exit
@@ -427,7 +400,7 @@ pub const Server = struct {
             const source: ?[]const u8 = if (loader.server.documents.get(absolute)) |open_document|
                 try allocator.dupe(u8, open_document.text)
             else
-                Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(10 * 1024 * 1024)) catch null;
+                Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(toolchain.source_read_limit)) catch null;
             if (source != null) try loader.server.recordResolvedPath(relative, absolute);
             return source;
         }
@@ -485,7 +458,7 @@ pub const Server = struct {
         const relative = try std.fmt.allocPrint(allocator, "pkg/{s}.alloylib", .{package_name});
         defer allocator.free(relative);
         const absolute = try joinNormalized(allocator, loader.base_directory, relative);
-        return Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+        return Io.Dir.cwd().readFileAlloc(loader.server.io, absolute, allocator, .limited(toolchain.library_read_limit)) catch |err| switch (err) {
             error.FileNotFound => null,
             else => null,
         };
@@ -526,7 +499,7 @@ pub const Server = struct {
             if (self.documents.get(stable)) |open| {
                 entry_path = stable;
                 entry_source = open.text;
-            } else if (Io.Dir.cwd().readFileAlloc(self.io, stable, self.message_arena.allocator(), .limited(10 * 1024 * 1024)) catch null) |from_disk| {
+            } else if (Io.Dir.cwd().readFileAlloc(self.io, stable, self.message_arena.allocator(), .limited(toolchain.source_read_limit)) catch null) |from_disk| {
                 entry_path = stable;
                 entry_source = from_disk;
             }
@@ -550,9 +523,11 @@ pub const Server = struct {
 
         try self.publishDiagnostics(unit, document);
         if (unit.views.len != 0) {
+            // extracted before the swap: a failure here frees only the new
+            // unit (the errdefer above), never the analysis still in service
+            try self.extractSymbols(unit);
             self.dropAnalysis();
             self.analysis = unit;
-            try self.extractSymbols(unit);
         } else {
             // the parse never reached the merge; keep the previous
             // analysis for symbol features
@@ -608,19 +583,13 @@ pub const Server = struct {
         }
         // the entry document always gets a publish, clearing stale markers
         if (!fresh.contains(entry_document.uri)) {
-            try self.notify("textDocument/publishDiagnostics", .{
-                .uri = entry_document.uri,
-                .diagnostics = &[_]LspDiagnostic{},
-            });
+            try self.publishEmpty(entry_document.uri);
         }
         // clear any URI that carried diagnostics last time but not now
         var stale = self.published.keyIterator();
         while (stale.next()) |key| {
             if (fresh.contains(key.*) or std.mem.eql(u8, key.*, entry_document.uri)) continue;
-            try self.notify("textDocument/publishDiagnostics", .{
-                .uri = key.*,
-                .diagnostics = &[_]LspDiagnostic{},
-            });
+            try self.publishEmpty(key.*);
         }
         var old = self.published.keyIterator();
         while (old.next()) |key| self.gpa.free(key.*);
@@ -629,6 +598,14 @@ pub const Server = struct {
         while (fresh_keys.next()) |key| {
             try self.published.put(self.gpa, try self.gpa.dupe(u8, key.*), {});
         }
+    }
+
+    // an empty diagnostics list clears the client's markers for the file
+    fn publishEmpty(self: *Server, uri: []const u8) !void {
+        try self.notify("textDocument/publishDiagnostics", .{
+            .uri = uri,
+            .diagnostics = &[_]LspDiagnostic{},
+        });
     }
 
     // the message arena resets between requests, so this reconstruction is
@@ -643,7 +620,7 @@ pub const Server = struct {
         self.symbols.clearRetainingCapacity();
         for (unit.views, 0..) |view, view_index| {
             for (view.module.definitions) |*module_definition| {
-                const name_token = definitionName(module_definition);
+                const name_token = module_definition.name();
                 try self.symbols.append(self.gpa, .{
                     .name = try arena.dupe(u8, name_token.slice(view.source)),
                     .detail = try arena.dupe(u8, definitionDetail(view.source, name_token.location.start, module_definition)),
@@ -682,6 +659,21 @@ pub const Server = struct {
             }
         }
         return null;
+    }
+
+    const Analysis = struct {
+        unit: *Compilation,
+        view_index: usize,
+        // null when the pipeline stopped before the check stage
+        checker: ?*Checker,
+    };
+
+    // the current analysis and the view of the given document. The view
+    // resolves FIRST: it may re-analyze and replace the unit
+    fn analysisFor(self: *Server, path: []const u8) ?Analysis {
+        const view_index = (self.viewIndexOfPath(path) catch null) orelse return null;
+        const unit = self.analysis orelse return null;
+        return .{ .unit = unit, .view_index = view_index, .checker = unit.checker };
     }
 
     const CompletionItem = struct {
@@ -767,10 +759,10 @@ pub const Server = struct {
     // Approximation: block scoping inside the definition is not replayed,
     // so a name from an inner block still offers after its block ends.
     fn scopedLocalCompletions(self: *Server, arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem), offered: *std.StringHashMapUnmanaged(void), location: RequestLocation) !void {
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return;
-        const unit = self.analysis orelse return;
-        const checker = unit.checker orelse return;
-        const view = unit.views[view_index];
+        const found = self.analysisFor(location.path) orelse return;
+        const checker = found.checker orelse return;
+        const view_index = found.view_index;
+        const view = found.unit.views[view_index];
         if (!std.mem.eql(u8, view.source, location.text)) return;
         const extent = definitionExtent(view.source, location.offset) orelse return;
         // scan backwards so a shadowing later declaration wins its name
@@ -796,12 +788,11 @@ pub const Server = struct {
     // completion after 'receiver.': the receiver's type comes from the
     // checker's recorded type of the nearest preceding use of that name
     fn memberCompletion(self: *Server, arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem), location: RequestLocation, dot_offset: usize) !void {
-        // resolve the view FIRST: it may re-analyze and replace the unit
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return;
-        const unit = self.analysis orelse return;
-        const checker = unit.checker orelse return;
+        const found = self.analysisFor(location.path) orelse return;
+        const unit = found.unit;
+        const checker = found.checker orelse return;
         const receiver = wordAt(location.text, dot_offset -| 1) orelse return;
-        const view = unit.views[view_index];
+        const view = unit.views[found.view_index];
 
         // '#TypeName.' reflects the type (section 4.4): the receiver needs
         // no prior typed use, the name and the leading '#' are enough
@@ -816,18 +807,16 @@ pub const Server = struct {
                 }
             } else false;
             if (names_type) {
-                for (type_description_completions) |method| {
-                    try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
-                }
+                try appendTypeDescriptionCompletions(arena, items);
                 return;
             }
         }
 
-        var paths: std.ArrayList(*const ast.Expression) = .empty;
-        try collectPathExpressions(arena, view.module, &paths);
+        var path_expressions: std.ArrayList(*const ast.Expression) = .empty;
+        try collectPathExpressions(arena, view.module, &path_expressions);
         var best: ?*const ast.Expression = null;
         var best_start: usize = 0;
-        for (paths.items) |candidate| {
+        for (path_expressions.items) |candidate| {
             const segments = candidate.path;
             if (segments.len != 1) continue;
             if (!std.mem.eql(u8, segments[0].slice(view.source), receiver)) continue;
@@ -845,9 +834,7 @@ pub const Server = struct {
 
         // a '#Type' value exposes the reflection methods (section 4.4)
         if (resolved.* == .type_description) {
-            for (type_description_completions) |method| {
-                try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
-            }
+            try appendTypeDescriptionCompletions(arena, items);
             return;
         }
         if (checker.structuralFieldsOf(resolved) catch null) |fields| {
@@ -874,12 +861,20 @@ pub const Server = struct {
         }
     }
 
+    // the '#Type' reflection methods (section 4.4), offered after '.' on a
+    // value the tooling pass typed as a '#Type'
+    fn appendTypeDescriptionCompletions(arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem)) !void {
+        for (type_description_completions) |method| {
+            try items.append(arena, .{ .label = method.name, .kind = 2, .detail = method.detail });
+        }
+    }
+
     // completion after 'prefix::': an enum type's variants, or a module
     // alias's visible definitions
     fn qualifiedCompletion(self: *Server, arena: std.mem.Allocator, items: *std.ArrayList(Server.CompletionItem), location: RequestLocation, colon_offset: usize) !void {
-        // resolve the view FIRST: it may re-analyze and replace the unit
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return;
-        const unit = self.analysis orelse return;
+        const found = self.analysisFor(location.path) orelse return;
+        const unit = found.unit;
+        const view_index = found.view_index;
         const merged = unit.merged orelse return;
         const prefix = wordAt(location.text, colon_offset -| 1) orelse return;
 
@@ -930,7 +925,7 @@ pub const Server = struct {
                 module_definition.visibility != .private;
             if (!visible) continue;
             if (dotOnlyFunction(module_definition) or qualifiedOnlyFunction(module_definition)) continue;
-            const name_token = definitionName(module_definition);
+            const name_token = module_definition.name();
             try items.append(arena, .{
                 .label = name_token.slice(target.source),
                 .kind = switch (module_definition.kind) {
@@ -983,15 +978,14 @@ pub const Server = struct {
     // cursor. Scanned backwards: a re-analysis appends fresh records last
     fn callTargetAtPosition(self: *Server, params: std.json.Value) ?resolution.Symbol {
         const location = self.requestLocation(params) orelse return null;
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return null;
-        const unit = self.analysis orelse return null;
-        const checker = unit.checker orelse return null;
+        const found = self.analysisFor(location.path) orelse return null;
+        const checker = found.checker orelse return null;
         const targets = checker.call_name_targets.items;
         var index = targets.len;
         while (index > 0) {
             index -= 1;
             const target = targets[index];
-            if (target.view_index != view_index) continue;
+            if (target.view_index != found.view_index) continue;
             if (location.offset < target.span.start or location.offset > target.span.end) continue;
             return target.symbol;
         }
@@ -1007,9 +1001,9 @@ pub const Server = struct {
     // recorded a type for
     fn typedNodeAtPosition(self: *Server, params: std.json.Value) ?TypedNode {
         const location = self.requestLocation(params) orelse return null;
-        // resolve the view FIRST: it may re-analyze and replace the unit
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return null;
-        const unit = self.analysis orelse return null;
+        const found = self.analysisFor(location.path) orelse return null;
+        const unit = found.unit;
+        const view_index = found.view_index;
         const view = unit.views[view_index];
         // global definitions hover through the symbol table instead
         const word = wordAt(location.text, location.offset) orelse return null;
@@ -1017,9 +1011,9 @@ pub const Server = struct {
             if (std.mem.eql(u8, symbol.name, word)) return null;
         }
         const arena = self.message_arena.allocator();
-        var paths: std.ArrayList(*const ast.Expression) = .empty;
-        collectPathExpressions(arena, view.module, &paths) catch return null;
-        for (paths.items) |candidate| {
+        var path_expressions: std.ArrayList(*const ast.Expression) = .empty;
+        collectPathExpressions(arena, view.module, &path_expressions) catch return null;
+        for (path_expressions.items) |candidate| {
             const segments = candidate.path;
             if (segments.len != 1) continue;
             const span = segments[0].location;
@@ -1094,8 +1088,7 @@ pub const Server = struct {
     // qualifier and falls through to the global symbol lookup
     fn enumMemberDefinition(self: *Server, arena: std.mem.Allocator, params: std.json.Value) !?LspLocation {
         const location = self.requestLocation(params) orelse return null;
-        _ = (self.viewIndexOfPath(location.path) catch null) orelse return null;
-        const unit = self.analysis orelse return null;
+        const unit = (self.analysisFor(location.path) orelse return null).unit;
         const word = wordAt(location.text, location.offset) orelse return null;
         const word_start = @intFromPtr(word.ptr) - @intFromPtr(location.text.ptr);
         if (word_start < 2 or location.text[word_start - 1] != ':' or location.text[word_start - 2] != ':') return null;
@@ -1173,8 +1166,9 @@ pub const Server = struct {
     // so a capture token renames both the inner and the outer binding
     fn collectLocalOccurrences(self: *Server, arena: std.mem.Allocator, params: std.json.Value) !?[]const LspLocation {
         const location = self.requestLocation(params) orelse return null;
-        const view_index = (self.viewIndexOfPath(location.path) catch null) orelse return null;
-        const unit = self.analysis orelse return null;
+        const found = self.analysisFor(location.path) orelse return null;
+        const unit = found.unit;
+        const view_index = found.view_index;
         const merged = unit.merged orelse return null;
         var ids: std.ArrayList(usize) = .empty;
         for (merged.locals) |local| {
@@ -1279,7 +1273,7 @@ pub const Server = struct {
         };
         var results: std.ArrayList(DocumentSymbol) = .empty;
         for (view.module.definitions) |*module_definition| {
-            const name_token = definitionName(module_definition);
+            const name_token = module_definition.name();
             const range: Range = .{
                 .start = positionOf(view.source, name_token.location.start),
                 .end = positionOf(view.source, name_token.location.end),
@@ -1333,38 +1327,37 @@ pub const Server = struct {
         const SpanClass = struct { end: usize, class: u32 };
         var span_classes: std.AutoHashMapUnmanaged(usize, SpanClass) = .empty;
         var fresh = false;
-        if (self.viewIndexOfPath(path) catch null) |view_index| {
-            if (self.analysis) |unit| {
-                if (unit.merged) |merged| {
-                    const view = unit.views[view_index];
-                    if (std.mem.eql(u8, view.source, text)) {
-                        fresh = true;
-                        for (merged.locals) |local| {
-                            if (local.view_index != view_index) continue;
-                            const class: u32 = switch (local.kind) {
-                                .variable => 4,
-                                .parameter => 5,
-                                .type_parameter => 6,
-                            };
-                            try span_classes.put(arena, local.span.start, .{ .end = local.span.end, .class = class });
-                        }
-                        // resolved uses of globals; multi-token qualified
-                        // paths are left to the grammar
-                        for (merged.references) |reference| {
-                            if (reference.view_index != view_index) continue;
-                            try span_classes.put(arena, reference.span.start, .{
-                                .end = reference.span.end,
-                                .class = definitionClass(reference.definition),
-                            });
-                        }
-                        // the definitions' own name tokens
-                        for (view.module.definitions) |*module_definition| {
-                            const name_token = definitionName(module_definition);
-                            try span_classes.put(arena, name_token.location.start, .{
-                                .end = name_token.location.end,
-                                .class = definitionClass(module_definition),
-                            });
-                        }
+        if (self.analysisFor(path)) |found| {
+            const view_index = found.view_index;
+            if (found.unit.merged) |merged| {
+                const view = found.unit.views[view_index];
+                if (std.mem.eql(u8, view.source, text)) {
+                    fresh = true;
+                    for (merged.locals) |local| {
+                        if (local.view_index != view_index) continue;
+                        const class: u32 = switch (local.kind) {
+                            .variable => 4,
+                            .parameter => 5,
+                            .type_parameter => 6,
+                        };
+                        try span_classes.put(arena, local.span.start, .{ .end = local.span.end, .class = class });
+                    }
+                    // resolved uses of globals; multi-token qualified
+                    // paths are left to the grammar
+                    for (merged.references) |reference| {
+                        if (reference.view_index != view_index) continue;
+                        try span_classes.put(arena, reference.span.start, .{
+                            .end = reference.span.end,
+                            .class = definitionClass(reference.definition),
+                        });
+                    }
+                    // the definitions' own name tokens
+                    for (view.module.definitions) |*module_definition| {
+                        const name_token = module_definition.name();
+                        try span_classes.put(arena, name_token.location.start, .{
+                            .end = name_token.location.end,
+                            .class = definitionClass(module_definition),
+                        });
                     }
                 }
             }
@@ -1498,16 +1491,6 @@ pub const Server = struct {
         return wordAt(location.text, location.offset);
     }
 };
-
-fn definitionName(definition: *const ast.Definition) Token {
-    return switch (definition.kind) {
-        .type_def => |def| def.name,
-        .fn_def => |def| def.name,
-        .extern_def => |def| def.name,
-        .interface_def => |def| def.name,
-        .macro_def => |def| def.name,
-    };
-}
 
 // the semantic token class of a definition's kind (legend order)
 fn definitionClass(definition: *const ast.Definition) u32 {
@@ -1704,8 +1687,6 @@ fn definitionDetail(source: []const u8, name_offset: usize, definition: *const a
     return declarationLine(source, name_offset);
 }
 
-// the whole source line containing the offset, trimmed, as a signature
-
 // the byte extent of the top-level definition whose body braces contain
 // the offset, found lexically so it works on any text state
 fn definitionExtent(source: []const u8, offset: usize) ?struct { start: usize, end: usize } {
@@ -1873,17 +1854,15 @@ pub fn normalizedPathFromUri(allocator: std.mem.Allocator, uri: []const u8) ?[]c
             decoded.append(allocator, value) catch return null;
             index += 2;
         } else {
-            decoded.append(allocator, if (byte == '\\') '/' else byte) catch return null;
+            decoded.append(allocator, byte) catch return null;
         }
     }
     var path = decoded.items;
     // '/c:/...' drops the leading slash on windows-style drive paths
-    if (path.len >= 3 and path[0] == '/' and path[2] == ':') {
+    if (path.len >= 3 and (path[0] == '/' or path[0] == '\\') and path[2] == ':') {
         path = path[1..];
     }
-    if (path.len >= 2 and path[1] == ':') {
-        path[0] = std.ascii.toLower(path[0]);
-    }
+    paths.normalizeInPlace(path);
     return path;
 }
 
@@ -1910,12 +1889,7 @@ fn joinNormalized(allocator: std.mem.Allocator, base: []const u8, relative: []co
         try allocator.dupe(u8, relative)
     else
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, relative });
-    for (joined) |*byte| {
-        if (byte.* == '\\') byte.* = '/';
-    }
-    if (joined.len >= 2 and joined[1] == ':') {
-        joined[0] = std.ascii.toLower(joined[0]);
-    }
+    paths.normalizeInPlace(joined);
     return joined;
 }
 

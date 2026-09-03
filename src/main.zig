@@ -14,7 +14,27 @@ const usage =
     \\
 ;
 
+// the compiler recurses as deep as a program nests: expressions, types,
+// and compile-time calls all walk the tree, and a runaway comptime
+// recursion has to reach the interpreter's frame limit (a diagnostic)
+// before the native stack runs out (a crash). The driver therefore runs
+// on a thread with a generous stack; the main thread only waits for it
+const driver_stack_size = 256 * 1024 * 1024;
+
 pub fn main(init: std.process.Init) !void {
+    var outcome: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{ .stack_size = driver_stack_size }, driverThread, .{ init, &outcome });
+    thread.join();
+    if (outcome) |err| return err;
+}
+
+fn driverThread(init: std.process.Init, outcome: *?anyerror) void {
+    driverMain(init) catch |err| {
+        outcome.* = err;
+    };
+}
+
+fn driverMain(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     var args = try init.minimal.args.iterateAllocator(allocator);
@@ -27,10 +47,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     if (std.mem.eql(u8, first_argument, "lsp")) {
-        return serveLanguageServer(init);
+        return serve(alloyc.LanguageServer, init);
     }
     if (std.mem.eql(u8, first_argument, "dap")) {
-        return serveDebugAdapter(init);
+        return serve(alloyc.DebugAdapter, init);
     }
     if (std.mem.eql(u8, first_argument, "fmt")) {
         return formatFile(init, &args);
@@ -110,15 +130,21 @@ pub fn main(init: std.process.Init) !void {
             .host_io = init.io,
             .arguments = run_arguments.items,
         };
+        // the program's own output goes to stdout, as a native build's
+        // would; compiler status stays on stderr
+        var stdout_buffer: [64 * 1024]u8 = undefined;
+        var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
         const exit_code = compilation.interpretWithEnvironment(&output.writer, environment) catch |err| switch (err) {
             error.RuntimeFault => {
-                std.debug.print("{s}", .{output.writer.buffered()});
+                try stdout.interface.writeAll(output.writer.buffered());
+                try stdout.interface.flush();
                 std.debug.print("runtime fault: {s}\n", .{compilation.fault orelse "unknown"});
                 std.process.exit(1);
             },
             else => return err,
         };
-        std.debug.print("{s}", .{output.writer.buffered()});
+        try stdout.interface.writeAll(output.writer.buffered());
+        try stdout.interface.flush();
         std.process.exit(@truncate(@as(u64, @bitCast(exit_code))));
     }
 
@@ -155,15 +181,8 @@ pub fn main(init: std.process.Init) !void {
         for (tree.module.imports) |import| {
             std.debug.print("  import {s}\n", .{import.path[import.path.len - 1].slice(module.source)});
         }
-        for (tree.module.definitions) |definition| {
-            const name = switch (definition.kind) {
-                .type_def => |def| def.name,
-                .fn_def => |def| def.name,
-                .extern_def => |def| def.name,
-                .interface_def => |def| def.name,
-                .macro_def => |def| def.name,
-            };
-            std.debug.print("  {t} {s}\n", .{ definition.kind, name.slice(module.source) });
+        for (tree.module.definitions) |*definition| {
+            std.debug.print("  {t} {s}\n", .{ definition.kind, definition.name().slice(module.source) });
         }
     }
 }
@@ -208,33 +227,22 @@ fn formatFile(init: std.process.Init, args: anytype) !void {
     std.debug.print("formatted {s}\n", .{file_path});
 }
 
-// 'alloyc lsp': the language server speaks JSON-RPC over stdio until the
-// client sends 'exit'
-fn serveLanguageServer(init: std.process.Init) !void {
+// 'alloyc lsp' and 'alloyc dap': the language server speaks JSON-RPC over
+// stdio until the client sends 'exit'; the interpreter-backed debug
+// adapter speaks DAP the same way until 'disconnect'
+fn serve(comptime Server: type, init: std.process.Init) !void {
     var input_buffer: [64 * 1024]u8 = undefined;
     var output_buffer: [64 * 1024]u8 = undefined;
     var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
     var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    var server = alloyc.LanguageServer.init(init.gpa, init.io, &input.interface, &output.interface);
-    server.search_bases = standardLibrarySearchBases(init);
-    defer server.deinit();
-    try server.run();
-}
-
-// 'alloyc dap': the interpreter-backed debug adapter over stdio
-fn serveDebugAdapter(init: std.process.Init) !void {
-    var input_buffer: [64 * 1024]u8 = undefined;
-    var output_buffer: [64 * 1024]u8 = undefined;
-    var input = Io.File.stdin().readerStreaming(init.io, &input_buffer);
-    var output = Io.File.stdout().writerStreaming(init.io, &output_buffer);
-    var server = alloyc.DebugAdapter.init(init.gpa, init.io, &input.interface, &output.interface);
+    var server = Server.init(init.gpa, init.io, &input.interface, &output.interface);
     server.search_bases = standardLibrarySearchBases(init);
     defer server.deinit();
     try server.run();
 }
 
 fn reportDiagnostics(compilation: *const alloyc.Compilation) void {
-    // the block scopes the lock so the unlock flushes before exit
+    // the deferred unlock flushes the buffered text before the caller exits
     var buffer: [4096]u8 = undefined;
     const stderr = std.debug.lockStderr(&buffer);
     defer std.debug.unlockStderr();
@@ -259,7 +267,7 @@ fn buildExecutable(
 
     try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = ir_path, .data = ir_text });
 
-    const clang_path = findClang(init) orelse {
+    const clang_path = alloyc.toolchain.findClang(init.arena.allocator(), init.io, init.environ_map.get("ALLOY_CLANG")) orelse {
         std.debug.print(
             "error: no clang found to link the executable; set ALLOY_CLANG or add clang to PATH (kept '{s}')\n",
             .{ir_path},
@@ -299,34 +307,13 @@ fn buildExecutable(
     std.debug.print("built {s}\n", .{executable_path});
 }
 
-// resolution order: $ALLOY_CLANG, then PATH, then the conventional local
-// LLVM install directories
-fn findClang(init: std.process.Init) ?[]const u8 {
-    if (init.environ_map.get("ALLOY_CLANG")) |configured| {
-        if (configured.len != 0) return configured;
-    }
-    const candidates = [_][]const u8{
-        "clang",
-        "C:\\LLVM.bak18\\bin\\clang.exe",
-        "C:\\LLVM\\bin\\clang.exe",
-    };
-    for (candidates) |candidate| {
-        const result = std.process.run(init.arena.allocator(), init.io, .{
-            .argv = &.{ candidate, "--version" },
-        }) catch continue;
-        if (result.term == .exited and result.term.exited == 0) return candidate;
-    }
-    return null;
-}
-
 fn stripExtension(path: []const u8) []const u8 {
     const extension = std.fs.path.extension(path);
     return path[0 .. path.len - extension.len];
 }
 
 fn readFile(io: Io, allocator: std.mem.Allocator, file_path: []const u8) ![]const u8 {
-    const max_size = 10 * 1024 * 1024;
-    return try Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(max_size));
+    return try Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(alloyc.toolchain.source_read_limit));
 }
 
 // standard library search bases beyond the current directory (section

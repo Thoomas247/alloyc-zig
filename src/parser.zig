@@ -1,11 +1,10 @@
-//! Parser for the Alloy language, implementing section 2 (Syntactic Grammar)
+//! Parser for the Alloy language, implementing section 3 (Syntactic Grammar)
 //! of LANGUAGE_SPEC.md. Consumes the token list produced by the tokenizer and
 //! builds the tree defined in ast.zig.
 //!
-//! Statements are terminated by ';' and implicitly before '}', 'else', and
-//! end of file. Terminator checks verify but never consume the semicolon;
-//! statement-list loops skip semicolon runs, which also makes redundant
-//! semicolons parse as empty statements.
+//! Terminators are strict (section 3.1): every statement ends with ';',
+//! which expectTerminator consumes, and a stray ';' where a statement would
+//! start is an error rather than an empty statement.
 
 const std = @import("std");
 const tokenizer_module = @import("tokenizer.zig");
@@ -23,6 +22,9 @@ pub const Parser = struct {
     stop_at_pipe: bool,
     // match arm patterns disallow 'Name { ... }' so the arm body block is kept
     allow_struct_init: bool,
+    // a cast target retried without generic arguments: 'x to i32 < y' is a
+    // comparison once '<' fails to open a type-argument list
+    plain_cast_target: bool = false,
     failure: ?Failure,
 
     pub const Failure = struct {
@@ -189,7 +191,6 @@ pub const Parser = struct {
             try functions.append(self.arena, .{
                 .name = fn_name,
                 .receiver = receiver,
-                .receiver_token = receiver_token,
                 .parameters = try parameters.toOwnedSlice(self.arena),
                 .return_type = return_type,
             });
@@ -238,39 +239,42 @@ pub const Parser = struct {
     }
 
     fn parseTypeParameters(self: *Parser) Error![]const ast.TypeParameter {
-        var type_parameters: std.ArrayList(ast.TypeParameter) = .empty;
-        if (self.match(.angle_left) != null) {
-            while (true) {
-                const parameter_name = try self.expect(.identifier, "a type parameter name");
-                var constraint: ?ast.InterfaceMarker = null;
-                if (self.match(.colon) != null) {
-                    constraint = try self.parseInterfaceMarker();
-                }
-                try type_parameters.append(self.arena, .{ .name = parameter_name, .constraint = constraint });
-                // a pending half of '>>' closes this list before any comma
-                if (self.pending_angle) break;
-                if (self.match(.comma) == null) break;
-            }
-            try self.expectAngleRight();
+        if (self.match(.angle_left) == null) return &.{};
+        return self.parseAngleList(ast.TypeParameter, parseTypeParameter);
+    }
+
+    fn parseTypeParameter(self: *Parser) Error!ast.TypeParameter {
+        const parameter_name = try self.expect(.identifier, "a type parameter name");
+        var constraint: ?ast.InterfaceMarker = null;
+        if (self.match(.colon) != null) {
+            constraint = try self.parseInterfaceMarker();
         }
-        return type_parameters.toOwnedSlice(self.arena);
+        return .{ .name = parameter_name, .constraint = constraint };
+    }
+
+    // the comma-separated elements of a '<...>' list up to and including
+    // its '>', the opening '<' already consumed
+    fn parseAngleList(self: *Parser, comptime T: type, comptime parseElement: fn (*Parser) Error!T) Error![]const T {
+        var elements: std.ArrayList(T) = .empty;
+        while (true) {
+            try elements.append(self.arena, try parseElement(self));
+            // a pending half of '>>' closes this list before any comma
+            if (self.pending_angle) break;
+            if (self.match(.comma) == null) break;
+        }
+        try self.expectAngleRight();
+        return elements.toOwnedSlice(self.arena);
     }
 
     // an interface name with optional type arguments, used by conformance
     // markers and generic constraints ('It: Iterator<T>', section 6.2)
     fn parseInterfaceMarker(self: *Parser) Error!ast.InterfaceMarker {
         const name = try self.expect(.identifier, "an interface name");
-        var type_arguments: std.ArrayList(*const ast.TypeExpression) = .empty;
+        var type_arguments: []const *const ast.TypeExpression = &.{};
         if (self.match(.angle_left) != null) {
-            while (true) {
-                try type_arguments.append(self.arena, try self.parseType());
-                // a pending half of '>>' closes this list before any comma
-                if (self.pending_angle) break;
-                if (self.match(.comma) == null) break;
-            }
-            try self.expectAngleRight();
+            type_arguments = try self.parseAngleList(*const ast.TypeExpression, parseType);
         }
-        return .{ .name = name, .type_arguments = try type_arguments.toOwnedSlice(self.arena) };
+        return .{ .name = name, .type_arguments = type_arguments };
     }
 
     const ParameterList = struct {
@@ -407,19 +411,13 @@ pub const Parser = struct {
         while (self.match(.colon_colon) != null) {
             try path.append(self.arena, try self.expect(.identifier, "a type name"));
         }
-        var type_arguments: std.ArrayList(*const ast.TypeExpression) = .empty;
-        if (self.match(.angle_left) != null) {
-            while (true) {
-                try type_arguments.append(self.arena, try self.parseType());
-                // a pending half of '>>' closes this list before any comma
-                if (self.pending_angle) break;
-                if (self.match(.comma) == null) break;
-            }
-            try self.expectAngleRight();
+        var type_arguments: []const *const ast.TypeExpression = &.{};
+        if (!self.plain_cast_target and self.match(.angle_left) != null) {
+            type_arguments = try self.parseAngleList(*const ast.TypeExpression, parseType);
         }
         return .{
             .path = try path.toOwnedSlice(self.arena),
-            .type_arguments = try type_arguments.toOwnedSlice(self.arena),
+            .type_arguments = type_arguments,
         };
     }
 
@@ -479,10 +477,9 @@ pub const Parser = struct {
             },
             // a statement starting with one of these always parses as the
             // statement form, never as an expression (section 3.1)
-            .keyword_if => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .if_expr = try self.parseIf(false) }) }),
-            .keyword_while => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .while_expr = try self.parseWhile(false) }) }),
-            .keyword_for => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .for_expr = try self.parseFor(false) }) }),
-            .keyword_match => return self.create(ast.Statement, .{ .expression = try self.create(ast.Expression, .{ .match_expr = try self.parseMatch(false) }) }),
+            .keyword_if, .keyword_while, .keyword_for, .keyword_match => {
+                return self.create(ast.Statement, .{ .expression = try self.parseControlFlow(token.tag, false) });
+            },
             .keyword_break => {
                 const keyword = self.advance();
                 var value: ?*const ast.Expression = null;
@@ -503,9 +500,6 @@ pub const Parser = struct {
                 try self.expectTerminator();
                 return self.create(ast.Statement, .{ .yield_stmt = .{ .keyword = keyword, .value = value } });
             },
-            else => {},
-        }
-        switch (token.tag) {
             .keyword_return => {
                 const keyword = self.advance();
                 var value: ?*const ast.Expression = null;
@@ -515,22 +509,34 @@ pub const Parser = struct {
                 try self.expectTerminator();
                 return self.create(ast.Statement, .{ .return_stmt = .{ .keyword = keyword, .value = value } });
             },
-            else => {
-                const expression = try self.parseExpression();
-                if (assignOperator(self.current().tag)) {
-                    const operator = self.advance();
-                    const value = try self.parseExpression();
-                    try self.expectTerminator();
-                    return self.create(ast.Statement, .{ .assign = .{
-                        .target = expression,
-                        .operator = operator,
-                        .value = value,
-                    } });
-                }
-                try self.expectTerminator();
-                return self.create(ast.Statement, .{ .expression = expression });
-            },
+            else => {},
         }
+        // anything else is an expression statement or an assignment
+        const expression = try self.parseExpression();
+        if (assignOperator(self.current().tag)) {
+            const operator = self.advance();
+            const value = try self.parseExpression();
+            try self.expectTerminator();
+            return self.create(ast.Statement, .{ .assign = .{
+                .target = expression,
+                .operator = operator,
+                .value = value,
+            } });
+        }
+        try self.expectTerminator();
+        return self.create(ast.Statement, .{ .expression = expression });
+    }
+
+    // the constructs that read as either a statement or a value; 'tag' is
+    // one of their keywords and 'as_value' selects the position (section 3.1)
+    fn parseControlFlow(self: *Parser, tag: Token.Tag, as_value: bool) Error!*const ast.Expression {
+        return switch (tag) {
+            .keyword_if => self.create(ast.Expression, .{ .if_expr = try self.parseIf(as_value) }),
+            .keyword_while => self.create(ast.Expression, .{ .while_expr = try self.parseWhile(as_value) }),
+            .keyword_for => self.create(ast.Expression, .{ .for_expr = try self.parseFor(as_value) }),
+            .keyword_match => self.create(ast.Expression, .{ .match_expr = try self.parseMatch(as_value) }),
+            else => unreachable,
+        };
     }
 
     fn parseVarDef(self: *Parser) Error!*const ast.Statement {
@@ -633,7 +639,7 @@ pub const Parser = struct {
                 },
                 .keyword_as, .keyword_to => {
                     const operator = self.advance();
-                    const target = try self.parseType();
+                    const target = try self.parseCastTarget();
                     operand = try self.create(ast.Expression, .{ .cast = .{
                         .operator = operator,
                         .operand = operand,
@@ -644,6 +650,22 @@ pub const Parser = struct {
             }
         }
         return operand;
+    }
+
+    // a cast target may be generic ('x to Vector<u8>'), but a '<' after it
+    // is usually a comparison ('n to i32 < limit'): the argument list is
+    // tried first and the target re-read without one when it fails
+    fn parseCastTarget(self: *Parser) Error!*const ast.TypeExpression {
+        const saved = self.snapshot();
+        return self.parseType() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.ParseError => {
+                self.restore(saved);
+                self.plain_cast_target = true;
+                defer self.plain_cast_target = false;
+                return self.parseType();
+            },
+        };
     }
 
     fn parseUnary(self: *Parser) Error!*const ast.Expression {
@@ -685,8 +707,9 @@ pub const Parser = struct {
                 },
                 .bracket_left => {
                     _ = self.advance();
-                    // 'arr[start..end]' and 'arr[..end]' borrow a subslice;
-                    // a lone subscript is an element index (section 3.1)
+                    // 'arr[start..end]' and 'arr[..end]' denote the unsized
+                    // range value (section 3.1); the checker demands '&',
+                    // '&var', or 'new' on it. A lone subscript is an index
                     var start: ?*const ast.Expression = null;
                     if (self.current().tag != .dot_dot) {
                         start = try self.parseInnerExpression();
@@ -749,20 +772,14 @@ pub const Parser = struct {
         const saved = self.snapshot();
         errdefer self.restore(saved);
         _ = try self.expect(.angle_left, "'<'");
-        var type_arguments: std.ArrayList(*const ast.TypeExpression) = .empty;
-        while (true) {
-            try type_arguments.append(self.arena, try self.parseType());
-            if (self.pending_angle) break;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expectAngleRight();
+        const type_arguments = try self.parseAngleList(*const ast.TypeExpression, parseType);
         // 'Vector<T> { ... }': a struct literal binding the type's
         // parameters explicitly (section 4.7)
         if (self.current().tag == .brace_left and self.allow_struct_init and callee.* == .path) {
             const members = try self.parseMemberInits();
             return self.create(ast.Expression, .{ .struct_init = .{
                 .path = callee.path,
-                .type_arguments = try type_arguments.toOwnedSlice(self.arena),
+                .type_arguments = type_arguments,
                 .members = members,
             } });
         }
@@ -772,7 +789,7 @@ pub const Parser = struct {
         const arguments = try self.parseCallArguments();
         return self.create(ast.Expression, .{ .call = .{
             .callee = callee,
-            .type_arguments = try type_arguments.toOwnedSlice(self.arena),
+            .type_arguments = type_arguments,
             .arguments = arguments,
         } });
     }
@@ -842,10 +859,7 @@ pub const Parser = struct {
                 return self.create(ast.Expression, .{ .lambda = .{ .captures = captures, .function = function } });
             },
             .bracket_left => return self.parseArrayLiteralOrFill(),
-            .keyword_if => return self.create(ast.Expression, .{ .if_expr = try self.parseIf(true) }),
-            .keyword_while => return self.create(ast.Expression, .{ .while_expr = try self.parseWhile(true) }),
-            .keyword_for => return self.create(ast.Expression, .{ .for_expr = try self.parseFor(true) }),
-            .keyword_match => return self.create(ast.Expression, .{ .match_expr = try self.parseMatch(true) }),
+            .keyword_if, .keyword_while, .keyword_for, .keyword_match => return self.parseControlFlow(token.tag, true),
             .hash => {
                 _ = self.advance();
                 const operand = try self.parseComptimeOperand();
@@ -1101,24 +1115,6 @@ pub const Parser = struct {
         return .{ .modifier = modifier, .name = name };
     }
 
-    // whether a '|' opens a capture clause rather than a bitwise-or
-    // operand: '|name', '|&', '|move' followed by the closing '|' or ','
-    fn looksLikeCapture(self: *const Parser) bool {
-        var index = self.token_index + 1;
-        switch (self.tokens[index].tag) {
-            .keyword_move => index += 1,
-            .ampersand => {
-                index += 1;
-                if (self.tokens[index].tag == .keyword_var) index += 1;
-            },
-            else => {},
-        }
-        if (self.tokens[index].tag != .identifier) return false;
-        const after = self.tokens[index + 1].tag;
-        return after == .pipe or after == .comma;
-    }
-
-
     // a '(' starts a lambda when it opens a parameter list: '()', '(self ...)',
     // or '(name: ...)'; anything else is a parenthesized expression
     fn looksLikeLambda(self: *const Parser) bool {
@@ -1259,6 +1255,16 @@ fn parseForTest(arena: *std.heap.ArenaAllocator, source: []const u8) Parser.Erro
     try tokenizer.tokenizeAll(arena.allocator(), &tokens);
     var parser = Parser.init(arena.allocator(), source, tokens.items);
     return parser.parseModule();
+}
+
+// parses a module that must fail, returning the failure message
+fn parseFailure(arena: *std.heap.ArenaAllocator, source: []const u8) ![]const u8 {
+    var tokenizer = tokenizer_module.Tokenizer.init(source);
+    var tokens: std.ArrayList(Token) = .empty;
+    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
+    var parser = Parser.init(arena.allocator(), source, tokens.items);
+    try testing.expectError(error.ParseError, parser.parseModule());
+    return parser.failure.?.message;
 }
 
 test "imports and definitions parse" {
@@ -1403,13 +1409,8 @@ test "statement-position constructs reject bare branches and loop else" {
         .{ .source = "fn f() { var x = if (c) a; }", .needle = "needs an 'else' branch" },
     };
     for (cases) |case| {
-        var tokenizer = tokenizer_module.Tokenizer.init(case.source);
-        var tokens: std.ArrayList(Token) = .empty;
-        defer tokens.deinit(arena.allocator());
-        try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-        var parser = Parser.init(arena.allocator(), case.source, tokens.items);
-        try testing.expectError(error.ParseError, parser.parseModule());
-        try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, case.needle) != null);
+        const message = try parseFailure(&arena, case.source);
+        try testing.expect(std.mem.indexOf(u8, message, case.needle) != null);
     }
 }
 
@@ -1515,13 +1516,8 @@ test "a semicolon that terminates nothing is an error" {
         "fn f() { return 1; };",
     };
     for (sources) |source| {
-        var tokenizer = tokenizer_module.Tokenizer.init(source);
-        var tokens: std.ArrayList(Token) = .empty;
-        defer tokens.deinit(arena.allocator());
-        try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-        var parser = Parser.init(arena.allocator(), source, tokens.items);
-        try testing.expectError(error.ParseError, parser.parseModule());
-        try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "terminates nothing") != null);
+        const message = try parseFailure(&arena, source);
+        try testing.expect(std.mem.indexOf(u8, message, "terminates nothing") != null);
     }
 }
 
@@ -1529,12 +1525,8 @@ test "missing semicolon fails with a clear message" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "fn f() { var x = 1 var y = 2; }";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "expected ';'") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "expected ';'") != null);
 }
 
 test "declaration-only macros parse without a body" {
@@ -1558,48 +1550,32 @@ test "a macro declares its result type" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "macro answer() { return 42; }";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "declares its result type") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "declares its result type") != null);
 }
 
 test "a macro body requires typed parameters" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "macro bad(x) -> i64 { return x; }";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "types its parameters") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "types its parameters") != null);
 }
 
 test "an empty capture list fails with the omitted form" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "fn f() { const empty = || () { run(); }; }";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "drop the '||'") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "drop the '||'") != null);
 }
 
 test "an annotated capture fails with the prefix form" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "fn f() { const doubler = |x: &var| (a: i64) -> i64 { return a; }; }";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "'|&x|'") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "'|&x|'") != null);
 }
 
 test "extern, interface, and macro definitions" {
@@ -1742,22 +1718,14 @@ test "import after a definition fails with a clear message" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "fn f() { }\nimport std::vec;";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "imports must appear before") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "imports must appear before") != null);
 }
 
 test "stray token at top level fails with a definition message" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "const x = 1;\n";
-    var tokenizer = tokenizer_module.Tokenizer.init(source);
-    var tokens: std.ArrayList(Token) = .empty;
-    try tokenizer.tokenizeAll(arena.allocator(), &tokens);
-    var parser = Parser.init(arena.allocator(), source, tokens.items);
-    try testing.expectError(error.ParseError, parser.parseModule());
-    try testing.expect(std.mem.indexOf(u8, parser.failure.?.message, "expected a definition") != null);
+    const message = try parseFailure(&arena, source);
+    try testing.expect(std.mem.indexOf(u8, message, "expected a definition") != null);
 }
