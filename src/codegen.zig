@@ -332,6 +332,18 @@ pub const Codegen = struct {
         return self.checker.layoutOf(try self.substituted(candidate), depth);
     }
 
+    // the active instance's bindings as the checker's evaluation services
+    // take them (section 4.4)
+    fn activeBindings(self: *Codegen) Error![]const Type.Binding {
+        const environment = self.current_bindings orelse return &.{};
+        var bindings: std.ArrayList(Type.Binding) = .empty;
+        var iterator = environment.iterator();
+        while (iterator.next()) |entry| {
+            try bindings.append(self.arena, .{ .name = entry.key_ptr.*, .bound = entry.value_ptr.* });
+        }
+        return bindings.toOwnedSlice(self.arena);
+    }
+
     fn fieldSlotsQuery(self: *Codegen, candidate: *const Type) Error!?[]const Checker.FieldSlot {
         return self.checker.fieldSlots(try self.substituted(candidate));
     }
@@ -762,6 +774,7 @@ pub const Codegen = struct {
                 self.terminated = true;
             },
             .yield_stmt => |yield_stmt| try self.emitYield(yield_stmt.value, yield_stmt.keyword.location),
+            .panic_stmt => |panic_stmt| try self.emitPanic(panic_stmt.message, panic_stmt.keyword.location),
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value_expression| {
                     const value = try self.evalExpression(value_expression);
@@ -808,7 +821,10 @@ pub const Codegen = struct {
         if (try self.unsupportedReason(binding_type, 0)) |reason| {
             return self.report(var_def.name.location, "{s} are not yet supported by native code generation", .{reason});
         }
-        const value = try self.evalExpression(var_def.value);
+        var value = try self.evalExpression(var_def.value);
+        // no implicit move (section 5.2): a bare read of an owning pointer
+        // place initializes the binding with a clone of the allocation
+        value = try self.copyOwnedScalarRead(var_def.value, value, var_def.name.location);
         const coerced = try self.coerceOperand(value, try self.typeOf(var_def.value), binding_type, var_def.name.location);
         const slot = switch (try self.classify(binding_type, var_def.name.location)) {
             .void_class => return self.report(var_def.name.location, "a binding cannot have no runtime value", .{}),
@@ -826,7 +842,10 @@ pub const Codegen = struct {
             // rebinds rather than writing the pointee (section 5.2)
             const place = (try self.evalPlaceRaw(assign.target)) orelse
                 return self.report(span, "assignment to a non-assignable expression", .{});
-            const value = try self.evalExpression(assign.value);
+            var value = try self.evalExpression(assign.value);
+            // no implicit move (section 5.2): a bare read of an owning
+            // pointer local assigns a clone of its allocation
+            value = try self.copyOwnedScalarRead(assign.value, value, span);
             var coerced = try self.coerceOperand(value, try self.typeOf(assign.value), place.value_type, span);
             if (try self.ownsHeap(place.value_type, 0)) {
                 // free-on-reassign (section 5.2): the value is staged first
@@ -874,6 +893,11 @@ pub const Codegen = struct {
 
     fn evalPlace(self: *Codegen, expression: *const ast.Expression) Error!?Place {
         const raw = (try self.evalPlaceRaw(expression)) orelse return null;
+        // a place the checker typed as a bare type parameter pierces
+        // exactly the layers the checker did (section 4.7): the pointer
+        // type an instantiation binds is opaque, so the slot holding the
+        // pointer is the place, never the pointee
+        if (self.checker.pierce_depths.get(expression)) |depth| return try self.pierceLayers(raw, depth);
         return try self.piercePlace(raw);
     }
 
@@ -1044,9 +1068,17 @@ pub const Codegen = struct {
     // reads through to its pointee; checked builds verify a pierced pointer
     // is not null (a use after move)
     fn piercePlace(self: *Codegen, place: Place) Error!Place {
+        return self.pierceLayers(place, 16);
+    }
+
+    // pierces at most 'limit' indirection layers; a recorded type that is
+    // still a bare type parameter stops early too (section 4.7), which
+    // covers locals whose declared type was never substituted
+    fn pierceLayers(self: *Codegen, place: Place, limit: usize) Error!Place {
         var current = place;
         var depth: usize = 0;
-        while (depth < 16) : (depth += 1) {
+        while (depth < limit) : (depth += 1) {
+            if ((try self.checker.resolveAlias(current.value_type)).* == .type_parameter) return current;
             const resolved = try self.resolvedOf(current.value_type);
             switch (resolved.*) {
                 .reference => |indirection| {
@@ -1125,6 +1157,15 @@ pub const Codegen = struct {
                 if (self.comptime_values.get(expression)) |value| {
                     return self.constantFromValue(value, expression);
                 }
+                // a '#' expression over a type parameter evaluates per
+                // monomorphized instance, with its bindings (section 4.4)
+                var message: ?[]const u8 = null;
+                if (try self.checker.evaluateGenericComptime(expression, try self.activeBindings(), &message)) |value| {
+                    return self.constantFromValue(value, expression);
+                }
+                if (message) |text| {
+                    return self.report(self.spanOf(expression), "comptime evaluation failed: {s} (section 7.1)", .{text});
+                }
                 return self.evalExpression(inner);
             },
             .unary => return self.evalUnary(expression),
@@ -1191,7 +1232,10 @@ pub const Codegen = struct {
     fn constantFromValue(self: *Codegen, value: Interpreter.Value, expression: *const ast.Expression) Error!Operand {
         switch (value) {
             .integer => |integer| {
-                const primitive = integer.primitive orelse (self.primitiveOf(expression) orelse .i32);
+                // the checker's static type of the '#' expression is what
+                // the surrounding code expects; a per-instantiation value
+                // may carry a literal's default width instead
+                const primitive = self.primitiveOf(expression) orelse (integer.primitive orelse .i32);
                 if (primitive.isFloat()) return .{ .scalar = try self.floatConstant(@floatFromInt(integer.value), primitive) };
                 return .{ .scalar = .{
                     .text = try std.fmt.allocPrint(self.arena, "{d}", .{integer.value}),
@@ -1493,25 +1537,23 @@ pub const Codegen = struct {
             },
             .keyword_new => return self.evalNew(expression),
             .keyword_move => {
-                // 'move' reads the pointer slot itself and clears the
-                // source, transferring ownership (section 5.2)
-                const place = (try self.evalPlaceRaw(unary.operand)) orelse
+                // 'move' reads the place and transfers what it owns
+                // (section 5.2): a pointer, or the owning members of a
+                // value; through a written reference it moves out of the
+                // pointee, while a type parameter bound to a reference
+                // copies the reference (section 4.7)
+                const raw = (try self.evalPlaceRaw(unary.operand)) orelse
                     return self.report(span, "'move' needs an addressable operand", .{});
-                // an owning interface object is a 16-byte fat pair: the
-                // whole pair transfers, and nulling the data half marks
-                // the source moved-from (section 6.2)
-                if ((try self.classify(place.value_type, span)) == .aggregate) {
-                    const layout = (try self.layoutQuery(place.value_type, 0)) orelse
-                        return self.report(span, "this type has no defined runtime layout", .{});
-                    const pair = try self.aggregateSlot(layout);
-                    try self.copyBytes(pair, place.pointer, layout.size);
-                    try self.instruction("store ptr null, ptr {s}", .{place.pointer});
-                    return .{ .memory = .{ .pointer = pair, .layout = layout, .fresh = true } };
+                const resolved = try self.resolvedOf(raw.value_type);
+                if (resolved.* == .reference) {
+                    if ((try self.checker.resolveAlias(raw.value_type)).* == .type_parameter) {
+                        return self.loadPlace(raw, span);
+                    }
+                    const pointee = (try self.evalPlace(unary.operand)) orelse
+                        return self.report(span, "'move' needs an addressable operand", .{});
+                    return self.moveOutOfPlace(pointee, span);
                 }
-                const taken = try self.freshTemp();
-                try self.instruction("{s} = load ptr, ptr {s}", .{ taken, place.pointer });
-                try self.instruction("store ptr null, ptr {s}", .{place.pointer});
-                return .{ .scalar = .{ .text = taken, .llvm = "ptr" } };
+                return self.moveOutOfPlace(raw, span);
             },
             else => return self.report(span, "this operator is not yet supported by native code generation", .{}),
         }
@@ -1573,7 +1615,10 @@ pub const Codegen = struct {
                     try self.faultUnless(non_negative, "runtime fault: array fill count is negative (section 5.2)");
                 }
                 const data = try self.allocateHeapArray(wide, element_layout.size);
-                const fill_value = try self.evalExpression(array_fill.value);
+                var fill_value = try self.evalExpression(array_fill.value);
+                // a bare read of an owning pointer local fills with clones
+                // of its allocation, never with the local's own (section 5.2)
+                fill_value = try self.copyOwnedScalarRead(array_fill.value, fill_value, span);
                 const fill_type = try self.typeOf(array_fill.value);
                 const coerced = try self.coerceOperand(fill_value, fill_type, element_type, span);
                 const fill = try self.fillSource(coerced, element_type, span);
@@ -2014,12 +2059,15 @@ pub const Codegen = struct {
     fn evalAsCast(self: *Codegen, expression: *const ast.Expression) Error!Operand {
         const cast = expression.cast;
         const span = cast.operator.location;
+        const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
+        const target_resolved = try self.resolvedOf(try self.typeOf(expression));
+        if (source_resolved.* == .slice and target_resolved.* == .slice) {
+            return self.reinterpretSlice(cast.operand, source_resolved, target_resolved, span);
+        }
         if (self.cast_shapes.get(expression)) |shapes| {
             return self.reinterpretShaped(expression, cast.operand, shapes, span);
         }
         const operand = try self.evalExpression(cast.operand);
-        const source_resolved = try self.resolvedOf(try self.typeOf(cast.operand));
-        const target_resolved = try self.resolvedOf(try self.typeOf(expression));
         if (source_resolved.* == .reference and target_resolved.* == .reference) {
             // same memory viewed as another pointee; nothing moves
             return operand;
@@ -2028,6 +2076,46 @@ pub const Codegen = struct {
             return self.report(span, "'as' on this type is not yet supported by native code generation", .{});
         }
         return .{ .scalar = try self.reinterpretPrimitive(operand.scalar, source_resolved.primitive, target_resolved.primitive) };
+    }
+
+    // '&[S] as &[T]' (section 4.5): the same data pointer under a new
+    // element count, no copy. Checked builds fault when the byte length is
+    // not a whole number of target elements or the data is misaligned for
+    // the target element.
+    fn reinterpretSlice(self: *Codegen, operand_expression: *const ast.Expression, from: *const Type, to: *const Type, span: Token.Location) Error!Operand {
+        const operand = try self.evalExpression(operand_expression);
+        const memory = try self.ensureMemory(operand, try self.typeOf(operand_expression), span);
+        const source_layout = (try self.layoutQuery(from.slice.child, 0)) orelse
+            return self.report(span, "the source element type of this 'as' has no defined layout", .{});
+        const target_layout = (try self.layoutQuery(to.slice.child, 0)) orelse
+            return self.report(span, "the target element type of this 'as' has no defined layout", .{});
+        if (target_layout.size == 0) {
+            return self.report(span, "'as' cannot view a slice as zero-sized elements (section 4.5)", .{});
+        }
+        const data = try self.loadPointerField(memory.pointer, 0);
+        const length = try self.loadIntegerField(memory.pointer, 8);
+        const byte_length = try self.freshTemp();
+        try self.instruction("{s} = mul i64 {s}, {d}", .{ byte_length, length, source_layout.size });
+        if (!self.release_mode) {
+            const remainder = try self.freshTemp();
+            try self.instruction("{s} = urem i64 {s}, {d}", .{ remainder, byte_length, target_layout.size });
+            const whole = try self.freshTemp();
+            try self.instruction("{s} = icmp eq i64 {s}, 0", .{ whole, remainder });
+            try self.faultUnless(whole, "runtime fault: 'as' slice view is not a whole number of target elements (section 4.5)");
+            if (target_layout.alignment > 1) {
+                const address = try self.freshTemp();
+                try self.instruction("{s} = ptrtoint ptr {s} to i64", .{ address, data });
+                const misalignment = try self.freshTemp();
+                try self.instruction("{s} = and i64 {s}, {d}", .{ misalignment, address, target_layout.alignment - 1 });
+                const aligned = try self.freshTemp();
+                try self.instruction("{s} = icmp eq i64 {s}, 0", .{ aligned, misalignment });
+                try self.faultUnless(aligned, "runtime fault: 'as' slice data is misaligned for the target element type (section 4.5)");
+            }
+        }
+        const count = try self.freshTemp();
+        try self.instruction("{s} = udiv i64 {s}, {d}", .{ count, byte_length, target_layout.size });
+        const pair = try self.slicePair(data, count);
+        return .{ .memory = .{ .pointer = pair, .layout = .{ .size = 16, .alignment = 8 } } };
     }
 
     fn evalIsCast(self: *Codegen, expression: *const ast.Expression) Error!Operand {
@@ -2373,7 +2461,8 @@ pub const Codegen = struct {
         if (arguments.len != 0) {
             const payload_type = frame.variants[variant_index].payload orelse
                 return self.report(span, "'{s}' carries no payload", .{variant_name});
-            const value = try self.evalExpression(arguments[0]);
+            var value = try self.evalExpression(arguments[0]);
+            value = try self.copyOwnedScalarRead(arguments[0], value, span);
             const coerced = try self.coerceOperand(value, try self.typeOf(arguments[0]), payload_type, span);
             const payload_pointer = try self.byteOffset(slot, frame.payload_offset);
             try self.storeOperand(payload_pointer, coerced, payload_type, span);
@@ -2471,7 +2560,10 @@ pub const Codegen = struct {
             if (argument_index >= info.parameter_types.len) break;
             const parameter_type = info.parameter_types[argument_index];
             argument_index += 1;
-            const value = try self.evalExpression(argument);
+            var value = try self.evalExpression(argument);
+            // no implicit move (section 5.2): a bare read of an owning
+            // pointer place passes a clone of the allocation
+            value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
             const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
             try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
         }
@@ -2734,11 +2826,15 @@ pub const Codegen = struct {
                     try self.instruction("store ptr {s}, ptr {s}", .{ pierced.pointer, environment_slot });
                 },
                 .owning => {
-                    // the whole owning value transfers (a thin pointer or
-                    // an interface fat pair); nulling the leading pointer
-                    // marks the source moved-from (section 5.2)
-                    try self.copyBytes(environment_slot, raw.pointer, closure_capture.layout.size);
-                    try self.instruction("store ptr null, ptr {s}", .{raw.pointer});
+                    // moves out like the 'move' operator (section 5.2): a
+                    // written reference moves out of its pointee
+                    var origin_place = raw;
+                    const resolved = try self.resolvedOf(raw.value_type);
+                    if (resolved.* == .reference and (try self.checker.resolveAlias(raw.value_type)).* != .type_parameter) {
+                        origin_place = try self.piercePlace(raw);
+                    }
+                    const moved = try self.moveOutOfPlace(origin_place, span);
+                    try self.storeOperand(environment_slot, moved, closure_capture.binding_type, span);
                 },
             }
         }
@@ -2908,7 +3004,10 @@ pub const Codegen = struct {
         for (call.arguments, 0..) |argument, index| {
             if (index >= fn_type.parameter_types.len) break;
             const parameter_type = try self.substituted(fn_type.parameter_types[index]);
-            const value = try self.evalExpression(argument);
+            var value = try self.evalExpression(argument);
+            // no implicit move (section 5.2): a bare read of an owning
+            // pointer place passes a clone of the allocation
+            value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
             const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
             try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
         }
@@ -2957,7 +3056,8 @@ pub const Codegen = struct {
             const slot = for (slots) |candidate| {
                 if (std.mem.eql(u8, candidate.name, name)) break candidate;
             } else return self.report(member.name.location, "no field '{s}' here", .{name});
-            const value = try self.evalExpression(member.value);
+            var value = try self.evalExpression(member.value);
+            value = try self.copyOwnedScalarRead(member.value, value, member.name.location);
             const coerced = try self.coerceOperand(value, try self.typeOf(member.value), slot.field_type, member.name.location);
             const pointer = try self.byteOffset(storage, slot.offset);
             try self.storeOperand(pointer, coerced, slot.field_type, member.name.location);
@@ -2985,7 +3085,8 @@ pub const Codegen = struct {
         const storage = try self.aggregateSlot(layout);
         try self.zeroFill(storage, layout.size);
         for (elements, 0..) |element, index| {
-            const value = try self.evalExpression(element);
+            var value = try self.evalExpression(element);
+            value = try self.copyOwnedScalarRead(element, value, self.spanOf(element));
             const coerced = try self.coerceOperand(value, try self.typeOf(element), element_type, self.spanOf(element));
             const pointer = try self.byteOffset(storage, element_layout.size * index);
             try self.storeOperand(pointer, coerced, element_type, self.spanOf(element));
@@ -3007,7 +3108,10 @@ pub const Codegen = struct {
             return self.report(span, "this array has no defined layout", .{});
         const storage = try self.aggregateSlot(layout);
         try self.zeroFill(storage, layout.size);
-        const value = try self.evalExpression(array_fill.value);
+        var value = try self.evalExpression(array_fill.value);
+        // a bare read of an owning pointer local fills with clones of its
+        // allocation, never with the local's own (section 5.2)
+        value = try self.copyOwnedScalarRead(array_fill.value, value, span);
         const coerced = try self.coerceOperand(value, try self.typeOf(array_fill.value), element_type, span);
         const fill = try self.fillSource(coerced, element_type, span);
         try self.emitFillLoop(storage, try self.constantIndex(resolved.fixed_array.length), fill.operand, element_type, element_layout.size, span);
@@ -3218,7 +3322,10 @@ pub const Codegen = struct {
             load_scalar: []const u8,
             copy_bytes: u64,
             deep_copy,
+            // an owning payload moves out (section 5.2): its bytes transfer
+            // and the source's owning slots clear
             take: u64,
+            take_scalar,
             borrow_in_place,
             borrow_loaded_pointer,
             borrow_heap_view,
@@ -3227,7 +3334,7 @@ pub const Codegen = struct {
         // the slot's contents own heap, so a re-bind drops the previous
         // occupant before filling again
         fn ownsPayload(self: PreparedCapture) bool {
-            return self.fill == .deep_copy or self.fill == .take;
+            return self.fill == .deep_copy or self.fill == .take or self.fill == .take_scalar;
         }
     };
 
@@ -3255,17 +3362,24 @@ pub const Codegen = struct {
                 };
             },
             .owning => {
-                const resolved = try self.resolvedOf(payload_type);
-                if (resolved.* != .pointer and resolved.* != .heap_array) {
-                    return self.report(span, "an owning capture needs a pointer payload (section 3.1)", .{});
-                }
-                const layout = (try self.layoutQuery(payload_type, 0)) orelse
-                    return self.report(span, "this payload type has no defined layout", .{});
-                return .{
-                    .slot = try self.aggregateSlot(layout),
-                    .bound_type = payload_type,
-                    .storage = .{ .aggregate = layout.size },
-                    .fill = .{ .take = layout.size },
+                // '|move x|' moves out like the operator (section 5.2): an
+                // owning payload transfers and its source clears, a
+                // non-owning one is simply copied
+                const owns = try self.ownsHeap(payload_type, 0);
+                return switch (try self.classify(payload_type, span)) {
+                    .void_class => null,
+                    .scalar => |llvm| .{
+                        .slot = try self.scalarSlot(llvm),
+                        .bound_type = payload_type,
+                        .storage = .{ .scalar = llvm },
+                        .fill = if (owns) .take_scalar else .{ .load_scalar = llvm },
+                    },
+                    .aggregate => |layout| .{
+                        .slot = try self.aggregateSlot(layout),
+                        .bound_type = payload_type,
+                        .storage = .{ .aggregate = layout.size },
+                        .fill = if (owns) .{ .take = layout.size } else .{ .copy_bytes = layout.size },
+                    },
                 };
             },
             .reference => unreachable,
@@ -3308,6 +3422,13 @@ pub const Codegen = struct {
             },
             .take => |size| {
                 try self.copyBytes(prepared.slot, payload_pointer, size);
+                const helper = try self.clearOwnedHelper(payload_type, span);
+                try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, payload_pointer });
+            },
+            .take_scalar => {
+                const loaded = try self.freshTemp();
+                try self.instruction("{s} = load ptr, ptr {s}", .{ loaded, payload_pointer });
+                try self.storeScalar(prepared.slot, .{ .text = loaded, .llvm = "ptr" });
                 try self.instruction("store ptr null, ptr {s}", .{payload_pointer});
             },
             .borrow_in_place => try self.storeScalar(prepared.slot, .{ .text = payload_pointer, .llvm = "ptr" }),
@@ -4352,6 +4473,76 @@ pub const Codegen = struct {
         return name;
     }
 
+    /// The move-out helper for a type (section 5.2): after the bytes have
+    /// been transferred elsewhere, nulls every owning slot in the source at
+    /// any depth - pointers, heap arrays, closures, the active enum payload
+    /// - so the source drops as moved-from and a later dereference faults.
+    fn clearOwnedHelper(self: *Codegen, candidate: *const Type, span: Token.Location) Error![]const u8 {
+        const resolved = try self.resolvedOf(candidate);
+        const key = try std.fmt.allocPrint(self.arena, "clear:{s}", .{try self.typeKey(resolved, 0)});
+        if (self.helper_names.get(key)) |existing| return existing;
+        const name = try std.fmt.allocPrint(self.arena, "alloy.clear.{d}", .{self.global_counter});
+        self.global_counter += 1;
+        try self.helper_names.put(self.arena, key, name);
+
+        const saved = self.beginHelperFunction();
+        switch (resolved.*) {
+            // an interface object's data half is its owning pointer; a thin
+            // pointer, heap array, or closure block is the slot itself
+            .pointer, .heap_array, .function => try self.instruction("store ptr null, ptr %value", .{}),
+            .fixed_array => |array| {
+                if (try self.ownsHeap(array.element, 0)) {
+                    const element_layout = (try self.layoutQuery(array.element, 0)) orelse
+                        return self.report(span, "this element type has no defined layout", .{});
+                    const child_clear = try self.clearOwnedHelper(array.element, span);
+                    const length = try std.fmt.allocPrint(self.arena, "{d}", .{array.length});
+                    try self.emitHelperElementLoop("%value", length, element_layout.size, child_clear, null);
+                }
+            },
+            else => {
+                if (try self.enumFrameQuery(resolved)) |frame| {
+                    try self.emitEnumPayloadDispatch(frame, "clear", span);
+                } else if (try self.fieldSlotsQuery(resolved)) |slots| {
+                    for (slots) |slot| {
+                        if (!try self.ownsHeap(slot.field_type, 0)) continue;
+                        const field_clear = try self.clearOwnedHelper(slot.field_type, span);
+                        const pointer = try self.byteOffset("%value", slot.offset);
+                        try self.instruction("call void @\"{s}\"(ptr {s})", .{ field_clear, pointer });
+                    }
+                }
+            },
+        }
+        try self.instruction("ret void", .{});
+        self.terminated = true;
+        const header = try std.fmt.allocPrint(self.arena, "define internal void @\"{s}\"(ptr %value) {{\nentry:\n", .{name});
+        try self.finishHelperFunction(saved, header);
+        return name;
+    }
+
+    // 'move' out of a place (section 5.2): the value's bytes transfer into
+    // a fresh temporary and the source's owning slots clear; a value that
+    // owns nothing is simply read
+    fn moveOutOfPlace(self: *Codegen, place: Place, span: Token.Location) Error!Operand {
+        const owns = try self.ownsHeap(place.value_type, 0);
+        switch (try self.classify(place.value_type, span)) {
+            .void_class => return .none,
+            .scalar => |llvm| {
+                const loaded = try self.loadScalar(place.pointer, llvm);
+                if (owns) try self.instruction("store ptr null, ptr {s}", .{place.pointer});
+                return .{ .scalar = .{ .text = loaded, .llvm = llvm } };
+            },
+            .aggregate => |layout| {
+                const staged = try self.aggregateSlot(layout);
+                try self.copyBytes(staged, place.pointer, layout.size);
+                if (owns) {
+                    const helper = try self.clearOwnedHelper(place.value_type, span);
+                    try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, place.pointer });
+                }
+                return .{ .memory = .{ .pointer = staged, .layout = layout, .fresh = true } };
+            },
+        }
+    }
+
     /// The deep-copy helper for a type: copies the bytes, then clones every
     /// owned allocation so the copy owns fresh heap (section 5.2).
     fn copyHelper(self: *Codegen, candidate: *const Type, span: Token.Location) Error![]const u8 {
@@ -4506,6 +4697,7 @@ pub const Codegen = struct {
     // the destination/origin pair for copy) addresses the enum in place
     fn emitEnumPayloadDispatch(self: *Codegen, frame: Checker.EnumFrame, comptime kind: []const u8, span: Token.Location) Error!void {
         const is_copy = comptime std.mem.eql(u8, kind, "copy");
+        const is_clear = comptime std.mem.eql(u8, kind, "clear");
         const value_base: []const u8 = if (is_copy) "%destination" else "%value";
         const tag = try self.freshTemp();
         try self.instruction("{s} = load {s}, ptr {s}", .{ tag, tagTypeText(frame.tag_size), value_base });
@@ -4526,7 +4718,7 @@ pub const Codegen = struct {
                 const origin = try self.byteOffset("%origin", frame.payload_offset);
                 try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, destination, origin });
             } else {
-                const helper = try self.dropHelper(payload, span);
+                const helper = if (is_clear) try self.clearOwnedHelper(payload, span) else try self.dropHelper(payload, span);
                 const pointer = try self.byteOffset("%value", frame.payload_offset);
                 try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, pointer });
             }
@@ -4803,6 +4995,36 @@ pub const Codegen = struct {
         self.terminated = true;
     }
 
+    // 'panic [message]' (section 5.3) faults in every build mode. A message
+    // is a runtime '&[u8]', so it is copied behind the static prefix into a
+    // NUL-terminated buffer for the fault helper; the process is about to
+    // trap, so the buffer is never freed.
+    fn emitPanic(self: *Codegen, message_expression: ?*const ast.Expression, span: Token.Location) Error!void {
+        const message = message_expression orelse return self.emitFault("runtime fault: panic (section 5.3)");
+        const value = try self.evalExpression(message);
+        const memory = try self.ensureMemory(value, try self.typeOf(message), span);
+        const data = try self.loadPointerField(memory.pointer, 0);
+        const length = try self.loadIntegerField(memory.pointer, 8);
+        const prefix = "runtime fault: panic: ";
+        const prefix_global = try self.byteGlobal(prefix);
+        try self.declareMalloc();
+        try self.declareIntrinsic("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)");
+        const total = try self.freshTemp();
+        try self.instruction("{s} = add i64 {s}, {d}", .{ total, length, prefix.len + 1 });
+        const buffer = try self.freshTemp();
+        try self.instruction("{s} = call ptr @\"malloc\"(i64 {s})", .{ buffer, total });
+        try self.instruction("call void @llvm.memcpy.p0.p0.i64(ptr {s}, ptr @\"{s}\", i64 {d}, i1 false)", .{ buffer, prefix_global.name, prefix.len });
+        const tail = try self.byteOffset(buffer, prefix.len);
+        try self.instruction("call void @llvm.memcpy.p0.p0.i64(ptr {s}, ptr {s}, i64 {s}, i1 false)", .{ tail, data, length });
+        const terminator = try self.freshTemp();
+        try self.instruction("{s} = getelementptr i8, ptr {s}, i64 {s}", .{ terminator, tail, length });
+        try self.instruction("store i8 0, ptr {s}", .{terminator});
+        try self.emitFaultHelper();
+        try self.instruction("call void @\"alloy.fault\"(ptr {s})", .{buffer});
+        try self.instruction("unreachable", .{});
+        self.terminated = true;
+    }
+
     // an interface method call: compare the object's type identity against
     // every implementer, calling the concrete extension on a match; the
     // default implementation receives the interface object itself
@@ -4816,7 +5038,8 @@ pub const Codegen = struct {
         var argument_operands: std.ArrayList(Operand) = .empty;
         var argument_types: std.ArrayList(*const Type) = .empty;
         for (call.arguments) |argument| {
-            try argument_operands.append(self.arena, try self.evalExpression(argument));
+            const value = try self.evalExpression(argument);
+            try argument_operands.append(self.arena, try self.copyOwnedScalarRead(argument, value, self.spanOf(argument)));
             try argument_types.append(self.arena, try self.typeOf(argument));
         }
 
@@ -5458,6 +5681,7 @@ pub const Codegen = struct {
             .continue_stmt => |continue_stmt| continue_stmt.keyword.location.start,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location.start,
             .return_stmt => |return_stmt| return_stmt.keyword.location.start,
+            .panic_stmt => |panic_stmt| panic_stmt.keyword.location.start,
         };
     }
 
@@ -5547,18 +5771,24 @@ pub const Codegen = struct {
     fn copyOwnedScalarRead(self: *Codegen, value_expression: *const ast.Expression, operand: Operand, span: Token.Location) Error!Operand {
         if (operand != .scalar) return operand;
         const unwrapped = unwrapGrouped(value_expression);
-        if (unwrapped.* != .path or unwrapped.path.len != 1) return operand;
-        const local = self.lookupLocal(unwrapped.path[0].slice(self.source())) orelse return operand;
-        if (!try self.ownsHeap(local.declared_type, 0)) return operand;
-        if ((try self.classify(local.declared_type, span)) != .scalar) return operand;
+        // a place read: a local, a field, or an element (an element of a
+        // generic container is how 'Vector<*T>' hands its pointers on)
+        switch (unwrapped.*) {
+            .path, .member, .index => {},
+            else => return operand,
+        }
+        if (operand != .scalar) return operand;
+        const read_type = try self.resolvedOf(try self.typeOf(value_expression));
+        if (!try self.ownsHeap(read_type, 0)) return operand;
+        if ((try self.classify(read_type, span)) != .scalar) return operand;
         // a pierced read ('return p' yielding the pointee copy) already
         // copied: only a read of the owning slot itself clones here
-        const read_type = try self.resolvedOf(try self.typeOf(value_expression));
-        const local_type = try self.resolvedOf(local.declared_type);
-        if (!read_type.eql(local_type)) return operand;
+        const place = (try self.evalPlace(unwrapped)) orelse return operand;
+        const place_type = try self.resolvedOf(place.value_type);
+        if (!read_type.eql(place_type)) return operand;
         const copied_slot = try self.scalarSlot("ptr");
-        const helper = try self.copyHelper(local_type, span);
-        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, copied_slot, local.pointer });
+        const helper = try self.copyHelper(place_type, span);
+        try self.instruction("call void @\"{s}\"(ptr {s}, ptr {s})", .{ helper, copied_slot, place.pointer });
         return .{ .scalar = .{ .text = try self.loadScalar(copied_slot, "ptr"), .llvm = "ptr" } };
     }
 

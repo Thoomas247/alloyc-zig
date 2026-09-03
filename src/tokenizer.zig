@@ -105,6 +105,7 @@ pub const Token = struct {
         keyword_macro,
         keyword_is,
         keyword_to,
+        keyword_panic,
 
         plus, // +
         plus_equal, // +=
@@ -201,6 +202,7 @@ pub const Token = struct {
                 .keyword_macro => "macro",
                 .keyword_is => "is",
                 .keyword_to => "to",
+                .keyword_panic => "panic",
 
                 .plus => "+",
                 .plus_equal => "+=",
@@ -296,6 +298,7 @@ pub const Token = struct {
         .{ "macro", .keyword_macro },
         .{ "is", .keyword_is },
         .{ "to", .keyword_to },
+        .{ "panic", .keyword_panic },
     });
 
     /// Source slice of this token.
@@ -626,13 +629,13 @@ test "keywords and identifiers" {
     try expectTokens("fn main importer _x x1 Self", &.{
         .keyword_fn, .identifier, .identifier, .identifier, .identifier, .identifier,
     });
-    try expectTokens("import as extern type enum struct const var if else while for match break return new move self pub exp true false interface macro is to", &.{
-        .keyword_import, .keyword_as,    .keyword_extern,    .keyword_type,  .keyword_enum,
-        .keyword_struct, .keyword_const, .keyword_var,       .keyword_if,    .keyword_else,
-        .keyword_while,  .keyword_for,   .keyword_match,     .keyword_break, .keyword_return,
-        .keyword_new,    .keyword_move,  .keyword_self,      .keyword_pub,   .keyword_exp,
-        .keyword_true,   .keyword_false, .keyword_interface, .keyword_macro, .keyword_is,
-        .keyword_to,
+    try expectTokens("import as extern type enum struct const var if else while for match break return new move self pub exp true false interface macro is to continue yield panic", &.{
+        .keyword_import,   .keyword_as,    .keyword_extern,    .keyword_type,  .keyword_enum,
+        .keyword_struct,   .keyword_const, .keyword_var,       .keyword_if,    .keyword_else,
+        .keyword_while,    .keyword_for,   .keyword_match,     .keyword_break, .keyword_return,
+        .keyword_new,      .keyword_move,  .keyword_self,      .keyword_pub,   .keyword_exp,
+        .keyword_true,     .keyword_false, .keyword_interface, .keyword_macro, .keyword_is,
+        .keyword_to,       .keyword_continue, .keyword_yield,  .keyword_panic,
     });
 }
 

@@ -49,10 +49,10 @@ const builtin_macro_completions = [_]struct { name: []const u8, detail: []const 
 };
 
 const keyword_completions = [_][]const u8{
-    "import", "as",    "extern", "type",  "enum",   "struct",    "const", "var",
-    "fn",     "if",    "else",   "while", "for",    "match",     "break", "continue",
-    "yield",  "return", "new",   "move",  "self",   "pub",       "exp",   "true",
-    "false",  "interface", "macro", "is", "to",
+    "import", "as",        "extern", "type",  "enum", "struct", "const", "var",
+    "fn",     "if",        "else",   "while", "for",  "match",  "break", "continue",
+    "yield",  "return",    "new",    "move",  "self", "pub",    "exp",   "true",
+    "false",  "interface", "macro",  "is",    "to",   "panic",
 };
 
 // the semantic token legend registered at initialize; indexes match
@@ -464,27 +464,131 @@ pub const Server = struct {
         };
     }
 
+    // whether a unit loaded the given absolute document path as one of
+    // its views (the entry directly, imports through the loader's record)
+    fn unitReaches(self: *Server, unit: *const Compilation, path: []const u8) bool {
+        if (unit.views.len == 0) return false;
+        if (std.mem.eql(u8, unit.views[0].path, path)) return true;
+        for (unit.views[1..]) |view| {
+            const absolute = self.resolved_paths.get(view.path) orelse continue;
+            if (std.mem.eql(u8, absolute, path)) return true;
+        }
+        return false;
+    }
+
     // the entry module of the current analysis, when the edited file is
     // one of its views: the unit then keeps its shape while the user
     // navigates, so whole-program diagnostics neither move nor vanish
     // with the open file, and comptime evaluation keeps one entry root
-    fn stableEntryPath(self: *Server, path: []const u8) []const u8 {
-        const analysis = self.analysis orelse return path;
-        if (analysis.views.len == 0) return path;
+    fn stableEntryPath(self: *Server, path: []const u8) ?[]const u8 {
+        const analysis = self.analysis orelse return null;
+        if (analysis.views.len == 0) return null;
         const entry = analysis.views[0].path;
-        if (std.mem.eql(u8, entry, path)) return path;
-        for (analysis.views[1..]) |view| {
-            const absolute = self.resolved_paths.get(view.path) orelse continue;
-            if (std.mem.eql(u8, absolute, path)) return entry;
+        if (std.mem.eql(u8, entry, path)) return null;
+        if (self.unitReaches(analysis, path)) return entry;
+        return null;
+    }
+
+    // a top-level 'fn main' marks a program's entry module
+    fn definesMain(source: []const u8) bool {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |raw| {
+            var line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0 or std.ascii.isWhitespace(line[0])) continue;
+            if (std.mem.startsWith(u8, line, "pub ")) line = std.mem.trimStart(u8, line[4..], " \t");
+            if (!std.mem.startsWith(u8, line, "fn ")) continue;
+            const rest = std.mem.trimStart(u8, line[3..], " \t");
+            if (!std.mem.startsWith(u8, rest, "main")) continue;
+            const after = std.mem.trimStart(u8, rest[4..], " \t");
+            if (after.len != 0 and after[0] == '(') return true;
         }
-        return path;
+        return false;
+    }
+
+    const EntryModule = struct {
+        path: []const u8,
+        source: []const u8,
+    };
+
+    // the source of an absolute path: the open buffer, else the disk
+    fn sourceOfPath(self: *Server, allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        if (self.documents.get(path)) |open| return open.text;
+        return Io.Dir.cwd().readFileAlloc(self.io, path, allocator, .limited(toolchain.source_read_limit)) catch null;
+    }
+
+    // the entry module a program is rooted at: main.alloy beside the
+    // document, else any module defining 'main' in the document's
+    // directory or an ancestor. Open buffers count as files
+    fn projectEntry(self: *Server, allocator: std.mem.Allocator, path: []const u8) !?EntryModule {
+        var directory = directoryOf(path);
+        var levels: usize = 0;
+        while (levels < 8) : (levels += 1) {
+            if (try self.entryInDirectory(allocator, directory, path)) |entry| return entry;
+            directory = parentDirectory(directory) orelse break;
+        }
+        return null;
+    }
+
+    fn entryInDirectory(self: *Server, allocator: std.mem.Allocator, directory: []const u8, except: []const u8) !?EntryModule {
+        var names: std.ArrayList([]const u8) = .empty;
+        try names.append(allocator, "main.alloy");
+        var open = self.documents.keyIterator();
+        while (open.next()) |key| {
+            if (std.mem.eql(u8, directoryOf(key.*), directory)) {
+                try names.append(allocator, std.fs.path.basename(key.*));
+            }
+        }
+        if (directory.len != 0) {
+            if (Io.Dir.cwd().openDir(self.io, directory, .{ .iterate = true })) |dir| {
+                defer dir.close(self.io);
+                var iterator = dir.iterate();
+                while (iterator.next(self.io) catch null) |entry| {
+                    if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".alloy")) continue;
+                    try names.append(allocator, try allocator.dupe(u8, entry.name));
+                }
+            } else |_| {}
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (names.items) |name| {
+            if ((try seen.getOrPut(allocator, name)).found_existing) continue;
+            const candidate = try joinNormalized(allocator, directory, name);
+            if (std.mem.eql(u8, candidate, except)) continue;
+            const source = self.sourceOfPath(allocator, candidate) orelse continue;
+            if (definesMain(source)) return .{ .path = candidate, .source = source };
+        }
+        return null;
+    }
+
+    // the module an analysis of the document is rooted at: the current
+    // unit's entry while the document stays one of its views, else the
+    // program's entry module found on disk, else the document itself.
+    // Rooting at the program keeps whole-program diagnostics identical
+    // whichever file is open
+    fn entryModuleFor(self: *Server, path: []const u8, document: Document) !EntryModule {
+        const allocator = self.message_arena.allocator();
+        if (self.stableEntryPath(path)) |stable| {
+            if (self.sourceOfPath(allocator, stable)) |source| return .{ .path = stable, .source = source };
+        }
+        if (definesMain(document.text)) return .{ .path = path, .source = document.text };
+        if (try self.projectEntry(allocator, path)) |entry| return entry;
+        return .{ .path = path, .source = document.text };
     }
 
     // one full pipeline run for the edited document: diagnostics publish
     // per file, and a merged unit replaces the previous analysis. The unit
-    // is rooted at the stable entry, not necessarily the edited file; the
-    // loader serves the edited buffer when the unit reaches it
+    // is rooted at the program's entry, not necessarily the edited file;
+    // the loader serves the edited buffer when the unit reaches it. A
+    // document the program never imports is analyzed as its own root, so
+    // it still gets diagnostics and symbol features
     fn analyze(self: *Server, path: []const u8, document: Document) !void {
+        const entry = try self.entryModuleFor(path, document);
+        const reached = try self.analyzeRootedAt(entry, path, document);
+        if (reached or std.mem.eql(u8, entry.path, path)) return;
+        _ = try self.analyzeRootedAt(.{ .path = path, .source = document.text }, path, document);
+    }
+
+    // returns whether the unit loaded the document
+    fn analyzeRootedAt(self: *Server, entry: EntryModule, path: []const u8, document: Document) !bool {
         const unit = try self.gpa.create(Compilation);
         unit.* = Compilation.init(self.gpa);
         unit.comptime_io = self.io;
@@ -492,22 +596,10 @@ pub const Server = struct {
             unit.deinit();
             self.gpa.destroy(unit);
         }
-        const stable = self.stableEntryPath(path);
-        var entry_path = path;
-        var entry_source = document.text;
-        if (!std.mem.eql(u8, stable, path)) {
-            if (self.documents.get(stable)) |open| {
-                entry_path = stable;
-                entry_source = open.text;
-            } else if (Io.Dir.cwd().readFileAlloc(self.io, stable, self.message_arena.allocator(), .limited(toolchain.source_read_limit)) catch null) |from_disk| {
-                entry_path = stable;
-                entry_source = from_disk;
-            }
-        }
         // the unit outlives this message and the document buffer it came
         // from (an edit frees the old text), so it owns its entry module
-        const owned_path = try unit.arena.allocator().dupe(u8, entry_path);
-        const owned_source = try unit.arena.allocator().dupe(u8, entry_source);
+        const owned_path = try unit.arena.allocator().dupe(u8, entry.path);
+        const owned_source = try unit.arena.allocator().dupe(u8, entry.source);
         _ = try unit.addModule(owned_path, owned_source);
 
         var loader_context: LoaderContext = .{
@@ -521,7 +613,8 @@ pub const Server = struct {
         };
         _ = unit.run(loader) catch false;
 
-        try self.publishDiagnostics(unit, document);
+        const reached = self.unitReaches(unit, path);
+        try self.publishDiagnostics(unit, document, reached);
         if (unit.views.len != 0) {
             // extracted before the swap: a failure here frees only the new
             // unit (the errdefer above), never the analysis still in service
@@ -534,6 +627,7 @@ pub const Server = struct {
             unit.deinit();
             self.gpa.destroy(unit);
         }
+        return reached;
     }
 
     const Range = struct {
@@ -553,7 +647,12 @@ pub const Server = struct {
         message: []const u8,
     };
 
-    fn publishDiagnostics(self: *Server, unit: *const Compilation, entry_document: Document) !void {
+    // publishes this run's diagnostics per file. Markers clear only on
+    // files the run re-checked (its views) and found clean; a file that
+    // belongs to another program keeps the markers its own root published.
+    // The document itself clears only when the unit reached it, otherwise
+    // a follow-up run rooted at the document publishes for it
+    fn publishDiagnostics(self: *Server, unit: *const Compilation, entry_document: Document, reached_document: bool) !void {
         const arena = self.message_arena.allocator();
         var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(LspDiagnostic)) = .empty;
         for (unit.diagnostics.items) |item| {
@@ -568,36 +667,54 @@ pub const Server = struct {
             });
         }
 
+        // the document's own diagnostics go out under the client's URI
+        // spelling (it may differ from ours in drive-letter case or
+        // percent-encoding), matched by resolved path rather than string
+        const document_path = self.pathOfUri(entry_document.uri) orelse "";
         var fresh: std.StringHashMapUnmanaged(void) = .empty;
         var iterator = groups.iterator();
         while (iterator.next()) |entry| {
-            const uri = if (std.mem.eql(u8, entry.key_ptr.*, self.pathOfUri(entry_document.uri) orelse ""))
-                entry_document.uri
-            else
-                try self.uriOfViewPath(arena, entry.key_ptr.*);
+            const uri = try self.uriOfCheckedPath(arena, entry.key_ptr.*, document_path, entry_document.uri);
             try self.notify("textDocument/publishDiagnostics", .{
                 .uri = uri,
                 .diagnostics = entry.value_ptr.items,
             });
             try fresh.put(arena, uri, {});
         }
-        // the entry document always gets a publish, clearing stale markers
-        if (!fresh.contains(entry_document.uri)) {
+        // the files this run checked: their old markers are stale now
+        var checked: std.StringHashMapUnmanaged(void) = .empty;
+        for (unit.views) |view| {
+            try checked.put(arena, try self.uriOfCheckedPath(arena, view.path, document_path, entry_document.uri), {});
+        }
+        if (reached_document) try checked.put(arena, entry_document.uri, {});
+        if (reached_document and !fresh.contains(entry_document.uri)) {
             try self.publishEmpty(entry_document.uri);
         }
-        // clear any URI that carried diagnostics last time but not now
+        var cleared: std.ArrayList([]const u8) = .empty;
         var stale = self.published.keyIterator();
         while (stale.next()) |key| {
-            if (fresh.contains(key.*) or std.mem.eql(u8, key.*, entry_document.uri)) continue;
-            try self.publishEmpty(key.*);
+            if (fresh.contains(key.*) or !checked.contains(key.*)) continue;
+            if (!std.mem.eql(u8, key.*, entry_document.uri)) try self.publishEmpty(key.*);
+            try cleared.append(arena, key.*);
         }
-        var old = self.published.keyIterator();
-        while (old.next()) |key| self.gpa.free(key.*);
-        self.published.clearRetainingCapacity();
+        for (cleared.items) |key| {
+            const removed = self.published.fetchRemove(key).?;
+            self.gpa.free(removed.key);
+        }
         var fresh_keys = fresh.keyIterator();
         while (fresh_keys.next()) |key| {
+            if (self.published.contains(key.*)) continue;
             try self.published.put(self.gpa, try self.gpa.dupe(u8, key.*), {});
         }
+    }
+
+    // the URI a checked view path publishes under: the client's own
+    // spelling when the view is the document, else one built from the
+    // absolute file the loader found
+    fn uriOfCheckedPath(self: *Server, allocator: std.mem.Allocator, view_path: []const u8, document_path: []const u8, document_uri: []const u8) ![]const u8 {
+        const resolved = self.resolved_paths.get(view_path) orelse view_path;
+        if (std.mem.eql(u8, resolved, document_path)) return document_uri;
+        return uriFromPath(allocator, resolved);
     }
 
     // an empty diagnostics list clears the client's markers for the file
@@ -1584,6 +1701,7 @@ fn collectFromStatement(arena: std.mem.Allocator, statement: *const ast.Statemen
         .continue_stmt => {},
         .yield_stmt => |yield_stmt| try collectFromExpression(arena, yield_stmt.value, into),
         .return_stmt => |return_stmt| if (return_stmt.value) |value| try collectFromExpression(arena, value, into),
+        .panic_stmt => |panic_stmt| if (panic_stmt.message) |message| try collectFromExpression(arena, message, into),
     }
 }
 
@@ -2559,6 +2677,65 @@ test "navigating to an imported module keeps the entry's diagnostics" {
         index = found + 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "opening a module roots the analysis at the program defining main" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    // on disk: main imports helper and holds the only error. Opening
+    // helper alone must analyze the program from main, so the same
+    // diagnostics appear whichever file the editor shows first
+    const directory = ".zig-cache/alloyc-lsp-tests/root";
+    try Io.Dir.cwd().createDirPath(io, directory);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = directory ++ "/main.alloy", .data = "import helper;\nfn main() -> i32 { return twice(true); }\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = directory ++ "/helper.alloy", .data = "pub fn twice(x: i64) -> i64 { return x * 2; }\n" });
+    const base = try paths.normalized(arena, try Io.Dir.cwd().realPathFileAlloc(io, directory, arena));
+    // the client spells the drive as VS Code does: percent-encoded colon
+    const helper_uri = try std.fmt.allocPrint(arena, "file:///{c}%3A{s}/helper.alloy", .{ base[0], base[2..] });
+    const orphan_uri = try uriFromPath(arena, try std.fmt.allocPrint(arena, "{s}/orphan.alloy", .{base}));
+    const main_uri = try uriFromPath(arena, try std.fmt.allocPrint(arena, "{s}/main.alloy", .{base}));
+
+    var frames: std.ArrayList(u8) = .empty;
+    const messages = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = helper_uri, .languageId = "alloy", .version = 1, .text = "pub fn twice(x: i64) -> i64 { return x * 2; }\npub fn bad() -> i32 { return true; }\n" } },
+        }, .{}),
+        // a file beside the program that main never imports still gets
+        // its own diagnostics, without clearing the program's
+        try std.json.Stringify.valueAlloc(arena, .{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = orphan_uri, .languageId = "alloy", .version = 1, .text = "fn lonely() -> i32 { return missing(); }\n" } },
+        }, .{}),
+    };
+    for (messages) |message| {
+        try frames.print(arena, "Content-Length: {d}\r\n\r\n{s}", .{ message.len, message });
+    }
+
+    var reader = Io.Reader.fixed(frames.items);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var server = Server.init(std.testing.allocator, io, &reader, &output.writer);
+    defer server.deinit();
+    try server.run();
+
+    const transcript = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "no overload of 'twice' matches these argument types") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, main_uri) != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "use of undeclared identifier 'missing'") != null);
+    const cleared_main = try std.fmt.allocPrint(arena, "\"uri\":\"{s}\",\"diagnostics\":[]", .{main_uri});
+    try std.testing.expect(std.mem.indexOf(u8, transcript, cleared_main) == null);
+    // helper's own error publishes under the client's URI spelling and
+    // is not cleared by a follow-up empty publish for that spelling
+    const helper_marked = try std.fmt.allocPrint(arena, "\"uri\":\"{s}\",\"diagnostics\":[{{", .{helper_uri});
+    try std.testing.expect(std.mem.indexOf(u8, transcript, helper_marked) != null);
+    const cleared_helper = try std.fmt.allocPrint(arena, "\"uri\":\"{s}\",\"diagnostics\":[]", .{helper_uri});
+    try std.testing.expect(std.mem.indexOf(u8, transcript, cleared_helper) == null);
 }
 
 test "a burst of edits analyzes once, not once per keystroke" {

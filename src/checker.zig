@@ -109,7 +109,17 @@ pub const Checker = struct {
     // its use site (section 5.2 reference-binding explicitness); both
     // engines copy the pointee when the node is marked here
     pierced_results: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
+    // reads whose pierced type is a bare type parameter (section 4.7),
+    // with the number of indirection layers the checker read through:
+    // both engines stop exactly there instead of piercing on into the
+    // pointer type an instantiation may bind
+    pierce_depths: std.AutoHashMapUnmanaged(*const ast.Expression, u8) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
+    // '#' expressions that reflect a type parameter of their generic
+    // ('#T.size()', section 4.4): they have a value per instantiation, so
+    // codegen and the interpreter evaluate them through
+    // evaluateGenericComptime once the bindings are known
+    generic_comptime: std.AutoHashMapUnmanaged(*const ast.Expression, PendingComptime) = .empty,
     // synthesised types per 'type T = #...' expression (section 4.4)
     comptime_type_cache: std.AutoHashMapUnmanaged(*const ast.Expression, *const Type) = .empty,
     // nonzero while checking inside a '#' expression: macro calls are only
@@ -144,6 +154,9 @@ pub const Checker = struct {
         // 4.2); using the binding here is a compile-time error, while a
         // conditional move stays a checked runtime fault
         moved: bool = false,
+        // a by-value parameter: immutable, but the callee owns it, so
+        // 'move' may clear it (section 5.2)
+        owned: bool = false,
     };
 
     const PendingComptime = struct {
@@ -258,6 +271,7 @@ pub const Checker = struct {
                         try self.report(parameter.name.location, "'#Type' may only appear in a macro signature; a function cannot take or return a comptime type (section 4.4)", .{});
                     }
                     try self.bind(parameter.name, parameter_type, false);
+            self.markOwnedParameter();
                 }
                 const declared_return: *const Type = if (fn_def.function.return_type) |return_expression|
                     try self.typeFromExpression(return_expression, environment)
@@ -331,6 +345,7 @@ pub const Checker = struct {
             else
                 &unknown_type;
             try self.bind(parameter.name, parameter_type, false);
+            self.markOwnedParameter();
         }
         const declared_return = try self.typeFromExpression(macro_def.return_type, &empty_type_environment);
         const saved_return = self.return_type;
@@ -867,7 +882,7 @@ pub const Checker = struct {
     // '#Type'; the result is cached per node so repeated uses agree
     fn comptimeType(self: *Checker, expression: *const ast.Expression, view_index: usize) Error!*const Type {
         if (self.comptime_type_cache.get(expression)) |cached| return cached;
-        const machine = try self.comptimeMachine(view_index, &.{});
+        const machine = try self.comptimeMachine(view_index, &.{}, &.{});
         const span = self.expressionSpan(expression);
         const result: *const Type = result: {
             const value = machine.evaluate(expression) catch |err| switch (err) {
@@ -1607,6 +1622,18 @@ pub const Checker = struct {
                     }
                 }
             },
+            // 'panic [message]' faults unconditionally (section 5.3); the
+            // message, when given, is a '&[u8]'
+            .panic_stmt => |panic_stmt| {
+                if (panic_stmt.message) |message| {
+                    const expected = try self.stringSliceType();
+                    const message_type = try self.consumedValueType(message, try self.checkExpression(message, expected));
+                    if (!try self.coerce(message_type, expected)) {
+                        const rendered = try message_type.render(self.arena);
+                        try self.report(panic_stmt.keyword.location, "a 'panic' message is a '&[u8]', found {s} (section 5.3)", .{rendered});
+                    }
+                }
+            },
             .break_stmt => |break_stmt| {
                 const frame = self.innermostYieldFrame(.loop) orelse {
                     try self.report(break_stmt.keyword.location, "'break' must be inside a loop; an if or match produces its value with 'yield' (section 5.3)", .{});
@@ -1717,7 +1744,8 @@ pub const Checker = struct {
     // count as falling through
     fn statementTerminates(statement: *const ast.Statement) bool {
         switch (statement.*) {
-            .return_stmt, .break_stmt, .continue_stmt, .yield_stmt => return true,
+            // 'panic' never completes in any build mode (section 5.3)
+            .return_stmt, .break_stmt, .continue_stmt, .yield_stmt, .panic_stmt => return true,
             .block => |statements| {
                 for (statements) |child| {
                     if (statementTerminates(child)) return true;
@@ -1766,6 +1794,10 @@ pub const Checker = struct {
             .return_stmt => |return_stmt| {
                 const value = return_stmt.value orelse return false;
                 return expressionBreaksLoop(value, depth);
+            },
+            .panic_stmt => |panic_stmt| {
+                const message = panic_stmt.message orelse return false;
+                return expressionBreaksLoop(message, depth);
             },
             .block => |statements| {
                 for (statements) |child| {
@@ -1985,6 +2017,18 @@ pub const Checker = struct {
                     try self.report(self.expressionSpan(expression), "a '#Type' cannot be retained in a runtime declaration (section 4.4)", .{});
                     return &unknown_type;
                 }
+                // an expression reflecting a type parameter has no value
+                // until the parameter binds: it evaluates per instantiation
+                // (section 4.4), typed statically by the method it calls
+                if (self.mentionsTypeParameter(inner)) {
+                    try self.generic_comptime.put(self.arena, expression, .{
+                        .outer = expression,
+                        .inner = inner,
+                        .view_index = self.current_view,
+                        .environment = try self.snapshotComptimeEnvironment(),
+                    });
+                    return result;
+                }
                 if (self.needsEagerComptime(inner)) {
                     const environment = try self.snapshotComptimeEnvironment();
                     if (try self.runValueComptime(expression, inner, self.current_view, environment)) |value| {
@@ -2055,7 +2099,7 @@ pub const Checker = struct {
                 }
                 // pointee transparency: reading a pointer or reference yields
                 // a copy of the pointee (section 5.2)
-                return self.pierce(binding.binding_type);
+                return self.pierceRead(expression, binding.binding_type);
             }
             // '#T' reflects a type (section 4.4): typed as '#Type' inside
             // any comptime context so hover and '#Point.' completion work;
@@ -2065,6 +2109,11 @@ pub const Checker = struct {
                 if (primitiveByName(name) != null) return self.makeType(.type_description);
                 // '#void', the payload-less member marker (section 4.4)
                 if (std.mem.eql(u8, name, "void")) return self.makeType(.type_description);
+                // '#T' on the enclosing generic's type parameter reflects
+                // the bound argument per instantiation (section 4.4)
+                if (self.scope_types.get(name)) |scoped| {
+                    if (scoped.* == .type_parameter) return self.makeType(.type_description);
+                }
                 if (self.firstVisible(name, self.current_view)) |symbol| {
                     switch (symbol.definition.kind) {
                         .type_def, .interface_def => return self.makeType(.type_description),
@@ -2315,33 +2364,50 @@ pub const Checker = struct {
         const unary = expression.unary;
         const place = try self.lvalueOf(unary.operand) orelse {
             _ = try self.checkExpression(unary.operand, null);
-            try self.report(unary.operator.location, "'move' requires an owning pointer variable or field", .{});
+            try self.report(unary.operator.location, "'move' needs a place to move out of: a variable, field, or element (section 5.2)", .{});
             return &unknown_type;
         };
-        switch (place.raw.*) {
-            .pointer, .heap_array => {},
-            .unknown => return &unknown_type,
-            else => {
-                const rendered = try place.raw.render(self.arena);
-                try self.report(unary.operator.location, "'move' requires a pointer (*T or *[T]), found {s}", .{rendered});
-                return &unknown_type;
+        const raw = try self.resolveAlias(place.raw);
+        if (raw.* == .unknown) return &unknown_type;
+        // 'move' reads its operand and transfers what the value owns
+        // (section 5.2): a pointer transfers; a value moves its owning
+        // members out and copies the rest; a reference does that to its
+        // pointee and yields it; a type parameter acts on whatever the
+        // instantiation binds (section 4.7). It writes its source only when
+        // something is owned, and then the source must be mutable.
+        var result: *const Type = place.raw;
+        var writes = true;
+        var source_mutable = place.mutable;
+        switch (raw.*) {
+            .pointer, .heap_array, .type_parameter => {},
+            .reference => |indirection| {
+                result = place.pierced;
+                writes = try self.typeOwnsHeap(place.pierced, 0);
+                source_mutable = indirection.mutable;
+                if (writes and !source_mutable) {
+                    try self.report(unary.operator.location, "'move' through an immutable '&' writes the pointee, which needs '&var' (section 5.2)", .{});
+                    return result;
+                }
             },
-        }
-        if (!place.mutable) {
-            try self.report(unary.operator.location, "'move' clears its source, which must be mutable (section 4.8)", .{});
+            else => writes = try self.typeOwnsHeap(raw, 0),
         }
         // definite move tracking (section 5.2): a bare variable is
         // marked; a field or element move only checks its root
         const operand_unwrapped = unwrapGrouped(unary.operand);
+        var owned_parameter = false;
         if (rootPathToken(unary.operand)) |root_token| {
             if (self.lookupPointer(root_token.slice(self.source()))) |binding| {
+                owned_parameter = binding.owned;
                 if (binding.moved) {
                     try self.report(unary.operator.location, "'{s}' was already moved (section 5.2)", .{root_token.slice(self.source())});
                 }
-                if (operand_unwrapped.* == .path) binding.moved = true;
+                if (writes and raw.* != .reference and operand_unwrapped.* == .path) binding.moved = true;
             }
         }
-        return place.raw;
+        if (writes and raw.* != .reference and !source_mutable and !owned_parameter) {
+            try self.report(unary.operator.location, "'move' clears its source, which must be mutable (section 4.8)", .{});
+        }
+        return result;
     }
 
     fn checkBinary(self: *Checker, expression: *const ast.Expression) Error!*const Type {
@@ -2454,8 +2520,26 @@ pub const Checker = struct {
         var source_measured = source_resolved;
         var target_measured = target_resolved;
         if (source_resolved.* == .reference and target_resolved.* == .reference) {
+            // a view never gains mutability (section 4.5)
+            if (!source_resolved.reference.mutable and target_resolved.reference.mutable) {
+                try self.report(cast.operator.location, "'as' cannot make a reference mutable: the source is an immutable '&' (section 4.5)", .{});
+            }
             source_measured = try self.resolveAlias(source_resolved.reference.child);
             target_measured = try self.resolveAlias(target_resolved.reference.child);
+        }
+        // '&[S] as &[T]' views the elements' bytes as T (section 4.5): a
+        // slice's length is a runtime value, so the width rule is checked
+        // at runtime by both engines and only the elements are checked here
+        if (source_resolved.* == .slice and target_resolved.* == .slice) {
+            if (!source_resolved.slice.mutable and target_resolved.slice.mutable) {
+                try self.report(cast.operator.location, "'as' cannot make a slice view mutable: the source is an immutable '&[T]' (section 4.5)", .{});
+            }
+            if (try self.layoutOf(target_resolved.slice.child, 0)) |element_layout| {
+                if (element_layout.size == 0) {
+                    try self.report(cast.operator.location, "'as' cannot view a slice as zero-sized elements (section 4.5)", .{});
+                }
+            }
+            return target;
         }
         const source_layout = try self.layoutOf(source_measured, 0);
         const target_layout = try self.layoutOf(target_measured, 0);
@@ -2590,9 +2674,9 @@ pub const Checker = struct {
         const resolved = try self.resolveAlias(base);
         // reading an element pierces like any read (section 5.2)
         return switch (resolved.*) {
-            .slice => |slice| self.pierce(slice.child),
-            .heap_array => |heap| self.pierce(heap.child),
-            .fixed_array => |array| self.pierce(array.element),
+            .slice => |slice| self.pierceRead(expression, slice.child),
+            .heap_array => |heap| self.pierceRead(expression, heap.child),
+            .fixed_array => |array| self.pierceRead(expression, array.element),
             .unknown => &unknown_type,
             else => {
                 const rendered = try base.render(self.arena);
@@ -2649,7 +2733,24 @@ pub const Checker = struct {
         const base = try self.checkExpression(member.object, null);
         // pointee transparency (section 5.2): reading a pointer or
         // reference field yields a copy of the pointee
-        return self.pierce(try self.memberType(base, member.name));
+        return self.pierceRead(expression, try self.memberType(base, member.name));
+    }
+
+    // a value read pierces like 'pierce'; when it lands on a bare type
+    // parameter the layer count is recorded so both engines stop there
+    // (section 4.7: the instantiation's own pointer type is opaque)
+    fn pierceRead(self: *Checker, expression: *const ast.Expression, candidate: *const Type) Error!*const Type {
+        var current = candidate;
+        var depth: u8 = 0;
+        while (depth < 16) : (depth += 1) {
+            switch (current.*) {
+                .pointer => |indirection| current = indirection.child,
+                .reference => |indirection| current = indirection.child,
+                else => break,
+            }
+        }
+        if (current.* == .type_parameter) try self.pierce_depths.put(self.arena, expression, depth);
+        return current;
     }
 
     fn memberType(self: *Checker, base: *const Type, name_token: Token) Error!*const Type {
@@ -2979,13 +3080,17 @@ pub const Checker = struct {
             if (outer.moved) {
                 try self.report(capture.name.location, "use of '{s}' after 'move' (section 5.2)", .{name});
             }
-            const bound = try self.captureBinding(capture, outer.binding_type, outer.mutable, try self.pierce(outer.binding_type));
+            const bound = try self.captureBinding(capture, outer.binding_type, outer.mutable or outer.owned, try self.pierce(outer.binding_type));
             try capture_bindings.append(self.arena, bound);
             // an owning capture moves the outer variable at construction,
-            // which is unconditional (section 5.4)
+            // which is unconditional (section 5.4); a non-owning value is
+            // only copied, and a reference stays usable (its pointee moved)
             if (capture.modifier) |modifier| {
                 if (modifier == .pointer or modifier == .pointer_var) {
-                    if (self.lookupPointer(name)) |outer_binding| outer_binding.moved = true;
+                    const outer_resolved = try self.resolveAlias(outer.binding_type);
+                    if (outer_resolved.* != .reference and try self.typeOwnsHeap(outer_resolved, 0)) {
+                        if (self.lookupPointer(name)) |outer_binding| outer_binding.moved = true;
+                    }
                 }
             }
         }
@@ -3003,6 +3108,7 @@ pub const Checker = struct {
             const parameter_type = try self.typeFromExpression(parameter.parameter_type, self.scope_types);
             try parameter_types.append(self.arena, parameter_type);
             try self.bind(parameter.name, parameter_type, false);
+            self.markOwnedParameter();
         }
 
         const declared_return: ?*const Type = if (lambda.function.return_type) |return_expression|
@@ -3118,20 +3224,30 @@ pub const Checker = struct {
                     return .{ .name = name, .binding_type = bound, .mutable = mutable };
                 },
                 .pointer, .pointer_var => {
-                    // owning capture ('|move x|'): only pointers are movable
-                    // (section 3.1)
-                    const is_pointer = subject_raw.* == .pointer or subject_raw.* == .heap_array or subject_raw.* == .unknown;
-                    if (!is_pointer) {
-                        const rendered = try subject_raw.render(self.arena);
-                        try self.report(capture.name.location, "an owning capture requires a pointer-typed value, found {s} (section 3.1)", .{rendered});
-                        return .{ .name = name, .binding_type = &unknown_type, .mutable = false };
+                    // owning capture ('|move x|'): moves out of the subject
+                    // like the 'move' operator (section 5.2) - a pointer
+                    // transfers, a value moves its owning members, a
+                    // reference does that to its pointee and binds it
+                    const raw = try self.resolveAlias(subject_raw);
+                    if (raw.* == .unknown) return .{ .name = name, .binding_type = &unknown_type, .mutable = false };
+                    var bound = subject_raw;
+                    var writes = true;
+                    var source_mutable = subject_mutable;
+                    switch (raw.*) {
+                        .pointer, .heap_array, .type_parameter => {},
+                        .reference => |indirection| {
+                            bound = try self.defaulted(subject_value);
+                            writes = try self.typeOwnsHeap(bound, 0);
+                            source_mutable = indirection.mutable;
+                        },
+                        else => writes = try self.typeOwnsHeap(raw, 0),
                     }
-                    if (!subject_mutable) {
+                    if (writes and !source_mutable) {
                         try self.report(capture.name.location, "an owning capture moves out of its subject, which must be mutable (section 3.1)", .{});
                     }
-                    // the capture owns the allocation now: it moves on
-                    // like any owning 'var' binding (section 3.1)
-                    return .{ .name = name, .binding_type = subject_raw, .mutable = true };
+                    // the capture owns what it took: it moves on like any
+                    // owning 'var' binding (section 3.1)
+                    return .{ .name = name, .binding_type = bound, .mutable = true };
                 },
             }
         }
@@ -4144,7 +4260,7 @@ pub const Checker = struct {
     // builds a sandboxed interpreter with the constants of one snapshot
     // bound in declaration order; a failing initializer simply is not
     // compile-time-known
-    fn comptimeMachine(self: *Checker, view_index: usize, environment: []const ComptimeEnvironmentEntry) Error!*Interpreter {
+    fn comptimeMachine(self: *Checker, view_index: usize, environment: []const ComptimeEnvironmentEntry, bindings: []const Type.Binding) Error!*Interpreter {
         const sink = try self.arena.create(std.Io.Writer.Allocating);
         sink.* = .init(self.arena);
         const machine = try self.arena.create(Interpreter);
@@ -4161,11 +4277,15 @@ pub const Checker = struct {
             &sink.writer,
         );
         machine.pierced_results = &self.pierced_results;
+        machine.pierce_depths = &self.pierce_depths;
         machine.comptime_mode = true;
         machine.comptime_io = self.comptime_io;
         machine.comptime_root = self.comptime_root;
         machine.step_budget = 1_000_000;
         machine.current_view = view_index;
+        // a generic body's constants may reflect its type parameters too
+        // ('const size = #T.size();'), so the bindings precede them
+        machine.current_type_bindings = bindings;
         machine.reflection = .{
             .context = @ptrCast(self),
             .reflect_named = reflectNamedHook,
@@ -4173,7 +4293,10 @@ pub const Checker = struct {
             .reflect_layout = reflectLayoutHook,
             .reflect_implementers = reflectImplementersHook,
             .reflect_implements = reflectImplementsHook,
+            .reflect_type = reflectTypeHook,
+            .reflect_layout_of = reflectLayoutOfHook,
         };
+        machine.checker_hooks = self.runtimeHooks();
         machine.pushEnvironment() catch return error.OutOfMemory;
         for (environment) |entry| {
             const initializer = entry.initializer orelse {
@@ -4196,7 +4319,7 @@ pub const Checker = struct {
     // errors, the pointer barrier applies, and the value is recorded for
     // runtime substitution
     fn runValueComptime(self: *Checker, outer: *const ast.Expression, inner: *const ast.Expression, view_index: usize, environment: []const ComptimeEnvironmentEntry) Error!?Interpreter.Value {
-        const machine = try self.comptimeMachine(view_index, environment);
+        const machine = try self.comptimeMachine(view_index, environment, &.{});
         const value = machine.evaluate(inner) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
@@ -4265,6 +4388,159 @@ pub const Checker = struct {
             .function => return value == .function or value == .closure,
             else => return false,
         }
+    }
+
+    // whether a '#' expression reflects a type parameter of the enclosing
+    // generic ('#T', section 4.4); a local of the same name shadows the
+    // parameter. Control-flow bodies are scanned too: '#if (T.size() > 8)
+    // ...' is per-instantiation wherever the parameter appears.
+    fn mentionsTypeParameter(self: *Checker, expression: *const ast.Expression) bool {
+        switch (expression.*) {
+            .path => |path| {
+                if (path.len != 1) return false;
+                const name = path[0].slice(self.source());
+                if (self.lookup(name) != null) return false;
+                const scoped = self.scope_types.get(name) orelse return false;
+                return scoped.* == .type_parameter;
+            },
+            .call => |call| {
+                if (self.mentionsTypeParameter(call.callee)) return true;
+                for (call.arguments) |argument| {
+                    if (self.mentionsTypeParameter(argument)) return true;
+                }
+                return false;
+            },
+            .member => |member| return self.mentionsTypeParameter(member.object),
+            .index => |index| return self.mentionsTypeParameter(index.object) or self.mentionsTypeParameter(index.subscript),
+            .subslice => |subslice| {
+                if (subslice.start) |start| if (self.mentionsTypeParameter(start)) return true;
+                return self.mentionsTypeParameter(subslice.object) or self.mentionsTypeParameter(subslice.end);
+            },
+            .grouped => |inner| return self.mentionsTypeParameter(inner),
+            .unary => |unary| return self.mentionsTypeParameter(unary.operand),
+            .binary => |binary| return self.mentionsTypeParameter(binary.left) or self.mentionsTypeParameter(binary.right),
+            .cast => |cast| return self.mentionsTypeParameter(cast.operand),
+            .comptime_expr => |inner| return self.mentionsTypeParameter(inner),
+            .if_expr => |if_expr| {
+                if (self.mentionsTypeParameter(if_expr.condition)) return true;
+                if (self.statementMentionsTypeParameter(if_expr.then_branch)) return true;
+                if (if_expr.else_branch) |else_branch| return self.statementMentionsTypeParameter(else_branch);
+                return false;
+            },
+            .match_expr => |match_expr| {
+                if (self.mentionsTypeParameter(match_expr.subject)) return true;
+                for (match_expr.arms) |arm| {
+                    if (self.statementMentionsTypeParameter(arm.body)) return true;
+                }
+                if (match_expr.else_branch) |else_branch| return self.statementMentionsTypeParameter(else_branch);
+                return false;
+            },
+            .while_expr => |while_expr| {
+                if (self.mentionsTypeParameter(while_expr.condition)) return true;
+                return self.statementMentionsTypeParameter(while_expr.body);
+            },
+            .struct_init => |struct_init| {
+                for (struct_init.members) |member| {
+                    if (self.mentionsTypeParameter(member.value)) return true;
+                }
+                return false;
+            },
+            .array_literal => |elements| {
+                for (elements) |element| {
+                    if (self.mentionsTypeParameter(element)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn statementMentionsTypeParameter(self: *Checker, statement: *const ast.Statement) bool {
+        switch (statement.*) {
+            .block => |statements| {
+                for (statements) |child| {
+                    if (self.statementMentionsTypeParameter(child)) return true;
+                }
+                return false;
+            },
+            .var_def => |var_def| return self.mentionsTypeParameter(var_def.value),
+            .assign => |assign| return self.mentionsTypeParameter(assign.target) or self.mentionsTypeParameter(assign.value),
+            .expression => |expression| return self.mentionsTypeParameter(expression),
+            .break_stmt => |break_stmt| return if (break_stmt.value) |value| self.mentionsTypeParameter(value) else false,
+            .continue_stmt => return false,
+            .yield_stmt => |yield_stmt| return self.mentionsTypeParameter(yield_stmt.value),
+            .return_stmt => |return_stmt| return if (return_stmt.value) |value| self.mentionsTypeParameter(value) else false,
+            .panic_stmt => |panic_stmt| return if (panic_stmt.message) |message| self.mentionsTypeParameter(message) else false,
+        }
+    }
+
+    /// Evaluates a '#' expression that reflects a type parameter (section
+    /// 4.4) for one instantiation, described by 'bindings'. Null with no
+    /// message when the expression is not such an expression; null with a
+    /// message when evaluation faulted. Called by codegen per monomorphized
+    /// instance and by the interpreter per generic call.
+    pub fn evaluateGenericComptime(self: *Checker, expression: *const ast.Expression, bindings: []const Type.Binding, message: *?[]const u8) Error!?Interpreter.Value {
+        const pending = self.generic_comptime.get(expression) orelse return null;
+        const saved_view = self.current_view;
+        defer self.current_view = saved_view;
+        self.current_view = pending.view_index;
+        const machine = try self.comptimeMachine(pending.view_index, pending.environment, bindings);
+        const value = machine.evaluate(pending.inner) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                message.* = machine.fault_message orelse "unspecified fault";
+                return null;
+            },
+        };
+        if (violatesPointerBarrier(value)) {
+            message.* = "a compile-time result is a value or a slice, never a '&T', '*T', or '*[T]' (section 7.2)";
+            return null;
+        }
+        return value;
+    }
+
+    /// The hooks a running program uses to reach the checker (sections 4.4,
+    /// 4.5): per-instantiation '#' evaluation and slice-cast layouts.
+    pub fn runtimeHooks(self: *Checker) Interpreter.CheckerHooks {
+        return .{
+            .context = @ptrCast(self),
+            .generic_comptime = genericComptimeHook,
+            .slice_cast = sliceCastHook,
+        };
+    }
+
+    fn genericComptimeHook(context: *anyopaque, expression: *const ast.Expression, bindings: []const Type.Binding, message: *?[]const u8) error{OutOfMemory}!?Interpreter.Value {
+        const self: *Checker = @ptrCast(@alignCast(context));
+        return self.evaluateGenericComptime(expression, bindings, message);
+    }
+
+    fn sliceCastHook(context: *anyopaque, source_type: *const Type, target_type: *const Type, bindings: []const Type.Binding) error{OutOfMemory}!?Interpreter.SliceCastInfo {
+        const self: *Checker = @ptrCast(@alignCast(context));
+        return self.sliceCastInfo(source_type, target_type, bindings);
+    }
+
+    // the element layouts and byte shapes of a '&[S] as &[T]' cast (section
+    // 4.5) once the bindings make both sides concrete; null when a side is
+    // not a slice or an element has no layout
+    fn sliceCastInfo(self: *Checker, source_type: *const Type, target_type: *const Type, bindings: []const Type.Binding) Error!?Interpreter.SliceCastInfo {
+        var environment: TypeEnvironment = .empty;
+        for (bindings) |binding| try environment.put(self.arena, binding.name, binding.bound);
+        const from = try self.resolveAlias(try self.substitute(source_type, &environment));
+        const to = try self.resolveAlias(try self.substitute(target_type, &environment));
+        if (from.* != .slice or to.* != .slice) return null;
+        const source_layout = try self.layoutOf(from.slice.child, 0) orelse return null;
+        const target_layout = try self.layoutOf(to.slice.child, 0) orelse return null;
+        var shapes: ?types.CastShapes = null;
+        const source_shape = try self.shapeOf(from.slice.child, 0);
+        const target_shape = try self.shapeOf(to.slice.child, 0);
+        if (source_shape != null and target_shape != null) {
+            shapes = .{ .source = source_shape.?, .target = target_shape.? };
+        }
+        return .{
+            .source = .{ .size = source_layout.size, .alignment = source_layout.alignment },
+            .target = .{ .size = target_layout.size, .alignment = target_layout.alignment },
+            .shapes = shapes,
+        };
     }
 
     // whether a '#' expression must evaluate during checking: type
@@ -4424,6 +4700,72 @@ pub const Checker = struct {
     fn reflectNamedHook(context: *anyopaque, name: []const u8) error{OutOfMemory}!?*Interpreter.Value.TypeDescription {
         const self: *Checker = @ptrCast(@alignCast(context));
         return self.reflectName(name);
+    }
+
+    // a generic body's '#T' reflects the argument bound at the active
+    // instantiation (section 4.4); an unbound parameter reflects nothing
+    fn reflectTypeHook(context: *anyopaque, candidate: *const Type) error{OutOfMemory}!?*Interpreter.Value.TypeDescription {
+        const self: *Checker = @ptrCast(@alignCast(context));
+        const resolved = try self.resolveAlias(candidate);
+        if (resolved.* == .unknown or resolved.* == .type_parameter) return null;
+        return try self.describeType(candidate, 0);
+    }
+
+    fn reflectLayoutOfHook(context: *anyopaque, description: *Interpreter.Value.TypeDescription) error{OutOfMemory}!?Interpreter.TypeLayout {
+        const self: *Checker = @ptrCast(@alignCast(context));
+        return self.layoutOfDescription(description, 0);
+    }
+
+    // the section 4.9 layout of a '#Type' in hand ('size' / 'alignment'):
+    // a struct or enum folds its CURRENT members, so a description rebuilt
+    // with add_member reports its new size; everything else answers from
+    // the type it reflects. Null for an interface, '#void', or any member
+    // without a runtime layout.
+    fn layoutOfDescription(self: *Checker, description: *Interpreter.Value.TypeDescription, depth: usize) Error!?Interpreter.TypeLayout {
+        if (depth > 64) return null;
+        switch (description.kind) {
+            .struct_kind => {
+                var offset: u64 = 0;
+                var max_alignment: u64 = 1;
+                for (description.members.items) |member| {
+                    const member_layout = try self.layoutOfDescription(member.description, depth + 1) orelse return null;
+                    max_alignment = @max(max_alignment, member_layout.alignment);
+                    offset = alignForward(offset, member_layout.alignment) + member_layout.size;
+                }
+                return .{ .size = alignForward(offset, max_alignment), .alignment = max_alignment };
+            },
+            .enum_kind => {
+                // the same numbers enumLayoutParts derives from a body
+                const count = description.members.items.len;
+                const tag_size: u64 = if (count <= 1 << 8) 1 else if (count <= 1 << 16) 2 else 4;
+                var payload_size: u64 = 0;
+                var payload_alignment: u64 = 1;
+                for (description.members.items) |member| {
+                    // '#void' marks a payload-less variant (section 4.4)
+                    if (member.description.kind == .other_kind and member.description.origin == null) continue;
+                    const payload_layout = try self.layoutOfDescription(member.description, depth + 1) orelse return null;
+                    payload_size = @max(payload_size, payload_layout.size);
+                    payload_alignment = @max(payload_alignment, payload_layout.alignment);
+                }
+                const alignment = @max(tag_size, payload_alignment);
+                const payload_offset = alignForward(tag_size, payload_alignment);
+                return .{
+                    .size = alignForward(payload_offset + alignForward(payload_size, payload_alignment), alignment),
+                    .alignment = alignment,
+                };
+            },
+            .primitive_kind => {
+                const primitive = description.primitive orelse return null;
+                const width: u64 = primitive.width();
+                return .{ .size = width, .alignment = width };
+            },
+            .interface_kind => return null,
+            .other_kind => {
+                const origin = description.origin orelse return null;
+                const layout = try self.layoutOf(origin, 0) orelse return null;
+                return .{ .size = layout.size, .alignment = layout.alignment };
+            },
+        }
     }
 
     // '#struct { ... }' / '#enum { ... }' (section 4.4): the layout resolves
@@ -5306,7 +5648,7 @@ pub const Checker = struct {
                 // the binding's own slot: its mutability is the binding's
                 return .{
                     .raw = binding.binding_type,
-                    .pierced = try self.pierce(binding.binding_type),
+                    .pierced = try self.pierceRead(expression, binding.binding_type),
                     .mutable = binding.mutable,
                 };
             },
@@ -5315,7 +5657,7 @@ pub const Checker = struct {
                 const field_type = try self.memberType(base.pierced, member.name);
                 return .{
                     .raw = field_type,
-                    .pierced = try self.pierce(field_type),
+                    .pierced = try self.pierceRead(expression, field_type),
                     .mutable = piercedMutability(base),
                 };
             },
@@ -5335,7 +5677,7 @@ pub const Checker = struct {
                     .fixed_array => piercedMutability(base),
                     else => false,
                 };
-                return .{ .raw = element, .pierced = try self.pierce(element), .mutable = mutable };
+                return .{ .raw = element, .pierced = try self.pierceRead(expression, element), .mutable = mutable };
             },
             else => return null,
         }
@@ -5427,6 +5769,40 @@ pub const Checker = struct {
 
     fn popFrame(self: *Checker) void {
         _ = self.scopes.pop();
+    }
+
+    // the binding just made is a by-value parameter the callee owns
+    // (section 5.2): 'move' may clear it although it is immutable
+    fn markOwnedParameter(self: *Checker) void {
+        const frame = &self.scopes.items[self.scopes.items.len - 1];
+        frame.bindings.items[frame.bindings.items.len - 1].owned = true;
+    }
+
+    // whether a value of the type owns heap (section 5.2): a pointer, a
+    // heap array, a closure, or an aggregate holding one anywhere; a type
+    // parameter counts as owning, since its instantiation may be
+    fn typeOwnsHeap(self: *Checker, candidate: *const Type, depth: usize) Error!bool {
+        if (depth > 16) return false;
+        const resolved = try self.resolveAlias(candidate);
+        switch (resolved.*) {
+            .pointer, .heap_array, .function, .type_parameter => return true,
+            .fixed_array => |array| return self.typeOwnsHeap(array.element, depth + 1),
+            .structural, .declared, .inline_enum, .structural_enum => {
+                if (try self.enumBody(resolved)) |body| {
+                    for (body.variants) |variant| {
+                        const payload = variant.payload orelse continue;
+                        if (try self.typeOwnsHeap(payload, depth + 1)) return true;
+                    }
+                    return false;
+                }
+                const fields = (try self.structuralFieldsOf(resolved)) orelse return false;
+                for (fields) |field| {
+                    if (try self.typeOwnsHeap(field.field_type, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn bind(self: *Checker, name_token: Token, binding_type: *const Type, mutable: bool) Error!void {
@@ -5573,6 +5949,10 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "add_member") or std.mem.eql(u8, name, "remove_member")) {
             return &void_type;
         }
+        // C's sizeof / alignof under the section 4.9 rules
+        if (std.mem.eql(u8, name, "size") or std.mem.eql(u8, name, "alignment")) {
+            return self.makeType(.{ .primitive = .u64 });
+        }
         try self.report(span, "'{s}' is not a '#Type' method (section 4.4)", .{name});
         return &unknown_type;
     }
@@ -5716,6 +6096,7 @@ pub const Checker = struct {
             .continue_stmt => |continue_stmt| continue_stmt.keyword.location,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location,
             .return_stmt => |return_stmt| return_stmt.keyword.location,
+            .panic_stmt => |panic_stmt| panic_stmt.keyword.location,
             .expression => |expression| self.expressionSpan(expression),
             .block => .{ .start = 0, .end = 0 },
         };

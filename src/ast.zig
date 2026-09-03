@@ -195,6 +195,9 @@ pub const Statement = union(enum) {
     // 'if' or 'match' (section 5.3)
     yield_stmt: struct { keyword: Token, value: *const Expression },
     return_stmt: struct { keyword: Token, value: ?*const Expression },
+    // 'panic [message]' faults unconditionally in every build mode; the
+    // optional message is a '&[u8]' (section 5.3)
+    panic_stmt: struct { keyword: Token, message: ?*const Expression },
     assign: struct {
         target: *const Expression,
         operator: Token,

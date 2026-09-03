@@ -588,7 +588,13 @@ pub const Compilation = struct {
             output,
         );
         interpreter.host_io = environment.host_io;
-        if (compilation.checker) |checked| interpreter.pierced_results = &checked.pierced_results;
+        if (compilation.checker) |checked| {
+            interpreter.pierced_results = &checked.pierced_results;
+            interpreter.pierce_depths = &checked.pierce_depths;
+            // per-instantiation '#' values and slice-cast layouts need the
+            // checker at run time (sections 4.4, 4.5)
+            interpreter.checker_hooks = checked.runtimeHooks();
+        }
         interpreter.process_arguments = environment.arguments;
         return interpreter.run() catch |err| switch (err) {
             error.RuntimeFault => {

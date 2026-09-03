@@ -73,7 +73,7 @@
             "patterns": [
                 {
                     "name": "keyword.control.alloy",
-                    "match": "\\b(if|else|while|for|match|break|continue|yield|return)\\b"
+                    "match": "\\b(if|else|while|for|match|break|continue|yield|return|panic)\\b"
                 },
                 {
                     "name": "keyword.declaration.alloy",

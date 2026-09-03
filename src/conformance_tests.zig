@@ -1022,15 +1022,21 @@ test "references and pointers obey section 5.2 assignment rules" {
     , &.{ "use 'move' to hand over the allocation or 'new' to copy it", "take a reference explicitly with '&'" });
 }
 
-test "move requires a mutable pointer" {
+test "move requires a mutable source only when it clears one" {
     try expectCheckErrors(
         \\fn f() {
         \\    const owned: *i32 = new 5;
         \\    var taken: *i32 = move owned;
-        \\    var plain: i32 = 5;
-        \\    var wrong = move plain;
         \\}
-    , &.{ "'move' clears its source", "'move' requires a pointer" });
+    , &.{"'move' clears its source"});
+    // a value that owns nothing is simply copied by 'move' (section 5.2)
+    try expectChecks(
+        \\fn f() {
+        \\    const plain: i32 = 5;
+        \\    var copied = move plain;
+        \\    var again = plain + copied;
+        \\}
+    );
 }
 
 test "pointee transparency pierces reads" {
@@ -1237,13 +1243,23 @@ test "enum payload captures type the payload" {
         \\    if (h is Holder::Empty) { }
         \\}
     );
-    try expectCheckErrors(
+    // a payload that owns nothing is simply copied by '|move x|', even
+    // from an immutable subject; an owning payload needs a mutable one
+    // (sections 3.1, 5.2)
+    try expectChecks(
         \\type Holder = enum { Boxed: u32, Empty };
         \\fn f() {
         \\    const h: Holder = Holder::Boxed(1);
         \\    if (h is Holder::Boxed |move taken|) { }
         \\}
-    , &.{"owning capture requires a pointer-typed value"});
+    );
+    try expectCheckErrors(
+        \\type Holder = enum { Boxed: *u32, Empty };
+        \\fn f() {
+        \\    const h: Holder = Holder::Boxed(new 5);
+        \\    if (h is Holder::Boxed |move taken|) { }
+        \\}
+    , &.{"an owning capture moves out of its subject, which must be mutable"});
 }
 
 test "string literals are static u8 slices" {
@@ -4422,4 +4438,249 @@ test "runaway compile-time recursion is a diagnostic, not a crash" {
         \\macro pong() -> i32 { return #ping(); }
         \\fn main() -> i32 { return #ping(); }
     , &.{"call stack exhausted (1024 frames)"});
+}
+
+// '#T.size()' / '#T.alignment()' (section 4.4) follow the section 4.9
+// layout, and '#T' inside a generic body reflects the bound argument per
+// instantiation: Pair is 16/8, Small 4/2, i32 4/4, Mode (tag + u64) 16/8
+const reflection_size_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Pair = struct { a: u8, b: u64 };
+    \\type Small = struct { a: u8, b: u16 };
+    \\type Mode = enum { Fast, Slow: u64 };
+    \\fn measure<T>(value: T) -> u64 {
+    \\    const size = #T.size();
+    \\    const alignment = #T.alignment();
+    \\    return size * 100 + alignment;
+    \\}
+    \\fn describe<T>(value: T) -> u64 {
+    \\    printf("%s has %d member(s)\n", #T.name(), #T.member_names().length() to i32);
+    \\    return #if (#T.size() > 8) 1 else 0;
+    \\}
+    \\fn main() -> i32 {
+    \\    var total: u64 = measure(Pair { .a = 1, .b = 2 }) + measure(Small { .a = 1, .b = 2 }) + measure(7) + measure(Mode::Slow(3));
+    \\    total += #Pair.size() + #Mode.alignment() + #struct { a: u8, b: u16 }.alignment();
+    \\    total += describe(Pair { .a = 1, .b = 2 }) * 10 + describe(Small { .a = 1, .b = 2 });
+    \\    printf("%d\n", total to i32);
+    \\    return 0;
+    \\}
+;
+
+test "#Type size and alignment reflect the C layout, per instantiation in generics" {
+    try expectRuns(reflection_size_source, 0, "Pair has 2 member(s)\nSmall has 2 member(s)\n4058\n");
+    try expectBuildsAndRuns("reflection_size", reflection_size_source, 0, "Pair has 2 member(s)\nSmall has 2 member(s)\n4058\n");
+    try expectCheckErrors(
+        \\interface Shape { fn area(self: &) -> u64; }
+        \\type Pair = struct { a: u8, b: u64 };
+        \\fn main() -> i32 {
+        \\    var a = #Shape.size();
+        \\    var b = #Pair.sizes();
+        \\    return 0;
+        \\}
+    , &.{
+        "'Shape' has no runtime layout, so it has no size",
+        "'sizes' is not a '#Type' method",
+    });
+}
+
+// '&[S] as &[T]' (section 4.5) views the same bytes: eight zeroed bytes
+// with 1 at 0 and 2, 1 at 4..5 read as the u32s 1 and 258, and a Pair
+// carved out of a byte page is written and read through the view
+const slice_cast_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Pair = struct { a: u8, b: u64 };
+    \\fn main() -> i32 {
+    \\    var bytes: *var [u8] = new [0 : 8];
+    \\    bytes[0] = 1;
+    \\    bytes[4] = 2;
+    \\    bytes[5] = 1;
+    \\    var words = &bytes[0..8] as &[u32];
+    \\    var page: *var [u8] = new [0 : 64];
+    \\    var slot = &var page[16..32] as &var [Pair];
+    \\    slot[0] = Pair { .a = 3, .b = 9 };
+    \\    var stable = &var slot[0];
+    \\    stable.b = 10;
+    \\    printf("%d %d %d %d %d %d\n", words.length() to i32, words[0] to i32, words[1] to i32, slot.length() to i32, slot[0].a to i32, stable.b to i32);
+    \\    return 0;
+    \\}
+;
+
+test "'as' views a slice's bytes as another element type" {
+    try expectRuns(slice_cast_source, 0, "2 1 258 1 3 10\n");
+    try expectBuildsAndRuns("slice_cast", slice_cast_source, 0, "2 1 258 1 3 10\n");
+    // the byte length must be a whole number of target elements
+    try expectRunFault(
+        \\fn main() -> i32 {
+        \\    var bytes: *var [u8] = new [0 : 8];
+        \\    var words = &bytes[0..6] as &[u32];
+        \\    return words.length() to i32;
+        \\}
+    , "'as' slice view of 6 byte(s) is not a whole number of 4-byte elements");
+    // checked builds guard length and alignment; release builds do not
+    const fault_source =
+        \\fn main() -> i32 {
+        \\    var bytes: *var [u8] = new [0 : 16];
+        \\    var words = &bytes[1..9] as &[u32];
+        \\    return words.length() to i32;
+        \\}
+    ;
+    const guards = [_][]const u8{
+        "'as' slice view is not a whole number of target elements",
+        "'as' slice data is misaligned for the target element type",
+    };
+    try expectGenerates(fault_source, false, &guards, &.{});
+    try expectGenerates(fault_source, true, &.{}, &guards);
+    try expectCheckErrors(
+        \\type Empty = struct { };
+        \\fn f(items: &[u8], word: &u64) {
+        \\    var gained = items as &var [u32];
+        \\    var gained_reference = &word as &var u64;
+        \\    var zero = items as &[Empty];
+        \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{
+        "'as' cannot make a slice view mutable",
+        "'as' cannot make a reference mutable",
+        "'as' cannot view a slice as zero-sized elements",
+    });
+}
+
+// 'panic [message]' (section 5.3) faults in every build mode and
+// terminates the path for the definite-return analysis
+const panic_source =
+    \\fn head(items: &[u32]) -> u32 {
+    \\    if (items.length() > 0) { return items[0]; }
+    \\    panic "head of an empty slice";
+    \\}
+    \\fn main() -> i32 {
+    \\    var xs: [u32 : 1] = [5];
+    \\    return head(&xs[0..1]) to i32;
+    \\}
+;
+
+test "'panic' faults in every build mode and terminates a path" {
+    try expectRuns(panic_source, 5, "");
+    try expectBuildsAndRuns("panic_unreached", panic_source, 5, "");
+    try expectRunFault(
+        \\fn head(items: &[u32]) -> u32 {
+        \\    if (items.length() > 0) { return items[0]; }
+        \\    panic "head of an empty slice";
+        \\}
+        \\fn main() -> i32 {
+        \\    var empty: &[u32] = [];
+        \\    return head(&empty) to i32;
+        \\}
+    , "panic: head of an empty slice");
+    try expectRunFault(
+        \\fn main() -> i32 { panic; }
+    , "panic");
+    // a release build keeps the fault, unlike the checked-build guards
+    try expectGenerates(panic_source, true, &.{ "runtime fault: panic: ", "llvm.trap" }, &.{});
+    try expectCheckErrors(
+        \\fn bad() -> u32 {
+        \\    panic 7;
+        \\}
+        \\fn falls_off(flag: bool) -> u32 {
+        \\    if (flag) { return 1; }
+        \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{
+        "a 'panic' message is a '&[u8]', found <integer literal>",
+        "control can fall off the end of 'falls_off'",
+    });
+}
+
+// type parameters are opaque (section 4.7): with T bound to '*var u64' a
+// T-typed value is the pointer, deep-copied on every bare read, so fills,
+// literals, bindings, and assignments each own a clone and every drop is
+// single; 'take(q)' twice leaves q intact
+const opaque_parameter_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Box = struct { inner: *var u64 };
+    \\fn twice<T>(item: T) -> u64 {
+    \\    var copy = item;
+    \\    var pair: [T : 2] = [item, item];
+    \\    var boxed = Box { .inner = new 1 };
+    \\    var grown: *var [T] = new [item : 2];
+    \\    grown[1] = copy;
+    \\    return grown.length() + pair.length() + 1;
+    \\}
+    \\fn take<T>(item: T) -> u64 { return 1; }
+    \\fn main() -> i32 {
+    \\    var p: *var u64 = new 7;
+    \\    var q: *var u64 = new 8;
+    \\    var total = twice(move p) + take(q) + take(q);
+    \\    printf("%d %d\n", total to i32, q to i32);
+    \\    return 0;
+    \\}
+;
+
+test "type parameters bound to pointers stay opaque and copy on read" {
+    try expectRuns(opaque_parameter_source, 0, "7 8\n");
+    try expectBuildsAndRuns("opaque_parameter", opaque_parameter_source, 0, "7 8\n");
+}
+
+// 'move' on any type (section 5.2): a struct moves its pointer member and
+// copies the rest, a '&var' moves out of its pointee, a primitive is just
+// copied and stays usable, a by-value parameter may be moved, owning
+// captures follow the same rule, and a generic move acts per instantiation
+const move_values_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Node = struct { value: u64, payload: *var u64, tag: u8 };
+    \\type Slot = enum { Empty, Full: Node };
+    \\fn consume(node: Node) -> u64 { return node.value + node.payload; }
+    \\fn steal(node: &var Node) -> Node { return move node; }
+    \\fn count<T>(item: T) -> u64 {
+    \\    var kept = move item;
+    \\    return 1;
+    \\}
+    \\fn main() -> i32 {
+    \\    var a = Node { .value = 1, .payload = new 10, .tag = 3 };
+    \\    var b = move a;
+    \\    printf("%d %d %d\n", b.value to i32, b.payload to i32, b.tag to i32);
+    \\    var c = Node { .value = 2, .payload = new 20, .tag = 4 };
+    \\    var d = steal(&var c);
+    \\    printf("%d %d %d\n", d.value to i32, d.payload to i32, c.value to i32);
+    \\    var n: u64 = 5;
+    \\    var m = move n;
+    \\    printf("%d %d\n", n to i32, m to i32);
+    \\    printf("%d\n", consume(move d) to i32);
+    \\    var slot: Slot = ::Full(Node { .value = 7, .payload = new 70, .tag = 1 });
+    \\    if (slot is ::Full |move taken|) {
+    \\        printf("%d %d\n", taken.value to i32, taken.payload to i32);
+    \\    }
+    \\    var e = Node { .value = 8, .payload = new 80, .tag = 2 };
+    \\    var f = |move e| () -> u64 { return e.value + e.payload; };
+    \\    printf("%d\n", f() to i32);
+    \\    var p: *var u64 = new 9;
+    \\    printf("%d\n", (count(move p) + count(Node { .value = 1, .payload = new 1, .tag = 1 }) + count(3)) to i32);
+    \\    return 0;
+    \\}
+;
+
+test "'move' transfers what any value owns and copies the rest" {
+    const expected = "1 10 3\n2 20 2\n5 5\n22\n7 70\n88\n3\n";
+    try expectRuns(move_values_source, 0, expected);
+    try expectBuildsAndRuns("move_values", move_values_source, 0, expected);
+    try expectCheckErrors(
+        \\type Node = struct { value: u64, payload: *var u64 };
+        \\type Plain = struct { value: u64 };
+        \\fn through_immutable(node: &Node) -> Node { return move node; }
+        \\fn through_immutable_plain(plain: &Plain) -> Plain { return move plain; }
+        \\fn use_after() -> u64 {
+        \\    var node = Node { .value = 1, .payload = new 2 };
+        \\    var taken = move node;
+        \\    return node.value;
+        \\}
+        \\fn const_source() -> u64 {
+        \\    const node = Node { .value = 1, .payload = new 2 };
+        \\    var taken = move node;
+        \\    return 0;
+        \\}
+        \\fn main() -> i32 { return 0; }
+    , &.{
+        "'move' through an immutable '&' writes the pointee, which needs '&var'",
+        "use of 'node' after 'move'",
+        "'move' clears its source, which must be mutable",
+    });
 }

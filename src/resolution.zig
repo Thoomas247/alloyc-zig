@@ -506,6 +506,9 @@ pub const Resolver = struct {
             .return_stmt => |return_stmt| {
                 if (return_stmt.value) |value| try self.resolveExpression(value);
             },
+            .panic_stmt => |panic_stmt| {
+                if (panic_stmt.message) |message| try self.resolveExpression(message);
+            },
         }
     }
 

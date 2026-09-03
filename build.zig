@@ -49,6 +49,10 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    // the driver runs compilation on a 256 MiB thread (main.zig) so a
+    // runaway comptime recursion reaches the 1024-frame fault before the
+    // native stack runs out; the test binary needs the same headroom
+    mod_tests.stack_size = 256 * 1024 * 1024;
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);

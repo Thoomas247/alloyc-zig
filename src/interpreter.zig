@@ -51,6 +51,10 @@ pub const Interpreter = struct {
     current_view: usize,
     // the active call's resolved type arguments (section 4.7)
     current_type_bindings: []const Type.Binding,
+    // the checker's services a running program still needs (sections 4.4,
+    // 4.5): per-instantiation '#' evaluation and the layouts of types only
+    // known once type parameters are bound; null in a run without a checker
+    checker_hooks: ?CheckerHooks = null,
     // compile-time sandboxing (section 7.2): externs fault and evaluation
     // is bounded by a step budget
     comptime_mode: bool,
@@ -70,6 +74,9 @@ pub const Interpreter = struct {
     // call nodes whose bare reference result pierces to a copy at the use
     // site (section 5.2 reference-binding explicitness), from the checker
     pierced_results: ?*const std.AutoHashMapUnmanaged(*const ast.Expression, void) = null,
+    // reads the checker typed as a bare type parameter, with the layers it
+    // pierced (section 4.7); the instantiation's pointer type is opaque
+    pierce_depths: ?*const std.AutoHashMapUnmanaged(*const ast.Expression, u8) = null,
     // the active comptime call chain (function, macro, and extension
     // names, outermost first): a fault inside a macro body reports where
     // evaluation was, since macro bodies carry no static diagnostics
@@ -236,6 +243,36 @@ pub const Interpreter = struct {
         // by definition identity including lang items; null when the
         // interface description carries no resolved interface
         reflect_implements: *const fn (context: *anyopaque, subject: *Value.TypeDescription, interface: *Value.TypeDescription) error{OutOfMemory}!?bool,
+        // the description of a checker type: how a generic body's '#T'
+        // reflects the argument bound at the active instantiation (section
+        // 4.4); null when the type is unknown or still a parameter
+        reflect_type: *const fn (context: *anyopaque, candidate: *const Type) error{OutOfMemory}!?*Value.TypeDescription,
+        // the section 4.9 layout behind 'size' and 'alignment'; null when
+        // the description has no runtime layout
+        reflect_layout_of: *const fn (context: *anyopaque, description: *Value.TypeDescription) error{OutOfMemory}!?TypeLayout,
+    };
+
+    // a section 4.9 layout as the interpreter sees it
+    pub const TypeLayout = struct { size: u64, alignment: u64 };
+
+    // everything a slice reinterpretation needs (section 4.5): both element
+    // layouts, and the element byte shapes when both sides have one
+    pub const SliceCastInfo = struct {
+        source: TypeLayout,
+        target: TypeLayout,
+        shapes: ?types.CastShapes,
+    };
+
+    pub const CheckerHooks = struct {
+        context: *anyopaque,
+        // evaluates a '#' expression that names a type parameter for the
+        // given bindings (section 4.4); null with no message when the
+        // expression is not such an expression, null with a message when
+        // evaluation faulted
+        generic_comptime: *const fn (context: *anyopaque, expression: *const ast.Expression, bindings: []const Type.Binding, message: *?[]const u8) error{OutOfMemory}!?Value,
+        // the element layouts of a '&[S] as &[T]' cast under the given
+        // bindings; null when a side is not a slice or has no layout
+        slice_cast: *const fn (context: *anyopaque, source_type: *const Type, target_type: *const Type, bindings: []const Type.Binding) error{OutOfMemory}!?SliceCastInfo,
     };
 
     // statements propagate flow directly; crossing an expression boundary
@@ -517,6 +554,25 @@ pub const Interpreter = struct {
         return current;
     }
 
+    // a value read pierces like pierceCell, except a read the checker typed
+    // as a bare type parameter pierces exactly the layers the checker did
+    // (section 4.7): with T bound to a pointer type the pointer itself is
+    // the value, never its pointee
+    fn pierceRead(self: *Interpreter, cell: *Value, expression: *const ast.Expression) Error!*Value {
+        const depths = self.pierce_depths orelse return self.pierceCell(cell);
+        const depth = depths.get(expression) orelse return self.pierceCell(cell);
+        var current = cell;
+        var remaining = depth;
+        while (remaining > 0) : (remaining -= 1) {
+            switch (current.*) {
+                .pointer => |target| current = target orelse return self.fault("use of a moved-from pointer", .{}),
+                .reference => |target| current = target,
+                else => return current,
+            }
+        }
+        return current;
+    }
+
     // chases reference cells only, reaching the innermost borrowed cell;
     // pointers are left alone (pierceCell also crosses those)
     fn innermostCell(cell: *Value) *Value {
@@ -555,6 +611,15 @@ pub const Interpreter = struct {
             .return_stmt => |return_stmt| {
                 const value: Value = if (return_stmt.value) |expression| try self.evalExpression(expression) else .void_value;
                 return .{ .return_value = value };
+            },
+            // 'panic [message]' faults in every build mode (section 5.3); at
+            // compile time the fault surfaces as a compile error
+            .panic_stmt => |panic_stmt| {
+                if (panic_stmt.message) |message| {
+                    const text = try self.byteSlice(try self.evalExpression(message));
+                    return self.fault("panic: {s}", .{text});
+                }
+                return self.fault("panic", .{});
             },
             .assign => |assign| return self.execAssign(assign),
             .expression => |expression| {
@@ -650,7 +715,7 @@ pub const Interpreter = struct {
                 };
                 // pointee transparency (section 5.2): reading a pointer or
                 // reference field yields a copy of the pointee
-                return self.deepCopy((try self.pierceCell(place)).*);
+                return self.deepCopy((try self.pierceRead(place, expression)).*);
             },
             .index => return self.evalIndex(expression),
             .subslice => return self.evalSubslice(expression),
@@ -675,6 +740,14 @@ pub const Interpreter = struct {
         // substituted by compile-time evaluation (section 7.1); the
         // fallback covers '#' nodes inside other comptime evaluations
         if (self.comptime_values.get(expression)) |value| return self.deepCopy(value);
+        // a '#' expression over a type parameter has a value per
+        // instantiation (section 4.4): the checker evaluates it with the
+        // active call's bindings. Kept out of line: this function sits on
+        // the recursive evaluation path, where every frame byte counts
+        // against the 1024-frame comptime budget.
+        if (!self.comptime_mode and self.checker_hooks != null) {
+            if (try self.evalGenericComptime(expression)) |value| return value;
+        }
         // '#name(...)': the '#' selects the macro when the name is
         // shared with functions (section 7.3); this covers macro
         // bodies, whose calls carry no checked targets
@@ -685,10 +758,20 @@ pub const Interpreter = struct {
         return self.evalExpression(inner);
     }
 
+    fn evalGenericComptime(self: *Interpreter, expression: *const ast.Expression) Error!?Value {
+        const hooks = self.checker_hooks orelse return null;
+        var message: ?[]const u8 = null;
+        if (try hooks.generic_comptime(hooks.context, expression, try self.activeBindings(), &message)) |value| {
+            return try self.deepCopy(value);
+        }
+        if (message) |text| return self.fault("comptime evaluation failed: {s} (section 7.1)", .{text});
+        return null;
+    }
+
     fn evalIndex(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         const index = expression.index;
         if (try self.evalPlace(expression)) |place| {
-            return self.deepCopy((try self.pierceCell(place)).*);
+            return self.deepCopy((try self.pierceRead(place, expression)).*);
         }
         // a temporary subject (a call result) indexes by value
         const subject = try self.evalExpression(index.object);
@@ -858,13 +941,42 @@ pub const Interpreter = struct {
         return current;
     }
 
+    // the active bindings with every bound type resolved through the
+    // bindings themselves, for the checker's per-instantiation services
+    fn activeBindings(self: *Interpreter) Error![]const Type.Binding {
+        const resolved = try self.arena.alloc(Type.Binding, self.current_type_bindings.len);
+        for (self.current_type_bindings, resolved) |binding, *slot| {
+            slot.* = .{ .name = binding.name, .bound = self.resolveTypeParameter(binding.bound) };
+        }
+        return resolved;
+    }
+
+    // '#T' inside a generic body reflects the type the active instantiation
+    // binds to the parameter (section 4.4); null when the name is no type
+    // parameter or the run has no checker to describe the type
+    fn reflectTypeParameter(self: *Interpreter, name: []const u8) Error!?Value {
+        const hooks = self.reflection orelse return null;
+        for (self.current_type_bindings) |binding| {
+            if (!std.mem.eql(u8, binding.name, name)) continue;
+            const bound = self.resolveTypeParameter(binding.bound);
+            const description = (try hooks.reflect_type(hooks.context, bound)) orelse return null;
+            return .{ .type_value = description };
+        }
+        return null;
+    }
+
     fn evalPath(self: *Interpreter, expression: *const ast.Expression) Error!Value {
         const path = expression.path;
         if (path.len == 1) {
             const name = path[0].slice(self.source());
             if (self.lookup(name)) |cell| {
-                const pierced = try self.pierceCell(cell);
+                const pierced = try self.pierceRead(cell, expression);
                 return self.deepCopy(pierced.*);
+            }
+            // a type parameter reflects before any global of the same name
+            // (section 4.4): the parameter is the nearer declaration
+            if (self.comptime_mode) {
+                if (try self.reflectTypeParameter(name)) |value| return value;
             }
             // a global function name used as a value
             if (self.firstVisible(name)) |symbol| {
@@ -904,14 +1016,9 @@ pub const Interpreter = struct {
                     entry.cell = cell;
                 },
                 .owning => {
-                    const taken = outer.*;
-                    switch (taken) {
-                        .pointer => outer.* = .{ .pointer = null },
-                        .heap_array => outer.* = .{ .heap_array = null },
-                        else => return self.fault("an owning capture needs a pointer-typed variable (section 3.1)", .{}),
-                    }
+                    // moves out like the 'move' operator (section 5.2)
                     const cell = try self.arena.create(Value);
-                    cell.* = taken;
+                    cell.* = try self.moveOut(outer);
                     entry.cell = cell;
                 },
             }
@@ -986,15 +1093,65 @@ pub const Interpreter = struct {
             .keyword_new => return self.evalNew(unary.operand),
             .keyword_move => {
                 const place = try self.evalPlace(unary.operand) orelse return self.fault("'move' needs an addressable operand", .{});
-                const taken = place.*;
-                switch (taken) {
-                    .pointer => place.* = .{ .pointer = null },
-                    .heap_array => place.* = .{ .heap_array = null },
-                    else => return self.fault("'move' needs a pointer-typed operand", .{}),
+                // a type parameter bound to a reference copies it: a
+                // reference owns nothing (section 4.7)
+                if (place.* == .reference) {
+                    if (self.pierce_depths) |depths| {
+                        if (depths.get(unary.operand)) |depth| {
+                            if (depth == 0) return place.*;
+                        }
+                    }
                 }
-                return taken;
+                return self.moveOut(place);
             },
             else => return self.fault("unsupported unary operator", .{}),
+        }
+    }
+
+    // 'move' (section 5.2): transfers what the cell's value owns and copies
+    // the rest. A pointer moves out and leaves null behind; a struct, array,
+    // or enum moves member by member into a fresh instance, so the source
+    // keeps its shape with its pointers nulled; a reference moves out of
+    // its pointee; everything else is a copy.
+    fn moveOut(self: *Interpreter, cell: *Value) Error!Value {
+        switch (cell.*) {
+            .pointer => |target| {
+                cell.* = .{ .pointer = null };
+                return .{ .pointer = target };
+            },
+            .heap_array => |instance| {
+                cell.* = .{ .heap_array = null };
+                return .{ .heap_array = instance };
+            },
+            .reference => |target| return self.moveOut(target),
+            .struct_value => |instance| {
+                const fields = try self.arena.alloc(Value.Field, instance.fields.len);
+                for (instance.fields, fields) |*field, *slot| {
+                    slot.* = .{ .name = field.name, .value = try self.moveOut(&field.value) };
+                }
+                const moved = try self.arena.create(Value.StructInstance);
+                moved.* = .{ .fields = fields, .type_name = instance.type_name, .identity = instance.identity };
+                return .{ .struct_value = moved };
+            },
+            .array => |instance| {
+                const elements = try self.arena.alloc(Value, instance.elements.len);
+                for (instance.elements, elements) |*element, *slot| {
+                    slot.* = try self.moveOut(element);
+                }
+                const moved = try self.arena.create(Value.ArrayInstance);
+                moved.* = .{ .elements = elements };
+                return .{ .array = moved };
+            },
+            .enum_value => |instance| {
+                var payload: ?Value = null;
+                if (instance.payload) |*present| payload = try self.moveOut(present);
+                const moved = try self.arena.create(Value.EnumInstance);
+                moved.* = .{ .variant = instance.variant, .payload = payload };
+                return .{ .enum_value = moved };
+            },
+            // slices and references own nothing; a closure keeps sharing
+            // its environment (the interpreter never frees)
+            else => return cell.*,
         }
     }
 
@@ -1237,6 +1394,8 @@ pub const Interpreter = struct {
 
     fn evalAsCast(self: *Interpreter, expression: *const ast.Expression, cast: anytype) Error!Value {
         const operand = try self.evalExpression(cast.operand);
+        // '&[S] as &[T]' views the elements' bytes as T (section 4.5)
+        if (operand == .slice) return self.reinterpretSlice(expression, cast, operand.slice);
         // a shaped cast reinterprets through a byte image (section 4.5);
         // the checker records shapes for non-primitive sides
         if (self.cast_shapes.get(expression)) |shapes| {
@@ -1264,6 +1423,55 @@ pub const Interpreter = struct {
             }
         }
         return self.fault("'as' through references or pointer-bearing values is not supported by the interpreter", .{});
+    }
+
+    // '&[S] as &[T]' (section 4.5). The interpreter holds element cells, not
+    // bytes, so the view is rebuilt: the byte length must be a whole number
+    // of target elements (the checked-build rule; alignment has no meaning
+    // without addresses). When both element types have byte images the
+    // source elements serialize and the target elements deserialize from
+    // that image, so bytes read back as the integers they spell; a
+    // pointer-bearing target starts as void slots the first store fills.
+    // The rebuilt elements take over the source's own leading cells when
+    // they fit, so reads and writes through the view and the source keep
+    // agreeing on them; a view with more elements than the source has cells
+    // is a fresh copy. Reading the source's original bytes after a typed
+    // write is the one aliasing the rebuild cannot reproduce.
+    fn reinterpretSlice(self: *Interpreter, expression: *const ast.Expression, cast: anytype, subject: *Value.ArrayInstance) Error!Value {
+        const hooks = self.checker_hooks orelse return self.fault("'as' on a slice is not supported in a run without the checker", .{});
+        const source_type = self.expression_types.get(cast.operand) orelse return self.fault("'as' slice operand has no recorded type", .{});
+        const target_type = self.expression_types.get(expression) orelse return self.fault("'as' slice result has no recorded type", .{});
+        const info = (try hooks.slice_cast(hooks.context, source_type, target_type, try self.activeBindings())) orelse
+            return self.fault("'as' between these slices has no defined element layout (section 4.5)", .{});
+        if (info.target.size == 0) return self.fault("'as' cannot view a slice as zero-sized elements (section 4.5)", .{});
+        const byte_length = subject.elements.len * info.source.size;
+        if (byte_length % info.target.size != 0) {
+            return self.fault("'as' slice view of {d} byte(s) is not a whole number of {d}-byte elements (section 4.5)", .{ byte_length, info.target.size });
+        }
+        const count = byte_length / info.target.size;
+        const elements: []Value = if (count <= subject.elements.len)
+            subject.elements[0..count]
+        else
+            try self.arena.alloc(Value, count);
+        if (info.shapes) |shapes| {
+            // the whole source image first: the target cells may overlap
+            // the source cells being read
+            const image = try self.arena.alloc(u8, byte_length);
+            @memset(image, 0);
+            const source_size: usize = @intCast(info.source.size);
+            for (subject.elements, 0..) |element, index| {
+                try self.serializeValue(element, shapes.source, image[index * source_size ..][0..source_size]);
+            }
+            const target_size: usize = @intCast(info.target.size);
+            for (elements, 0..) |*slot, index| {
+                slot.* = try self.deserializeValue(shapes.target, image[index * target_size ..][0..target_size]);
+            }
+        } else {
+            for (elements) |*slot| slot.* = .void_value;
+        }
+        const view = try self.arena.create(Value.ArrayInstance);
+        view.* = .{ .elements = elements };
+        return .{ .slice = view };
     }
 
     // 'as' reinterprets the bytes of same-width primitives (section 4.5)
@@ -1720,6 +1928,19 @@ pub const Interpreter = struct {
             const instance = try self.arena.create(Value.ArrayInstance);
             instance.* = .{ .elements = values };
             return .{ .slice = instance };
+        }
+        // 'size' and 'alignment' answer from the section 4.9 layout of the
+        // description in hand, so a rebuilt '#Type' reports its new size
+        const wants_size = std.mem.eql(u8, name, "size");
+        if (wants_size or std.mem.eql(u8, name, "alignment")) {
+            if (arguments.len != 0) return self.fault("'{s}' takes no arguments (section 4.4)", .{name});
+            const hooks = self.reflection orelse return self.fault("'{s}' reflects only during compile-time evaluation (section 4.4)", .{name});
+            const layout = (try hooks.reflect_layout_of(hooks.context, description)) orelse {
+                const shown: []const u8 = if (description.name.len != 0) description.name else "this type";
+                return self.fault("'{s}' has no runtime layout, so it has no {s} (section 4.4)", .{ shown, name });
+            };
+            const measure: u64 = if (wants_size) layout.size else layout.alignment;
+            return .{ .integer = .{ .value = measure, .primitive = .u64 } };
         }
         return self.fault("'#Type' has no method '{s}' (section 4.4)", .{name});
     }
@@ -2550,15 +2771,15 @@ pub const Interpreter = struct {
                 }
             },
             .owning => {
-                try self.bind(name, payload);
-                // the payload moves out; the subject is moved-from
+                // the payload moves out like the 'move' operator (section
+                // 5.2); the subject keeps its shape with its pointers nulled
                 if (subject.* == .enum_value) {
-                    subject.enum_value.payload = switch (payload) {
-                        .pointer => .{ .pointer = null },
-                        .heap_array => .{ .heap_array = null },
-                        else => payload,
-                    };
+                    if (subject.enum_value.payload) |*present| {
+                        try self.bind(name, try self.moveOut(present));
+                        return;
+                    }
                 }
+                try self.bind(name, payload);
             },
         }
     }
@@ -2703,7 +2924,7 @@ pub const Interpreter = struct {
                         switch (capture.mode()) {
                             .copy => try self.bind(capture.name.slice(self.source()), try self.deepCopy(cell.*)),
                             .reference => try self.bind(capture.name.slice(self.source()), .{ .reference = cell }),
-                            .owning => try self.bind(capture.name.slice(self.source()), cell.*),
+                            .owning => try self.bind(capture.name.slice(self.source()), try self.moveOut(cell)),
                         }
                     },
                     .cursor => {

@@ -653,6 +653,7 @@ pub const Server = struct {
             .continue_stmt => |continue_stmt| continue_stmt.keyword.location.start,
             .yield_stmt => |yield_stmt| yield_stmt.keyword.location.start,
             .return_stmt => |return_stmt| return_stmt.keyword.location.start,
+            .panic_stmt => |panic_stmt| panic_stmt.keyword.location.start,
         };
     }
 };

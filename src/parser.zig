@@ -509,6 +509,15 @@ pub const Parser = struct {
                 try self.expectTerminator();
                 return self.create(ast.Statement, .{ .return_stmt = .{ .keyword = keyword, .value = value } });
             },
+            .keyword_panic => {
+                const keyword = self.advance();
+                var message: ?*const ast.Expression = null;
+                if (self.current().tag != .semicolon) {
+                    message = try self.parseExpression();
+                }
+                try self.expectTerminator();
+                return self.create(ast.Statement, .{ .panic_stmt = .{ .keyword = keyword, .message = message } });
+            },
             else => {},
         }
         // anything else is an expression statement or an assignment
