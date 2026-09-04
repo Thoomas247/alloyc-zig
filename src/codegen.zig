@@ -973,9 +973,12 @@ pub const Codegen = struct {
             const start_type = try self.resolvedOf(try self.typeOf(start_expression));
             start_text = try self.widenToIndex(start.scalar, start_type);
         }
-        const end = try self.evalExpression(subslice.end);
-        const end_type = try self.resolvedOf(try self.typeOf(subslice.end));
-        const end_text = try self.widenToIndex(end.scalar, end_type);
+        // a missing end is the length: 'arr[..]' is the whole array
+        const end_text = if (subslice.end) |end_expression| end: {
+            const end = try self.evalExpression(end_expression);
+            const end_type = try self.resolvedOf(try self.typeOf(end_expression));
+            break :end try self.widenToIndex(end.scalar, end_type);
+        } else view.length;
         if (!self.release_mode) {
             const ordered = try self.freshTemp();
             try self.instruction("{s} = icmp ule i64 {s}, {s}", .{ ordered, start_text, end_text });
@@ -1782,6 +1785,15 @@ pub const Codegen = struct {
     }
 
     fn evalBinary(self: *Codegen, expression: *const ast.Expression) Error!Operand {
+        return self.evalBinaryAs(expression, null);
+    }
+
+    // 'target' is the type an enclosing all-untyped expression computes
+    // in: '10 * 1024 * 1024' under a u64 annotation is u64 arithmetic all
+    // the way down (section 4.3 rule 2), never an i32 product widened
+    // afterwards, which would truncate or store a narrow value in a wide
+    // slot
+    fn evalBinaryAs(self: *Codegen, expression: *const ast.Expression, target: ?*const Type) Error!Operand {
         const binary = expression.binary;
         const span = binary.operator.location;
         if (binary.operator.tag == .ampersand_ampersand or binary.operator.tag == .pipe_pipe) {
@@ -1789,8 +1801,9 @@ pub const Codegen = struct {
         }
         const left_recorded = try self.typeOf(binary.left);
         const right_recorded = try self.typeOf(binary.right);
-        const left_type = try self.resolvedOf(left_recorded);
-        const right_type = try self.resolvedOf(right_recorded);
+        var left_type = try self.resolvedOf(left_recorded);
+        var right_type = try self.resolvedOf(right_recorded);
+        const both_untyped = isUntyped(left_recorded) and isUntyped(right_recorded);
         // an untyped literal adopts the typed side (section 4.3 rule 2)
         const operand_type = operand: {
             // a shift has its left operand's width, and the amount converts
@@ -1799,15 +1812,30 @@ pub const Codegen = struct {
             if (shifting and !isUntyped(left_recorded)) break :operand left_type;
             if (isUntyped(left_recorded) and !isUntyped(right_recorded)) break :operand right_type;
             if (isUntyped(right_recorded) and !isUntyped(left_recorded)) break :operand left_type;
+            // both untyped: the context decides the width, through the
+            // enclosing expression's target or this expression's own
+            // recorded (contextual) type
+            if (both_untyped) {
+                if (target) |forced| break :operand forced;
+                const recorded = try self.resolvedOf(try self.typeOf(expression));
+                if (recorded.* == .primitive and recorded.primitive.isNumeric()) break :operand recorded;
+            }
             break :operand try self.widerOf(left_type, right_type, span);
         };
-        const left_raw = try self.evalExpression(binary.left);
-        const right_raw = try self.evalExpression(binary.right);
+        // an untyped nested binary computes directly in the operand type
+        const left_raw = if (isUntyped(left_recorded) and isUntypedBinary(binary.left)) left: {
+            left_type = operand_type;
+            break :left try self.evalBinaryAs(unwrapGrouped(binary.left), operand_type);
+        } else try self.evalExpression(binary.left);
+        const right_raw = if (isUntyped(right_recorded) and isUntypedBinary(binary.right)) right: {
+            right_type = operand_type;
+            break :right try self.evalBinaryAs(unwrapGrouped(binary.right), operand_type);
+        } else try self.evalExpression(binary.right);
         const left = (try self.coerceOperand(left_raw, left_type, operand_type, span)).scalar;
         const right = (try self.coerceOperand(right_raw, right_type, operand_type, span)).scalar;
         switch (binary.operator.tag) {
             .plus, .minus, .asterisk, .slash, .percent, .shift_left, .shift_right, .ampersand, .pipe, .caret => {
-                const result_type = try self.typeOf(expression);
+                const result_type = if (both_untyped) operand_type else try self.typeOf(expression);
                 return .{ .scalar = try self.applyArithmetic(binary.operator.tag, left, right, result_type, span) };
             },
             .equal_equal, .bang_equal, .angle_left, .angle_left_equal, .angle_right, .angle_right_equal => {
@@ -3082,6 +3110,25 @@ pub const Codegen = struct {
             return self.report(span, "this element type has no defined layout", .{});
         const layout = (try self.layoutQuery(resolved, 0)) orelse
             return self.report(span, "this array has no defined layout", .{});
+        // a literal of constants is static program data (section 3.1):
+        // evaluated once at compile time and materialized like a comptime
+        // result, so '&[a, b][..]' views memory that lives for the whole
+        // program; anything the evaluation cannot render builds at runtime
+        if (isConstantLiteral(expression)) {
+            if (try self.checker.evaluateConstant(expression, self.current_view)) |value| {
+                if (value == .array) {
+                    if (try self.staticConstant(value, resolved)) |rendered| {
+                        const name = try std.fmt.allocPrint(self.arena, "@\"literal.{d}\"", .{self.global_counter});
+                        self.global_counter += 1;
+                        self.constants.writer.print(
+                            "{s} = private unnamed_addr constant {s} {s}, align {d}\n",
+                            .{ name, rendered.type_text, rendered.value_text, layout.alignment },
+                        ) catch return error.OutOfMemory;
+                        return .{ .memory = .{ .pointer = name, .layout = layout } };
+                    }
+                }
+            }
+        }
         const storage = try self.aggregateSlot(layout);
         try self.zeroFill(storage, layout.size);
         for (elements, 0..) |element, index| {
@@ -5998,6 +6045,39 @@ fn tagPrimitive(tag_size: u64) types.Primitive {
 
 fn isUntyped(candidate: *const Type) bool {
     return candidate.* == .untyped_integer or candidate.* == .untyped_float;
+}
+
+// an array literal whose elements are all constants (section 3.1):
+// literals, payload-less variant paths, negated literals, nested such
+// literals; a qualified path that turns out not to be a variant simply
+// fails the compile-time evaluation and falls back to runtime construction
+fn isConstantLiteral(expression: *const ast.Expression) bool {
+    const unwrapped = unwrapGrouped(expression);
+    switch (unwrapped.*) {
+        .integer_literal, .float_literal, .string_literal, .character_literal, .bool_literal, .implied_variant => return true,
+        .path => |path| return path.len >= 2,
+        .unary => |unary| return unary.operator.tag == .minus and isConstantLiteral(unary.operand),
+        .array_literal => |elements| {
+            if (elements.len == 0) return false;
+            for (elements) |element| {
+                if (!isConstantLiteral(element)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+// a nested arithmetic expression over untyped literals only ('10 * 1024'
+// inside '10 * 1024 * 1024'), which adopts its context's width
+fn isUntypedBinary(expression: *const ast.Expression) bool {
+    const unwrapped = unwrapGrouped(expression);
+    if (unwrapped.* != .binary) return false;
+    const tag = unwrapped.binary.operator.tag;
+    return tag != .ampersand_ampersand and tag != .pipe_pipe and
+        tag != .equal_equal and tag != .bang_equal and
+        tag != .angle_left and tag != .angle_left_equal and
+        tag != .angle_right and tag != .angle_right_equal;
 }
 
 fn unwrapGrouped(expression: *const ast.Expression) *const ast.Expression {

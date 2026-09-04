@@ -247,12 +247,13 @@ pub const Expression = union(enum) {
     index: struct { object: *const Expression, subscript: *const Expression },
     // 'arr[start..end]' denotes the unsized range value of elements
     // start..end-1 (section 3.1): '&' / '&var' borrow the view, 'new'
-    // copies it; a null start means 0
+    // copies it; a null start means 0, a null end the length ('arr[..]'
+    // is the whole array)
     subslice: struct {
         object: *const Expression,
         operator: Token,
         start: ?*const Expression,
-        end: *const Expression,
+        end: ?*const Expression,
     },
     // a null path is an anonymous structural literal ('{ .x = 1 }'); a
     // named literal may be module-qualified ('liba::Pair { ... }') and may

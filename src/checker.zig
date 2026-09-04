@@ -1880,7 +1880,8 @@ pub const Checker = struct {
                 if (subslice.start) |start| {
                     if (expressionBreaksLoop(start, depth)) return true;
                 }
-                return expressionBreaksLoop(subslice.end, depth);
+                if (subslice.end) |end| return expressionBreaksLoop(end, depth);
+                return false;
             },
             // a lambda body cannot break an enclosing loop
             .lambda => return false,
@@ -2076,6 +2077,12 @@ pub const Checker = struct {
                         const right = try candidate.render(self.arena);
                         try self.report(self.expressionSpan(element), "array elements disagree: {s} versus {s}", .{ left, right });
                     }
+                }
+                // untyped elements take the contextual element type
+                // (section 4.3 rule 2), so '[1, 2, 3]' under '[u8 : 3]'
+                // is recorded as u8 elements, never widened afterwards
+                if (expected_element) |element| {
+                    if (isUntypedLiteralType(element_type) and try self.coerce(element_type, element)) element_type = element;
                 }
                 return self.makeType(.{ .fixed_array = .{ .element = element_type, .length = elements.len } });
             },
@@ -2700,9 +2707,11 @@ pub const Checker = struct {
                 try self.report(self.expressionSpan(start), "a subslice bound must be an integer", .{});
             }
         }
-        const end_type = try self.checkExpression(subslice.end, null);
-        if (!end_type.isInteger()) {
-            try self.report(self.expressionSpan(subslice.end), "a subslice bound must be an integer", .{});
+        if (subslice.end) |end| {
+            const end_type = try self.checkExpression(end, null);
+            if (!end_type.isInteger()) {
+                try self.report(self.expressionSpan(end), "a subslice bound must be an integer", .{});
+            }
         }
         // a place subject borrows with its location's mutability; a
         // temporary subject still slices, immutably
@@ -4414,7 +4423,8 @@ pub const Checker = struct {
             .index => |index| return self.mentionsTypeParameter(index.object) or self.mentionsTypeParameter(index.subscript),
             .subslice => |subslice| {
                 if (subslice.start) |start| if (self.mentionsTypeParameter(start)) return true;
-                return self.mentionsTypeParameter(subslice.object) or self.mentionsTypeParameter(subslice.end);
+                if (subslice.end) |end| if (self.mentionsTypeParameter(end)) return true;
+                return self.mentionsTypeParameter(subslice.object);
             },
             .grouped => |inner| return self.mentionsTypeParameter(inner),
             .unary => |unary| return self.mentionsTypeParameter(unary.operand),
@@ -4497,6 +4507,20 @@ pub const Checker = struct {
             return null;
         }
         return value;
+    }
+
+    /// Evaluates a constant expression (an array literal of literals and
+    /// payload-less variants, section 3.1) at compile time for codegen to
+    /// materialize as static data; null when evaluation faults.
+    pub fn evaluateConstant(self: *Checker, expression: *const ast.Expression, view_index: usize) Error!?Interpreter.Value {
+        const saved_view = self.current_view;
+        defer self.current_view = saved_view;
+        self.current_view = view_index;
+        const machine = try self.comptimeMachine(view_index, &.{}, &.{});
+        return machine.evaluate(expression) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
     }
 
     /// The hooks a running program uses to reach the checker (sections 4.4,
@@ -5803,6 +5827,10 @@ pub const Checker = struct {
             },
             else => return false,
         }
+    }
+
+    fn isUntypedLiteralType(candidate: *const Type) bool {
+        return candidate.* == .untyped_integer or candidate.* == .untyped_float;
     }
 
     fn bind(self: *Checker, name_token: Token, binding_type: *const Type, mutable: bool) Error!void {

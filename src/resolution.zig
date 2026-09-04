@@ -552,7 +552,7 @@ pub const Resolver = struct {
             .subslice => |subslice| {
                 try self.resolveExpression(subslice.object);
                 if (subslice.start) |start| try self.resolveExpression(start);
-                try self.resolveExpression(subslice.end);
+                if (subslice.end) |end| try self.resolveExpression(end);
             },
             // an inline layout's members resolve like any type expression
             .type_literal => |layout| try self.resolveTypeExpression(layout, false),

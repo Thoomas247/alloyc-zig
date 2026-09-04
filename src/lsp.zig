@@ -1727,7 +1727,7 @@ fn collectFromExpression(arena: std.mem.Allocator, expression: *const ast.Expres
         .subslice => |subslice| {
             try collectFromExpression(arena, subslice.object, into);
             if (subslice.start) |start| try collectFromExpression(arena, start, into);
-            try collectFromExpression(arena, subslice.end, into);
+            if (subslice.end) |end| try collectFromExpression(arena, end, into);
         },
         .struct_init => |struct_init| for (struct_init.members) |member| try collectFromExpression(arena, member.value, into),
         .array_literal => |elements| for (elements) |element| try collectFromExpression(arena, element, into),

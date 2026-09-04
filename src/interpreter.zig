@@ -808,7 +808,11 @@ pub const Interpreter = struct {
             try self.integerOf(try self.evalExpression(start_expression))
         else
             0;
-        const end = try self.integerOf(try self.evalExpression(subslice.end));
+        // a missing end is the length: 'arr[..]' is the whole array
+        const end: i128 = if (subslice.end) |end_expression|
+            try self.integerOf(try self.evalExpression(end_expression))
+        else
+            @intCast(instance.elements.len);
         if (start < 0 or end < start or end > instance.elements.len) {
             return self.fault("subslice {d}..{d} out of bounds for length {d}", .{ start, end, instance.elements.len });
         }
@@ -944,11 +948,63 @@ pub const Interpreter = struct {
     // the active bindings with every bound type resolved through the
     // bindings themselves, for the checker's per-instantiation services
     fn activeBindings(self: *Interpreter) Error![]const Type.Binding {
-        const resolved = try self.arena.alloc(Type.Binding, self.current_type_bindings.len);
-        for (self.current_type_bindings, resolved) |binding, *slot| {
-            slot.* = .{ .name = binding.name, .bound = self.resolveTypeParameter(binding.bound) };
+        return self.resolveBindings(self.current_type_bindings);
+    }
+
+    // substitutes the active bindings into each bound type, so a binding
+    // made inside a generic body ('T' bound to the caller's 'T', or to
+    // 'Vector<T>') names concrete types
+    fn resolveBindings(self: *Interpreter, bindings: []const Type.Binding) Error![]const Type.Binding {
+        if (self.current_type_bindings.len == 0) return bindings;
+        const resolved = try self.arena.alloc(Type.Binding, bindings.len);
+        for (bindings, resolved) |binding, *slot| {
+            slot.* = .{ .name = binding.name, .bound = try self.substituteType(binding.bound, 0) };
         }
         return resolved;
+    }
+
+    // the checker's 'substitute' for the active bindings (section 4.7),
+    // rebuilding only the shapes that can hold a type parameter
+    fn substituteType(self: *Interpreter, candidate: *const Type, depth: usize) Error!*const Type {
+        if (depth > 16) return candidate;
+        switch (candidate.*) {
+            .type_parameter => return self.resolveTypeParameter(candidate),
+            .pointer => |indirection| return self.makeType(.{ .pointer = .{ .mutable = indirection.mutable, .child = try self.substituteType(indirection.child, depth + 1) } }),
+            .reference => |indirection| return self.makeType(.{ .reference = .{ .mutable = indirection.mutable, .child = try self.substituteType(indirection.child, depth + 1) } }),
+            .heap_array => |indirection| return self.makeType(.{ .heap_array = .{ .mutable = indirection.mutable, .child = try self.substituteType(indirection.child, depth + 1) } }),
+            .slice => |slice| return self.makeType(.{ .slice = .{ .mutable = slice.mutable, .child = try self.substituteType(slice.child, depth + 1) } }),
+            .fixed_array => |array| return self.makeType(.{ .fixed_array = .{ .element = try self.substituteType(array.element, depth + 1), .length = array.length } }),
+            .function => |function| {
+                const parameter_types = try self.arena.alloc(*const Type, function.parameter_types.len);
+                for (function.parameter_types, parameter_types) |parameter_type, *slot| {
+                    slot.* = try self.substituteType(parameter_type, depth + 1);
+                }
+                return self.makeType(.{ .function = .{ .parameter_types = parameter_types, .return_type = try self.substituteType(function.return_type, depth + 1) } });
+            },
+            .declared => |declared| {
+                if (declared.arguments.len == 0) return candidate;
+                const arguments = try self.arena.alloc(*const Type, declared.arguments.len);
+                for (declared.arguments, arguments) |argument, *slot| {
+                    slot.* = try self.substituteType(argument, depth + 1);
+                }
+                return self.makeType(.{ .declared = .{ .definition = declared.definition, .view_index = declared.view_index, .name = declared.name, .arguments = arguments } });
+            },
+            .interface => |interface| {
+                if (interface.arguments.len == 0) return candidate;
+                const arguments = try self.arena.alloc(*const Type, interface.arguments.len);
+                for (interface.arguments, arguments) |argument, *slot| {
+                    slot.* = try self.substituteType(argument, depth + 1);
+                }
+                return self.makeType(.{ .interface = .{ .definition = interface.definition, .view_index = interface.view_index, .name = interface.name, .arguments = arguments } });
+            },
+            else => return candidate,
+        }
+    }
+
+    fn makeType(self: *Interpreter, value: Type) Error!*const Type {
+        const stored = try self.arena.create(Type);
+        stored.* = value;
+        return stored;
     }
 
     // '#T' inside a generic body reflects the type the active instantiation
@@ -2126,8 +2182,12 @@ pub const Interpreter = struct {
         const guard = try CallGuard.enter(self, fn_def.name.slice(self.views[symbol.view_index].source), symbol.view_index);
         defer guard.leave(self);
 
+        // a call site inside a generic body binds the callee's parameters
+        // to the caller's ('alloc<T>' calling 'alloc<T>'): the caller's
+        // active bindings make them concrete before they take over
+        const effective_bindings = try self.resolveBindings(type_bindings);
         const saved_bindings = self.current_type_bindings;
-        self.current_type_bindings = type_bindings;
+        self.current_type_bindings = effective_bindings;
         defer self.current_type_bindings = saved_bindings;
 
         const view_source = self.views[symbol.view_index].source;

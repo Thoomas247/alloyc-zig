@@ -716,16 +716,20 @@ pub const Parser = struct {
                 },
                 .bracket_left => {
                     _ = self.advance();
-                    // 'arr[start..end]' and 'arr[..end]' denote the unsized
-                    // range value (section 3.1); the checker demands '&',
-                    // '&var', or 'new' on it. A lone subscript is an index
+                    // 'arr[start..end]', 'arr[..end]', 'arr[start..]', and
+                    // 'arr[..]' denote the unsized range value (section
+                    // 3.1); the checker demands '&', '&var', or 'new' on
+                    // it. A lone subscript is an index
                     var start: ?*const ast.Expression = null;
                     if (self.current().tag != .dot_dot) {
                         start = try self.parseInnerExpression();
                     }
                     if (self.current().tag == .dot_dot) {
                         const operator = self.advance();
-                        const end = try self.parseInnerExpression();
+                        var end: ?*const ast.Expression = null;
+                        if (self.current().tag != .bracket_right) {
+                            end = try self.parseInnerExpression();
+                        }
                         _ = try self.expect(.bracket_right, "']'");
                         expression = try self.create(ast.Expression, .{ .subslice = .{
                             .object = expression,

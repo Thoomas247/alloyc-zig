@@ -4658,6 +4658,96 @@ const move_values_source =
     \\}
 ;
 
+// a generic body calling another generic binds the callee's parameter to
+// its own ('T' to 'T'): the interpreter resolves that through the active
+// bindings before the callee reflects on it (section 4.7)
+const nested_generic_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Node = struct { value: u64, tag: u8 };
+    \\type Holder = struct { items: *var [u64] };
+    \\fn size_of<T>(value: T) -> u64 { return #T.size(); }
+    \\fn outer<T>(value: T) -> u64 { return size_of(value) + 1; }
+    \\fn store<T>(self h: &var Holder, value: T) -> u64 { return outer(value); }
+    \\fn main() -> i32 {
+    \\    var h = Holder { .items = new [0 : 2] };
+    \\    printf("%d %d %d\n", outer(Node { .value = 1, .tag = 1 }) to i32, outer(7) to i32, h.store(Node { .value = 2, .tag = 2 }) to i32);
+    \\    return 0;
+    \\}
+;
+
+test "nested generic calls carry the outer bindings into '#T'" {
+    try expectRuns(nested_generic_source, 0, "17 5 17\n");
+    try expectBuildsAndRuns("nested_generic", nested_generic_source, 0, "17 5 17\n");
+}
+
+// all-untyped arithmetic takes its width from the context (section 4.3
+// rule 2): '10 * 1024 * 1024' under a u64 annotation is a u64 product, not
+// an i32 product stored into a u64 slot
+const untyped_width_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Box = struct { page: u64, used: u64 };
+    \\fn Box::make(page: u64) -> Box { return Box { .page = page, .used = page }; }
+    \\fn main() -> i32 {
+    \\    const page: u64 = 10 * 1024 * 1024;
+    \\    var a = Box::make(page);
+    \\    var b = Box::make(page + 1);
+    \\    const wide: u64 = 100000 * 100000;
+    \\    printf("%llu %llu %llu %llu\n", a.page, b.used, page, wide);
+    \\    return 0;
+    \\}
+;
+
+test "untyped arithmetic under a wide annotation computes in that width" {
+    try expectRuns(untyped_width_source, 0, "10485760 10485761 10485760 10000000000\n");
+    try expectBuildsAndRuns("untyped_width", untyped_width_source, 0, "10485760 10485761 10485760 10000000000\n");
+}
+
+// 'arr[..]' is the whole array and 'arr[start..]' runs to the length
+// (section 3.1); a literal of constants is static data, so '&[...][..]'
+// is a program-lifetime '&[T]' (returned from a function here), while
+// 'new [...][..]' copies and a literal under '[u8 : N]' takes u8 elements
+const whole_slice_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Kind = enum { Semicolon, Import, Fn, Other: u8 };
+    \\fn count_stops(kind: Kind, stops: &[Kind]) -> u64 {
+    \\    var hits: u64 = 0;
+    \\    for (stops) |&stop| {
+    \\        if ((stop to u64) == (kind to u64)) { hits += 1; }
+    \\    }
+    \\    return hits;
+    \\}
+    \\fn stops() -> &[Kind] {
+    \\    return &[Kind::Semicolon, Kind::Import, Kind::Fn][..];
+    \\}
+    \\fn main() -> i32 {
+    \\    const sync = &[Kind::Semicolon, Kind::Import, Kind::Fn, Kind::Import][..];
+    \\    const numbers = &[10, 20, 30, 40][..];
+    \\    const tail = &numbers[1..];
+    \\    const head = &numbers[..2];
+    \\    var words: [u8 : 4] = [1, 2, 3, 4];
+    \\    var all = &var words[..];
+    \\    all[3] = 9;
+    \\    var owned: *var [i32] = new [7, 8, 9][..];
+    \\    owned[0] = 70;
+    \\    const kept = &stops();
+    \\    printf("%d %d %d %d %d %d %d %d\n", sync.length() to i32, count_stops(Kind::Import, &sync) to i32, tail.length() to i32, tail[0], head.length() to i32, words[3] to i32, owned[0], kept.length() to i32);
+    \\    return 0;
+    \\}
+;
+
+test "whole-array subslices and static constant literals" {
+    try expectRuns(whole_slice_source, 0, "4 2 3 20 2 9 70 3\n");
+    try expectBuildsAndRuns("whole_slice", whole_slice_source, 0, "4 2 3 20 2 9 70 3\n");
+    // the constant literals live in program data, not on the stack
+    try expectGenerates(whole_slice_source, false, &.{"@\"literal."}, &.{});
+    try expectCheckErrors(
+        \\fn main() -> i32 {
+        \\    var bad = &var [1, 2, 3][..];
+        \\    return 0;
+        \\}
+    , &.{"a '&var' borrow requires a mutable subject"});
+}
+
 test "'move' transfers what any value owns and copies the rest" {
     const expected = "1 10 3\n2 20 2\n5 5\n22\n7 70\n88\n3\n";
     try expectRuns(move_values_source, 0, expected);
