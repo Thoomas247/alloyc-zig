@@ -114,6 +114,10 @@ pub const Checker = struct {
     // both engines stop exactly there instead of piercing on into the
     // pointer type an instantiation may bind
     pierce_depths: std.AutoHashMapUnmanaged(*const ast.Expression, u8) = .empty,
+    // call arguments that are temporaries bound to an immutable '&T'
+    // parameter (section 5.2): codegen materializes them and passes the
+    // address, the temporary living to the end of the statement
+    temporary_borrows: std.AutoHashMapUnmanaged(*const ast.Expression, void) = .empty,
     pending_comptime: std.ArrayList(PendingComptime) = .empty,
     // '#' expressions that reflect a type parameter of their generic
     // ('#T.size()', section 4.4): they have a value per instantiation, so
@@ -2473,6 +2477,21 @@ pub const Checker = struct {
                 }
                 if (try self.unify(left, right) == null) {
                     try self.operandMismatch(operator, left, right);
+                    return &bool_type;
+                }
+                // enum equality compares variants, so only a payload-free
+                // enum has it (section 4.2)
+                if (try self.enumBody(try self.resolveAlias(left))) |body| {
+                    for (body.variants) |variant| {
+                        if (variant.payload != null) {
+                            try self.report(operator.location, "'{s}' compares the variants of a payload-free enum only; '{s}' carries payloads, so test it with 'is' (section 4.2)", .{ operator.tag.lexeme().?, body.name });
+                            return &bool_type;
+                        }
+                    }
+                } else if ((try self.resolveAlias(left)).* == .declared or (try self.resolveAlias(left)).* == .structural) {
+                    if ((try self.structBody(try self.resolveAlias(left))) != null or (try self.resolveAlias(left)).* == .structural) {
+                        try self.report(operator.location, "'{s}' is not defined for struct values (section 4.2)", .{operator.tag.lexeme().?});
+                    }
                 }
                 return &bool_type;
             },
@@ -4037,6 +4056,11 @@ pub const Checker = struct {
         const checked = @min(call.arguments.len, function.parameter_types.len);
         for (call.arguments[0..checked], function.parameter_types[0..checked]) |argument, parameter_type| {
             const argument_type = try self.consumedValueType(argument, try self.checkExpression(argument, parameter_type));
+            if (try self.temporaryBorrowTarget(argument, argument_type, parameter_type)) |pointee| {
+                try self.recordTemporaryBorrow(argument, pointee);
+                try self.expectAssignable(argument_type, pointee, argument, self.expressionSpan(argument));
+                continue;
+            }
             try self.expectAssignable(argument_type, parameter_type, argument, self.expressionSpan(argument));
         }
         try self.checkArgumentsQuietly(call.arguments[checked..]);
@@ -5081,7 +5105,55 @@ pub const Checker = struct {
         default_implementation: bool = false,
         argument_expectations: []const *const Type,
         type_bindings: []const Type.Binding,
+        temporary_borrows: []const TemporaryBorrow = &.{},
     };
+
+    const TemporaryBorrow = struct {
+        index: usize,
+        // the parameter's pointee, substituted: an untyped literal argument
+        // is re-recorded at this type so it materializes at the right width
+        pointee: *const Type,
+    };
+
+    // a temporary argument - a literal, a construction, a variant, a call
+    // result, an arithmetic or cast result - binds to an immutable '&T'
+    // parameter (section 5.2): the callee borrows it for the call and it
+    // lives to the end of the statement (section 5.5). A place still
+    // borrows with '&', so copying and borrowing a variable stay visibly
+    // different. Returns the pointee type the argument must fit.
+    fn temporaryBorrowTarget(self: *Checker, argument: *const ast.Expression, argument_type: *const Type, parameter_type: *const Type) Error!?*const Type {
+        const parameter = try self.resolveAlias(parameter_type);
+        if (parameter.* != .reference or parameter.reference.mutable) return null;
+        if ((try self.resolveAlias(parameter.reference.child)).* == .interface) return null;
+        switch ((try self.resolveAlias(argument_type)).*) {
+            .reference, .slice, .heap_array, .pointer, .unknown, .void_type, .type_description => return null,
+            else => {},
+        }
+        const unwrapped = unwrapGrouped(argument);
+        switch (unwrapped.*) {
+            // a local is a place; a longer path is a variant value
+            .path => |path| if (path.len == 1 and self.lookup(path[0].slice(self.source())) != null) return null,
+            .member, .index => return null,
+            .unary => |unary| if (unary.operator.tag == .ampersand) return null,
+            else => {},
+        }
+        return parameter.reference.child;
+    }
+
+    fn recordTemporaryBorrows(self: *Checker, call: anytype, borrows: []const TemporaryBorrow) Error!void {
+        if (!@hasField(@TypeOf(call), "arguments")) return;
+        for (borrows) |borrow| {
+            if (borrow.index < call.arguments.len) try self.recordTemporaryBorrow(call.arguments[borrow.index], borrow.pointee);
+        }
+    }
+
+    fn recordTemporaryBorrow(self: *Checker, argument: *const ast.Expression, pointee: *const Type) Error!void {
+        try self.temporary_borrows.put(self.arena, argument, {});
+        // an untyped literal adopts the pointee type (section 4.3 rule 2)
+        if (self.expression_types.get(argument)) |recorded| {
+            if (isUntypedLiteralType(recorded)) try self.expression_types.put(self.arena, argument, pointee);
+        }
+    }
 
     // the tail shared by free and dot-notation overload resolution (section
     // 4.6): a lone viable candidate wins, several settle on the unique exact
@@ -5091,6 +5163,7 @@ pub const Checker = struct {
     fn resolveViable(self: *Checker, name: []const u8, viable: []const Candidate, candidate_count: usize, symbols: resolution.SymbolList, call: anytype, argument_types: []const *const Type, receiver: ?MethodReceiver, target_key: ?*const ast.Expression, span: Token.Location, expected: ?*const Type) Error!*const Type {
         if (viable.len == 1) {
             try self.recordCallTarget(target_key, viable[0].symbol, viable[0].type_bindings);
+            try self.recordTemporaryBorrows(call, viable[0].temporary_borrows);
             try self.recheckContextualArguments(call, viable[0].argument_expectations);
             return viable[0].return_type;
         }
@@ -5105,6 +5178,7 @@ pub const Checker = struct {
             }
             if (exact_count == 1) {
                 try self.recordCallTarget(target_key, exact.?.symbol, exact.?.type_bindings);
+                try self.recordTemporaryBorrows(call, exact.?.temporary_borrows);
                 try self.recheckContextualArguments(call, exact.?.argument_expectations);
                 return exact.?.return_type;
             }
@@ -5188,6 +5262,7 @@ pub const Checker = struct {
                     .return_type = result.return_type,
                     .exact = result.exact,
                     .argument_expectations = result.argument_expectations,
+                    .temporary_borrows = result.temporary_borrows,
                     .type_bindings = result.type_bindings,
                 });
             }
@@ -5277,6 +5352,7 @@ pub const Checker = struct {
                     .exact = result.exact,
                     .default_implementation = result.default_implementation,
                     .argument_expectations = result.argument_expectations,
+                    .temporary_borrows = result.temporary_borrows,
                     .type_bindings = result.type_bindings,
                 });
             }
@@ -5335,6 +5411,11 @@ pub const Checker = struct {
         for (call.arguments[0..checked], function.parameters[0..checked]) |argument, parameter| {
             const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, interface_environment, interface.view_index);
             const argument_type = try self.consumedValueType(argument, try self.checkExpression(argument, parameter_type));
+            if (try self.temporaryBorrowTarget(argument, argument_type, parameter_type)) |pointee| {
+                try self.recordTemporaryBorrow(argument, pointee);
+                try self.expectAssignable(argument_type, pointee, argument, self.expressionSpan(argument));
+                continue;
+            }
             try self.expectAssignable(argument_type, parameter_type, argument, self.expressionSpan(argument));
         }
         try self.checkArgumentsQuietly(call.arguments[checked..]);
@@ -5360,6 +5441,9 @@ pub const Checker = struct {
         return_type: *const Type,
         exact: bool,
         default_implementation: bool = false,
+        // arguments that are temporaries borrowed by a '&T' parameter
+        // (section 5.2), recorded only for the winner
+        temporary_borrows: []const TemporaryBorrow = &.{},
         // substituted parameter types per argument index, for the final
         // reporting pass over contextual arguments; empty when none occur
         argument_expectations: []const *const Type = &.{},
@@ -5483,6 +5567,7 @@ pub const Checker = struct {
         // types instead of their precomputed placeholder (sections 4.2, 4.7)
         const arguments: []const *const ast.Expression = if (@hasField(@TypeOf(call), "arguments")) call.arguments else &.{};
         var has_contextual = false;
+        var borrowed: std.ArrayList(TemporaryBorrow) = .empty;
         for (parameters[offset..], 0..) |parameter, index| {
             if (index >= argument_types.len) break;
             const parameter_type = try self.typeFromExpressionIn(parameter.parameter_type, placeholders, symbol.view_index);
@@ -5492,8 +5577,20 @@ pub const Checker = struct {
                 const expected_here = try self.substitute(parameter_type, environment);
                 argument_type = (try self.quietExpressionType(arguments[index], expected_here)) orelse return null;
             }
-            if (!try self.unifyParameter(parameter_type, argument_type, environment)) return null;
-            const substituted = try self.substitute(parameter_type, environment);
+            // a temporary binds to a '&T' parameter through the pointee
+            // (section 5.2); it is a coercion, so a by-value overload wins
+            var target = parameter_type;
+            var borrowing = false;
+            if (index < arguments.len) {
+                if (try self.temporaryBorrowTarget(arguments[index], argument_type, parameter_type)) |pointee| {
+                    target = pointee;
+                    exact = false;
+                    borrowing = true;
+                }
+            }
+            if (!try self.unifyParameter(target, argument_type, environment)) return null;
+            const substituted = try self.substitute(target, environment);
+            if (borrowing) try borrowed.append(self.arena, .{ .index = index, .pointee = substituted });
             if (!argument_type.eql(substituted)) {
                 exact = false;
                 if (!try self.coerce(argument_type, substituted)) return null;
@@ -5539,6 +5636,7 @@ pub const Checker = struct {
             .default_implementation = default_implementation,
             .argument_expectations = argument_expectations,
             .type_bindings = type_bindings,
+            .temporary_borrows = try borrowed.toOwnedSlice(self.arena),
         };
     }
 

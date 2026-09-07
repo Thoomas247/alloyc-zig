@@ -4748,6 +4748,105 @@ test "whole-array subslices and static constant literals" {
     , &.{"a '&var' borrow requires a mutable subject"});
 }
 
+// a temporary argument binds to an immutable '&T' parameter (section 5.2):
+// struct literals, variants, call results, owning temporaries (dropped at
+// statement end), untyped literals (materialized at the pointee width),
+// generic '&T', and lambda parameters; a by-value overload wins over the
+// '&T' one, a place still needs '&', and '&var' never binds a temporary
+const temporary_borrow_source =
+    \\extern printf(format: &[u8], ...) -> i32;
+    \\type Span = struct { start: u64, end: u64 };
+    \\type Decl = struct { span: Span, count: u64 };
+    \\type Kind = enum { Semicolon, Import };
+    \\type Bag = struct { items: *var [u64] };
+    \\fn placeholder(span: &Span) -> Decl { return Decl { .span = span, .count = 0 }; }
+    \\fn width(span: &Span) -> u64 { return span.end - span.start; }
+    \\fn width(span: Span) -> u64 { return 1000 + span.end - span.start; }
+    \\fn narrow(span: &Span) -> u64 { return span.end - span.start; }
+    \\fn kind_tag(kind: &Kind) -> u64 { return kind to u64; }
+    \\fn total(bag: &Bag) -> u64 { return bag.items.length(); }
+    \\fn describe<T>(value: &T) -> u64 { return #T.size(); }
+    \\fn make_span(end: u64) -> Span { return Span { .start = 1, .end = end }; }
+    \\fn add(a: &u64, b: &u64) -> u64 { return a + b; }
+    \\fn main() -> i32 {
+    \\    var state_end: u64 = 9;
+    \\    const decl = placeholder(Span { .start = 4, .end = state_end });
+    \\    const w = width(Span { .start = 2, .end = 5 });
+    \\    const n = narrow(make_span(8));
+    \\    const k = kind_tag(Kind::Import);
+    \\    const t = total(Bag { .items = new [1, 2, 3] });
+    \\    const d = describe(Span { .start = 0, .end = 0 });
+    \\    const sum = add(20, 22);
+    \\    const lambda = (span: &Span) -> u64 { return span.start * 10; };
+    \\    const l = lambda(Span { .start = 7, .end = 8 });
+    \\    printf("%d %d %d %d %d %d %d %d %d\n", decl.span.start to i32, decl.span.end to i32, w to i32, n to i32, k to i32, t to i32, d to i32, sum to i32, l to i32);
+    \\    return 0;
+    \\}
+;
+
+test "temporaries bind to immutable reference parameters" {
+    try expectRuns(temporary_borrow_source, 0, "4 9 1003 7 1 3 16 42 70\n");
+    try expectBuildsAndRuns("temporary_borrow", temporary_borrow_source, 0, "4 9 1003 7 1 3 16 42 70\n");
+    try expectCheckErrors(
+        \\type Span = struct { start: u64, end: u64 };
+        \\fn bump(span: &var Span) { span.end += 1; }
+        \\fn take(span: &Span) -> u64 { return span.end; }
+        \\fn main() -> i32 {
+        \\    bump(Span { .start = 0, .end = 1 });
+        \\    var s = Span { .start = 0, .end = 1 };
+        \\    var n = take(s);
+        \\    return 0;
+        \\}
+    , &.{
+        "no overload of 'bump' matches these argument types",
+        "no overload of 'take' matches these argument types",
+    });
+}
+
+test "enum equality compares variants of payload-free enums" {
+    const source =
+        \\extern printf(format: &[u8], ...) -> i32;
+        \\type Kind = enum { A, B, C };
+        \\fn same(a: &Kind, b: Kind) -> bool { return a == b; }
+        \\fn main() -> i32 {
+        \\    var k = Kind::B;
+        \\    printf("%d %d %d %d\n", if (k == Kind::B) 1 else 0, if (k != Kind::A) 1 else 0, if (same(&k, Kind::B)) 1 else 0, if (Kind::C == k) 1 else 0);
+        \\    return 0;
+        \\}
+    ;
+    try expectRuns(source, 0, "1 1 1 0\n");
+    try expectBuildsAndRuns("enum_equality", source, 0, "1 1 1 0\n");
+    try expectCheckErrors(
+        \\type Slot = enum { Empty, Full: u8 };
+        \\type Pair = struct { a: u8, b: u8 };
+        \\fn main() -> i32 {
+        \\    var a: Slot = ::Full(1);
+        \\    var b: Slot = ::Empty;
+        \\    var same = a == b;
+        \\    var p = Pair { .a = 1, .b = 2 } == Pair { .a = 1, .b = 2 };
+        \\    return 0;
+        \\}
+    , &.{
+        "'==' compares the variants of a payload-free enum only",
+        "'==' is not defined for struct values",
+    });
+}
+
+test "members of temporaries read through their materialized storage" {
+    const source =
+        \\type Span = struct { start: u64, end: u64 };
+        \\type Token = struct { span: Span };
+        \\fn make(at: u64) -> Token { return Token { .span = Span { .start = at, .end = at + 2 } }; }
+        \\fn main() -> i32 {
+        \\    const width = make(3).span.end - make(3).span.start;
+        \\    const nested = Span { .start = 1, .end = 9 }.end;
+        \\    return (width + nested) to i32;
+        \\}
+    ;
+    try expectRuns(source, 11, "");
+    try expectBuildsAndRuns("temporary_member", source, 11, "");
+}
+
 test "'move' transfers what any value owns and copies the rest" {
     const expected = "1 10 3\n2 20 2\n5 5\n22\n7 70\n88\n3\n";
     try expectRuns(move_values_source, 0, expected);

@@ -1831,6 +1831,20 @@ pub const Codegen = struct {
             right_type = operand_type;
             break :right try self.evalBinaryAs(unwrapGrouped(binary.right), operand_type);
         } else try self.evalExpression(binary.right);
+        // enum equality compares tags (section 4.2); the checker admits it
+        // only for payload-free enums
+        if (binary.operator.tag == .equal_equal or binary.operator.tag == .bang_equal) {
+            if (try self.enumFrameQuery(operand_type)) |frame| {
+                const left_memory = try self.ensureMemory(left_raw, left_type, span);
+                const right_memory = try self.ensureMemory(right_raw, right_type, span);
+                const left_tag = try self.loadTag(left_memory.pointer, frame);
+                const right_tag = try self.loadTag(right_memory.pointer, frame);
+                const result = try self.freshTemp();
+                const condition: []const u8 = if (binary.operator.tag == .equal_equal) "eq" else "ne";
+                try self.instruction("{s} = icmp {s} {s} {s}, {s}", .{ result, condition, tagTypeText(frame.tag_size), left_tag, right_tag });
+                return .{ .scalar = .{ .text = result, .llvm = "i1" } };
+            }
+        }
         const left = (try self.coerceOperand(left_raw, left_type, operand_type, span)).scalar;
         const right = (try self.coerceOperand(right_raw, right_type, operand_type, span)).scalar;
         switch (binary.operator.tag) {
@@ -2589,10 +2603,18 @@ pub const Codegen = struct {
             const parameter_type = info.parameter_types[argument_index];
             argument_index += 1;
             var value = try self.evalExpression(argument);
-            // no implicit move (section 5.2): a bare read of an owning
-            // pointer place passes a clone of the allocation
-            value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
-            const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
+            var argument_type = try self.typeOf(argument);
+            if (self.checker.temporary_borrows.contains(argument)) {
+                // a temporary bound to a '&T' parameter passes its address
+                // (section 5.2)
+                value = try self.borrowTemporary(value, argument_type, self.spanOf(argument));
+                argument_type = try self.referenceTo(argument_type);
+            } else {
+                // no implicit move (section 5.2): a bare read of an owning
+                // pointer place passes a clone of the allocation
+                value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
+            }
+            const coerced = try self.coerceOperand(value, argument_type, parameter_type, self.spanOf(argument));
             try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
         }
 
@@ -2647,8 +2669,12 @@ pub const Codegen = struct {
         const info = try self.externInfo(symbol, span);
         var lowered: std.ArrayList([]const u8) = .empty;
         for (call.arguments, 0..) |argument, index| {
-            const value = try self.evalExpression(argument);
-            const argument_type = try self.typeOf(argument);
+            var value = try self.evalExpression(argument);
+            var argument_type = try self.typeOf(argument);
+            if (self.checker.temporary_borrows.contains(argument)) {
+                value = try self.borrowTemporary(value, argument_type, self.spanOf(argument));
+                argument_type = try self.referenceTo(argument_type);
+            }
             if (index < info.parameter_types.len) {
                 const coerced = try self.coerceOperand(value, argument_type, info.parameter_types[index], self.spanOf(argument));
                 try lowered.append(self.arena, try self.lowerExternArgument(coerced, info.parameter_types[index], self.spanOf(argument)));
@@ -3033,10 +3059,18 @@ pub const Codegen = struct {
             if (index >= fn_type.parameter_types.len) break;
             const parameter_type = try self.substituted(fn_type.parameter_types[index]);
             var value = try self.evalExpression(argument);
-            // no implicit move (section 5.2): a bare read of an owning
-            // pointer place passes a clone of the allocation
-            value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
-            const coerced = try self.coerceOperand(value, try self.typeOf(argument), parameter_type, self.spanOf(argument));
+            var argument_type = try self.typeOf(argument);
+            if (self.checker.temporary_borrows.contains(argument)) {
+                // a temporary bound to a '&T' parameter passes its address
+                // (section 5.2)
+                value = try self.borrowTemporary(value, argument_type, self.spanOf(argument));
+                argument_type = try self.referenceTo(argument_type);
+            } else {
+                // no implicit move (section 5.2): a bare read of an owning
+                // pointer place passes a clone of the allocation
+                value = try self.copyOwnedScalarRead(argument, value, self.spanOf(argument));
+            }
+            const coerced = try self.coerceOperand(value, argument_type, parameter_type, self.spanOf(argument));
             try lowered.append(self.arena, try self.lowerArgument(coerced, parameter_type, self.spanOf(argument)));
         }
         // the block loads AFTER the arguments: an argument may reassign the
@@ -5086,8 +5120,14 @@ pub const Codegen = struct {
         var argument_types: std.ArrayList(*const Type) = .empty;
         for (call.arguments) |argument| {
             const value = try self.evalExpression(argument);
+            const argument_type = try self.typeOf(argument);
+            if (self.checker.temporary_borrows.contains(argument)) {
+                try argument_operands.append(self.arena, try self.borrowTemporary(value, argument_type, self.spanOf(argument)));
+                try argument_types.append(self.arena, try self.referenceTo(argument_type));
+                continue;
+            }
             try argument_operands.append(self.arena, try self.copyOwnedScalarRead(argument, value, self.spanOf(argument)));
-            try argument_types.append(self.arena, try self.typeOf(argument));
+            try argument_types.append(self.arena, argument_type);
         }
 
         const return_type = try self.substituted(try self.typeOf(expression));
@@ -5876,6 +5916,23 @@ pub const Codegen = struct {
     // an owning temporary lives to the end of the statement in progress
     // (section 5.5): it joins the innermost frame, dropping when the
     // statement completes or when an early exit abandons the frame
+    // a temporary argument bound to a '&T' parameter (section 5.2): it
+    // materializes, lives to the end of the statement (section 5.5), and
+    // the callee receives its address
+    fn borrowTemporary(self: *Codegen, value: Operand, value_type: *const Type, span: Token.Location) Error!Operand {
+        const memory = try self.ensureMemory(value, value_type, span);
+        if (memory.fresh and try self.ownsHeap(value_type, 0)) {
+            try self.registerTemporary(memory.pointer, value_type);
+        }
+        return .{ .scalar = .{ .text = memory.pointer, .llvm = "ptr" } };
+    }
+
+    fn referenceTo(self: *Codegen, child: *const Type) Error!*const Type {
+        const reference_type = try self.arena.create(Type);
+        reference_type.* = .{ .reference = .{ .mutable = false, .child = child } };
+        return reference_type;
+    }
+
     fn registerTemporary(self: *Codegen, pointer: []const u8, value_type: *const Type) Error!void {
         const frame = &self.scopes.items[self.scopes.items.len - 1];
         try frame.temporaries.append(self.arena, .{ .name = "", .pointer = pointer, .declared_type = value_type });

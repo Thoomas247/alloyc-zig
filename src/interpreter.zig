@@ -1269,6 +1269,15 @@ pub const Interpreter = struct {
                 else => self.fault("unsupported bool operation", .{}),
             };
         }
+        // enum equality compares variants (section 4.2)
+        if (left == .enum_value and right == .enum_value) {
+            const same = std.mem.eql(u8, left.enum_value.variant, right.enum_value.variant);
+            return switch (operator) {
+                .equal_equal => .{ .bool_value = same },
+                .bang_equal => .{ .bool_value = !same },
+                else => self.fault("unsupported enum operation", .{}),
+            };
+        }
         return self.fault("unsupported operand types", .{});
     }
 
@@ -1715,7 +1724,14 @@ pub const Interpreter = struct {
                 return self.lookup(path[0].slice(self.source()));
             },
             .member => |member| {
-                const object = try self.evalPlace(member.object) orelse return null;
+                // a temporary receiver ('make().x') materializes into a
+                // fresh cell, readable like any place (section 5.5)
+                const object = (try self.evalPlace(member.object)) orelse temporary: {
+                    if (member.object.* == .path or member.object.* == .member or member.object.* == .index) return null;
+                    const cell = try self.arena.create(Value);
+                    cell.* = try self.evalExpression(member.object);
+                    break :temporary cell;
+                };
                 const pierced = try self.pierceCell(object);
                 if (pierced.* != .struct_value) return null;
                 const name = member.name.slice(self.source());
