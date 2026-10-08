@@ -46,6 +46,7 @@
 //! the leading argument.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tokenizer_module = @import("tokenizer.zig");
 const Token = tokenizer_module.Token;
 const ast = @import("ast.zig");
@@ -58,6 +59,24 @@ const interpreter_module = @import("interpreter.zig");
 const Interpreter = interpreter_module.Interpreter;
 
 const empty_type_environment: Checker.TypeEnvironment = .empty;
+
+// std::io reaches the standard streams through __acrt_iob_func, which only
+// the Windows C runtime provides. Elsewhere the extern gets this body
+// instead of a declaration: index 2 is the C runtime's stderr, any other
+// index its stdout, so the standard library builds unchanged on the host
+const standard_stream_accessor = "__acrt_iob_func";
+const standard_stream_accessor_definition =
+    \\@stdout = external global ptr
+    \\@stderr = external global ptr
+    \\define linkonce_odr i64 @"__acrt_iob_func"(i32 %index) {
+    \\entry:
+    \\  %is_error = icmp eq i32 %index, 2
+    \\  %slot = select i1 %is_error, ptr @stderr, ptr @stdout
+    \\  %stream = load ptr, ptr %slot
+    \\  %handle = ptrtoint ptr %stream to i64
+    \\  ret i64 %handle
+    \\}
+;
 
 pub const Codegen = struct {
     arena: std.mem.Allocator,
@@ -559,7 +578,11 @@ pub const Codegen = struct {
         };
         try self.extern_infos.put(self.arena, symbol.definition, info);
         if (!self.extern_declarations.contains(name)) {
-            try self.extern_declarations.put(self.arena, name, declaration.writer.buffered());
+            const text = if (builtin.os.tag != .windows and std.mem.eql(u8, name, standard_stream_accessor))
+                standard_stream_accessor_definition
+            else
+                declaration.writer.buffered();
+            try self.extern_declarations.put(self.arena, name, text);
         }
         return info;
     }

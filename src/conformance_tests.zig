@@ -2331,7 +2331,7 @@ fn expectNativeRun(arena: std.mem.Allocator, clang: []const u8, compilation: *Co
     const io = std.testing.io;
     try std.Io.Dir.cwd().createDirPath(io, ".zig-cache/alloyc-native-tests");
     const ir_path = try std.fmt.allocPrint(arena, ".zig-cache/alloyc-native-tests/{s}.ll", .{name});
-    const executable_path = try std.fmt.allocPrint(arena, ".zig-cache/alloyc-native-tests/{s}.exe", .{name});
+    const executable_path = try std.fmt.allocPrint(arena, ".zig-cache/alloyc-native-tests/{s}{s}", .{ name, toolchain.executable_extension });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ir_path, .data = ir_text });
 
     const optimization: []const u8 = if (release_mode) "-O2" else "-O0";
@@ -3053,6 +3053,19 @@ test "native executables match the interpreter" {
         \\    return account.balance to i32;
         \\}
     , 150, "account 7 holds 120\nrefused 0\n");
+}
+
+test "native standard streams go through __acrt_iob_func on every host" {
+    // std::io's stream accessor; off Windows the codegen supplies its body
+    try expectBuildsAndRuns("standard_streams",
+        \\extern fwrite(buffer: &[u8], size: u64, count: u64, stream: i64) -> u64;
+        \\extern __acrt_iob_func(index: u32) -> i64;
+        \\fn main() -> i32 {
+        \\    fwrite("to stdout\n", 1, 10, __acrt_iob_func(1));
+        \\    fwrite("to stderr\n", 1, 10, __acrt_iob_func(2));
+        \\    return 0;
+        \\}
+    , 0, "to stdout\n");
 }
 
 test "native executables reinterpret and slice like the interpreter" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const alloyc = @import("alloyc");
@@ -262,8 +263,8 @@ fn buildExecutable(
     // process-lifetime strings live in the init arena
     const allocator = init.arena.allocator();
     const stem = std.fs.path.stem(entrypoint_file_path);
-    const executable_path = explicit_output orelse try std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
-    const ir_path = try std.fmt.allocPrint(allocator, "{s}.ll", .{stripExtension(executable_path)});
+    const executable_path = explicit_output orelse try std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, alloyc.toolchain.executable_extension });
+    const ir_path = try std.fmt.allocPrint(allocator, "{s}.ll", .{if (explicit_output) |output| stripExtension(output) else stem});
 
     try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = ir_path, .data = ir_text });
 
@@ -278,14 +279,19 @@ fn buildExecutable(
     const optimization: []const u8 = if (release) "-O2" else "-O0";
     var linked = false;
     if (!release) {
-        // checked builds carry DWARF end to end; the MSVC linker cannot
-        // keep DWARF sections, so the debug link goes through lld
+        // checked builds carry DWARF end to end; on Windows the MSVC linker
+        // cannot keep DWARF sections, so the debug link goes through lld
+        const debug_argv: []const []const u8 = if (builtin.os.tag == .windows)
+            &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g", "-fuse-ld=lld", "-Wl,/debug:dwarf" }
+        else
+            &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g" };
         const debug_result = std.process.run(init.arena.allocator(), init.io, .{
-            .argv = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g", "-fuse-ld=lld", "-Wl,/debug:dwarf" },
+            .argv = debug_argv,
         }) catch null;
         linked = debug_result != null and debug_result.?.term == .exited and debug_result.?.term.exited == 0;
         if (!linked) {
-            std.debug.print("note: debug-info link failed (lld unavailable?); linking without debug info\n", .{});
+            const hint = if (builtin.os.tag == .windows) " (lld unavailable?)" else "";
+            std.debug.print("note: debug-info link failed{s}; linking without debug info\n", .{hint});
         }
     }
     if (!linked) {
@@ -322,7 +328,7 @@ fn readFile(io: Io, allocator: std.mem.Allocator, file_path: []const u8) ![]cons
 fn standardLibrarySearchBases(init: std.process.Init) []const []const u8 {
     const arena = init.arena.allocator();
     var bases: std.ArrayList([]const u8) = .empty;
-    if (executableDirectory(arena)) |directory| {
+    if (executableDirectory(init.io, arena)) |directory| {
         bases.append(arena, directory) catch return &.{};
     }
     if (init.environ_map.get("ALLOY_STDLIB")) |configured| {
@@ -331,9 +337,10 @@ fn standardLibrarySearchBases(init: std.process.Init) []const []const u8 {
     return bases.toOwnedSlice(arena) catch &.{};
 }
 
-// the running executable's directory, read from the process image path
-fn executableDirectory(arena: std.mem.Allocator) ?[]const u8 {
-    if (@import("builtin").os.tag != .windows) return null;
+// the running executable's directory: on Windows read from the process
+// image path, elsewhere from the standard library's lookup
+fn executableDirectory(io: Io, arena: std.mem.Allocator) ?[]const u8 {
+    if (builtin.os.tag != .windows) return std.process.executableDirPathAlloc(io, arena) catch null;
     const image = std.os.windows.peb().ProcessParameters.ImagePathName;
     const buffer = image.Buffer orelse return null;
     const wide = buffer[0 .. image.Length / 2];
