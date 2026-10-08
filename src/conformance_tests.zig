@@ -4942,3 +4942,33 @@ test "an untyped literal wider than i32 keeps its value in a native build" {
         \\}
     , 1, "");
 }
+
+test "a temporary made on some paths of its statement drops once in a native build" {
+    try expectBuildsAndRuns("conditional_temporary",
+        \\type Box = struct { value: *var u64 };
+        \\fn make(v: u64) -> Box { return Box { .value = new v }; }
+        \\fn read(self b: &Box) -> u64 { return b.value; }
+        \\fn main() -> i32 {
+        \\    var hits: i32 = 0;
+        \\    for ([..3]) |i| {
+        \\        if (i == 1 && make(5).read() == 5) { hits += 1; }
+        \\    }
+        \\    return hits;
+        \\}
+    , 1, "");
+}
+
+test "an owning capture re-bound by a loop drops once in a native build" {
+    try expectBuildsAndRuns("rebound_owning_capture",
+        \\type Box = struct { value: *var u64 };
+        \\type Maybe = enum { Some: Box, None };
+        \\fn find() -> Maybe { return Maybe::Some(Box { .value = new 4 }); }
+        \\fn main() -> i32 {
+        \\    var count: u64 = 0;
+        \\    for ([..4]) |i| {
+        \\        if (find() is ::Some |move b|) { count += b.value; }
+        \\    }
+        \\    return count to i32;
+        \\}
+    , 16, "");
+}

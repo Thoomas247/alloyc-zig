@@ -5945,6 +5945,12 @@ pub const Codegen = struct {
             if (!try self.ownsHeap(local.declared_type, 0)) continue;
             const helper = try self.dropHelper(local.declared_type, .{ .start = 0, .end = 0 });
             try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, local.pointer });
+            // a slot the next loop iteration binds again ('is' captures
+            // drop their previous occupant before re-binding) must not
+            // still hold what was just freed
+            if (std.mem.startsWith(u8, local.pointer, "%slot.")) {
+                if (try self.layoutQuery(local.declared_type, 0)) |layout| try self.zeroFill(local.pointer, layout.size);
+            }
         }
     }
 
@@ -5978,9 +5984,23 @@ pub const Codegen = struct {
         return reference_type;
     }
 
+    // a temporary made on only some paths of its statement (the right of
+    // '&&', one branch of an 'if' value) is still dropped on every path:
+    // its slot starts zeroed and is zeroed again after each drop, so a
+    // drop where it was never made, or made on an earlier iteration, does
+    // nothing
     fn registerTemporary(self: *Codegen, pointer: []const u8, value_type: *const Type) Error!void {
         const frame = &self.scopes.items[self.scopes.items.len - 1];
         try frame.temporaries.append(self.arena, .{ .name = "", .pointer = pointer, .declared_type = value_type });
+        if (std.mem.startsWith(u8, pointer, "%slot.")) {
+            if (try self.layoutQuery(value_type, 0)) |layout| try self.zeroAggregateSlotInEntry(pointer, layout.size);
+        }
+    }
+
+    fn dropTemporary(self: *Codegen, temporary: Local) Error!void {
+        const helper = try self.dropHelper(temporary.declared_type, .{ .start = 0, .end = 0 });
+        try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, temporary.pointer });
+        if (try self.layoutQuery(temporary.declared_type, 0)) |layout| try self.zeroFill(temporary.pointer, layout.size);
     }
 
     fn temporaryMark(self: *Codegen) usize {
@@ -5996,9 +6016,7 @@ pub const Codegen = struct {
         var index = frame.temporaries.items.len;
         while (index > mark) {
             index -= 1;
-            const temporary = frame.temporaries.items[index];
-            const helper = try self.dropHelper(temporary.declared_type, .{ .start = 0, .end = 0 });
-            try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, temporary.pointer });
+            try self.dropTemporary(frame.temporaries.items[index]);
         }
     }
 
@@ -6015,9 +6033,7 @@ pub const Codegen = struct {
         var index = frame.temporaries.items.len;
         while (index > 0) {
             index -= 1;
-            const temporary = frame.temporaries.items[index];
-            const helper = try self.dropHelper(temporary.declared_type, .{ .start = 0, .end = 0 });
-            try self.instruction("call void @\"{s}\"(ptr {s})", .{ helper, temporary.pointer });
+            try self.dropTemporary(frame.temporaries.items[index]);
         }
     }
 
