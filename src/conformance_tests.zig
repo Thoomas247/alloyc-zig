@@ -4482,6 +4482,13 @@ test "a type containing itself by value is an error, not a crash" {
         \\type Tree = struct { value: i32, left: *Tree };
         \\fn main() -> i32 { return 0; }
     );
+    // another instantiation of the same generic type is not recursion
+    try expectChecks(
+        \\type Maybe<T> = enum { Some: T, None };
+        \\type Pair = struct { inner: Maybe<u32> };
+        \\fn make() -> Maybe<Pair> { return Maybe::None; }
+        \\fn main() -> i32 { const p = make(); return 0; }
+    );
 }
 
 test "runaway compile-time recursion is a diagnostic, not a crash" {

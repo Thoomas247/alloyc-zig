@@ -80,7 +80,9 @@ pub const Checker = struct {
     cast_shapes: std.AutoHashMapUnmanaged(*const ast.Expression, types.CastShapes) = .empty,
     // declared types whose section 4.9 layout is being computed: reaching
     // one again means it contains itself by value, an infinite type
-    layout_in_progress: std.AutoHashMapUnmanaged(*const ast.Definition, void) = .empty,
+    // compared by instantiation, so 'Option<Program>' holding an
+    // 'Option<u32>' is not mistaken for recursion
+    layout_in_progress: std.ArrayListUnmanaged(*const Type) = .empty,
     recursive_layout_reported: std.AutoHashMapUnmanaged(*const ast.Definition, void) = .empty,
     // the capture bindings computed for every lambda expression (section
     // 4.4), so codegen builds closure environments from the same typing
@@ -1357,16 +1359,18 @@ pub const Checker = struct {
             .structural, .declared, .inline_enum, .structural_enum => {
                 // a declared type met again while its own layout is still
                 // being computed contains itself by value (section 4.9)
-                const guard: ?*const ast.Definition = if (resolved.* == .declared) resolved.declared.definition else null;
-                if (guard) |definition| {
-                    if (self.layout_in_progress.contains(definition)) {
-                        try self.reportRecursiveLayout(resolved.declared);
-                        return null;
+                const guarded = resolved.* == .declared;
+                if (guarded) {
+                    for (self.layout_in_progress.items) |in_progress| {
+                        if (Type.eql(in_progress, resolved)) {
+                            try self.reportRecursiveLayout(resolved.declared);
+                            return null;
+                        }
                     }
-                    try self.layout_in_progress.put(self.arena, definition, {});
+                    try self.layout_in_progress.append(self.arena, resolved);
                 }
-                defer if (guard) |definition| {
-                    _ = self.layout_in_progress.remove(definition);
+                defer if (guarded) {
+                    _ = self.layout_in_progress.pop();
                 };
                 if (try self.enumBody(resolved)) |body| return self.enumLayout(body, depth);
                 const fields = try self.structuralFieldsOf(resolved) orelse return null;
