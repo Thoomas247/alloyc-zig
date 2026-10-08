@@ -3476,11 +3476,14 @@ pub const Checker = struct {
         var element_mutability: std.ArrayList(bool) = .empty;
         for (for_expr.subjects) |subject| {
             // a range subject never materializes: runtime bounds are fine
-            // and the loop lowers to a counting loop (section 5.3)
-            const subject_type = if (subject.* == .array_range)
-                try self.checkArrayRange(subject, null, false, true)
-            else
-                try self.checkExpression(subject, null);
+            // and the loop lowers to a counting loop (section 5.3); its type
+            // is recorded like any checked expression's, since codegen
+            // captures the counter as its element type
+            const subject_type = if (subject.* == .array_range) range: {
+                const range_type = try self.checkArrayRange(subject, null, false, true);
+                try self.expression_types.put(self.arena, subject, range_type);
+                break :range range_type;
+            } else try self.checkExpression(subject, null);
             const resolved = try self.resolveAlias(subject_type);
             var element: ?*const Type = switch (resolved.*) {
                 .slice => |slice| slice.child,

@@ -3055,6 +3055,23 @@ test "native executables match the interpreter" {
     , 150, "account 7 holds 120\nrefused 0\n");
 }
 
+test "native runtime-bounded range captures take the bound's type" {
+    // '[..offset]' with a u64 bound counts in u64, so 'index + 1' is u64
+    // arithmetic; the counter used to capture as i32 and broke the IR
+    try expectBuildsAndRuns("runtime_range_capture",
+        \\fn last_after(offset: u64) -> u64 {
+        \\    var start: u64 = 0;
+        \\    for ([..offset]) |index| {
+        \\        start = index + 1;
+        \\    }
+        \\    return start;
+        \\}
+        \\fn main() -> i32 {
+        \\    return last_after(5) to i32;
+        \\}
+    , 5, "");
+}
+
 test "native debug info survives types nested past its depth limit" {
     // the debug-type walk stops past depth 8; an enum tag, a slice length,
     // and an array element one level beyond it must not crash the build or

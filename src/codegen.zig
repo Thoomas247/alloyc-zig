@@ -3926,14 +3926,18 @@ pub const Codegen = struct {
             }
             const length = try self.freshTemp();
             try self.instruction("{s} = sub i64 {s}, {s}", .{ length, end_wide, start_wide });
-            // the counter captures as the element type of the fixed-array
-            // shape the checker recorded for the range (section 5.3),
-            // defaulted; an unrecorded range counts in the default integer
+            // the counter captures as the element type the checker recorded
+            // for the range (section 5.3), defaulted: a fixed array for
+            // literal bounds, a slice for runtime ones; an unrecorded range
+            // counts in the default integer
             const capture_type: *const Type = capture: {
                 const recorded = self.expression_types.get(subject_expression) orelse break :capture &integer_type;
                 const resolved = try self.resolvedOf(recorded);
-                if (resolved.* == .fixed_array) break :capture try self.checker.defaulted(resolved.fixed_array.element);
-                break :capture &integer_type;
+                switch (resolved.*) {
+                    .fixed_array => |array| break :capture try self.checker.defaulted(array.element),
+                    .slice => |slice| break :capture try self.checker.defaulted(slice.child),
+                    else => break :capture &integer_type,
+                }
             };
             return .{ .kind = .{ .counter = start_wide }, .length = length, .capture_type = capture_type };
         }
