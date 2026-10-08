@@ -5575,8 +5575,11 @@ pub const Codegen = struct {
     // renders a DWARF type for a checked type, mirroring the section 4.9
     // layouts; null when the type has no meaningful runtime description
     fn debugType(self: *Codegen, candidate: *const Type, depth: usize) Error!?usize {
-        if (depth > 8) return null;
         const resolved = self.resolvedOf(candidate) catch return null;
+        // the depth limit cuts recursion through composites; a primitive
+        // recurses into nothing, so a composite at the limit still names
+        // its enum tag and slice length types
+        if (depth > 8 and resolved.* != .primitive) return null;
         const key = self.typeKey(resolved, 0) catch return null;
         if (self.debug_types.get(key)) |existing| return existing;
         const out = &self.debug_metadata.writer;
@@ -5668,10 +5671,12 @@ pub const Codegen = struct {
                 return id;
             },
             .fixed_array => |array| {
-                const id = self.nextMetadata();
-                try self.debug_types.put(self.arena, key, id);
+                // resolve the element first: an id cached before giving up
+                // would be referenced later without ever being defined
                 const element = (try self.debugType(array.element, depth + 1)) orelse return null;
                 const element_layout = (self.layoutQuery(array.element, 0) catch null) orelse return null;
+                const id = self.nextMetadata();
+                try self.debug_types.put(self.arena, key, id);
                 const subrange = self.nextMetadata();
                 const elements = self.nextMetadata();
                 out.print("!{d} = !DISubrange(count: {d})\n", .{ subrange, array.length }) catch return error.OutOfMemory;

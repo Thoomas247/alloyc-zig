@@ -3055,6 +3055,28 @@ test "native executables match the interpreter" {
     , 150, "account 7 holds 120\nrefused 0\n");
 }
 
+test "native debug info survives types nested past its depth limit" {
+    // the debug-type walk stops past depth 8; an enum tag, a slice length,
+    // and an array element one level beyond it must not crash the build or
+    // leave a dangling metadata reference. 'root' is the only local, so its
+    // walk is the first to reach each type
+    try expectBuildsAndRuns("deep_debug_types",
+        \\type Leaf = enum { Empty, Text: &[u8], Grid: [u8 : 2] };
+        \\type L7 = struct { leaf: Leaf, cells: [Leaf : 2], text: &[u8] };
+        \\type L6 = struct { inner: L7 };
+        \\type L5 = struct { inner: L6 };
+        \\type L4 = struct { inner: L5 };
+        \\type L3 = struct { inner: L4 };
+        \\type L2 = struct { inner: L3 };
+        \\type L1 = struct { inner: L2 };
+        \\type L0 = struct { inner: L1, shallow: [Leaf : 2] };
+        \\fn main() -> i32 {
+        \\    const root = L0 { .inner = L1 { .inner = L2 { .inner = L3 { .inner = L4 { .inner = L5 { .inner = L6 { .inner = L7 { .leaf = ::Text("abc"), .cells = [::Empty, ::Grid([1, 2])], .text = "xy" } } } } } } }, .shallow = [::Empty, ::Empty] };
+        \\    return root.inner.inner.inner.inner.inner.inner.inner.text.length() to i32;
+        \\}
+    , 2, "");
+}
+
 test "native standard streams go through __acrt_iob_func on every host" {
     // std::io's stream accessor; off Windows the codegen supplies its body
     try expectBuildsAndRuns("standard_streams",
