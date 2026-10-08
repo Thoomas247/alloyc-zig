@@ -4932,3 +4932,13 @@ test "'move' transfers what any value owns and copies the rest" {
         "'move' clears its source, which must be mutable",
     });
 }
+
+test "an untyped literal wider than i32 keeps its value in a native build" {
+    try expectBuildsAndRuns("wide_untyped_literal",
+        \\fn main() -> i32 {
+        \\    var h: u64 = 0x1FFFFFFFF;
+        \\    h = h & 0xFFFFFFFF;
+        \\    return (h - 4294967294) to i32;
+        \\}
+    , 1, "");
+}

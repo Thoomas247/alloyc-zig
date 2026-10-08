@@ -1234,7 +1234,11 @@ pub const Codegen = struct {
         const text = token.slice(self.source());
         const value = interpreter_module.parseIntegerText(text) catch
             return self.report(token.location, "invalid integer literal '{s}'", .{text});
-        const primitive = self.primitiveOf(expression) orelse .i32;
+        // a literal operand left at the i32 default widens later from its
+        // own width, which must hold the value: 0xFFFFFFFF is no i32
+        const fallback: types.Primitive = if (value <= std.math.maxInt(i32)) .i32 else if (value <= std.math.maxInt(i64)) .i64 else .u64;
+        var primitive = self.primitiveOf(expression) orelse fallback;
+        if (!primitive.isFloat() and !literalFits(value, primitive)) primitive = fallback;
         if (primitive.isFloat()) {
             return .{ .scalar = try self.floatConstant(@floatFromInt(value), primitive) };
         }
@@ -1242,6 +1246,12 @@ pub const Codegen = struct {
             .text = try std.fmt.allocPrint(self.arena, "{d}", .{value}),
             .llvm = scalarTypeText(primitive),
         } };
+    }
+
+    fn literalFits(value: i128, primitive: types.Primitive) bool {
+        const bits: u7 = @intCast(@as(u16, primitive.width()) * 8);
+        const limit: i128 = if (primitive.isSigned()) @as(i128, 1) << (bits - 1) else @as(i128, 1) << bits;
+        return value < limit;
     }
 
     // LLVM requires exact float constants; the hexadecimal form of the
@@ -2229,7 +2239,10 @@ pub const Codegen = struct {
         return .{ .scalar = .{ .text = result, .llvm = "i1" } };
     }
 
-    fn convertNumeric(self: *Codegen, operand: Scalar, origin: types.Primitive, target: types.Primitive) Error!Scalar {
+    fn convertNumeric(self: *Codegen, operand: Scalar, declared_origin: types.Primitive, target: types.Primitive) Error!Scalar {
+        // a literal too wide for its i32 default was emitted as i64
+        // (integerLiteralOperand); convert from what it really is
+        const origin: types.Primitive = if (!declared_origin.isFloat() and declared_origin.width() < 8 and std.mem.eql(u8, operand.llvm, "i64")) .i64 else declared_origin;
         const target_llvm = scalarTypeText(target);
         if (origin == target) return operand;
         const result = try self.freshTemp();
