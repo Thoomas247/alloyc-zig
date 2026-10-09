@@ -7,7 +7,7 @@ const alloyc = @import("alloyc");
 const usage =
     \\usage: alloyc <file.alloy>
     \\       alloyc run <file.alloy>
-    \\       alloyc build <file.alloy> [-o <output>] [--emit-llvm] [--release]
+    \\       alloyc build <file.alloy> [-o <output>] [--emit-llvm] [--release] [--link <argument>]...
     \\       alloyc lib <file.alloy> [-o <name.alloylib>]
     \\       alloyc fmt <file.alloy> [--check]
     \\       alloyc lsp
@@ -70,6 +70,9 @@ fn driverMain(init: std.process.Init) !void {
     var output_path: ?[]const u8 = null;
     var emit_llvm = false;
     var release = false;
+    // passed to the linker as they are: objects, '-L' and '-l' arguments
+    var link_arguments: std.ArrayList([]const u8) = .empty;
+    defer link_arguments.deinit(allocator);
     if (build_mode or lib_mode) {
         while (args.next()) |argument| {
             if (std.mem.eql(u8, argument, "-o")) {
@@ -81,6 +84,12 @@ fn driverMain(init: std.process.Init) !void {
                 emit_llvm = true;
             } else if (build_mode and std.mem.eql(u8, argument, "--release")) {
                 release = true;
+            } else if (build_mode and std.mem.eql(u8, argument, "--link")) {
+                const link_argument = args.next() orelse {
+                    std.debug.print("error: '--link' needs an argument\n", .{});
+                    std.process.exit(1);
+                };
+                try link_arguments.append(allocator, try init.arena.allocator().dupe(u8, link_argument));
             } else {
                 std.debug.print("error: unknown option '{s}'\n{s}", .{ argument, usage });
                 std.process.exit(1);
@@ -154,7 +163,7 @@ fn driverMain(init: std.process.Init) !void {
             reportDiagnostics(&compilation);
             std.process.exit(1);
         };
-        try buildExecutable(init, entrypoint_file_path, output_path, ir_text, emit_llvm, release);
+        try buildExecutable(init, entrypoint_file_path, output_path, ir_text, emit_llvm, release, link_arguments.items);
         return;
     }
 
@@ -259,6 +268,7 @@ fn buildExecutable(
     ir_text: []const u8,
     emit_llvm: bool,
     release: bool,
+    link_arguments: []const []const u8,
 ) !void {
     // process-lifetime strings live in the init arena
     const allocator = init.arena.allocator();
@@ -277,14 +287,17 @@ fn buildExecutable(
     };
 
     const optimization: []const u8 = if (release) "-O2" else "-O0";
+    const base_argv: []const []const u8 = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module" };
+    const plain_argv = try std.mem.concat(allocator, []const u8, &.{ base_argv, link_arguments });
     var linked = false;
     if (!release) {
         // checked builds carry DWARF end to end; on Windows the MSVC linker
         // cannot keep DWARF sections, so the debug link goes through lld
-        const debug_argv: []const []const u8 = if (builtin.os.tag == .windows)
-            &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g", "-fuse-ld=lld", "-Wl,/debug:dwarf" }
+        const debug_flags: []const []const u8 = if (builtin.os.tag == .windows)
+            &.{ "-g", "-fuse-ld=lld", "-Wl,/debug:dwarf" }
         else
-            &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module", "-g" };
+            &.{"-g"};
+        const debug_argv = try std.mem.concat(allocator, []const u8, &.{ plain_argv, debug_flags });
         const debug_result = std.process.run(init.arena.allocator(), init.io, .{
             .argv = debug_argv,
         }) catch null;
@@ -296,7 +309,7 @@ fn buildExecutable(
     }
     if (!linked) {
         const result = std.process.run(init.arena.allocator(), init.io, .{
-            .argv = &.{ clang_path, ir_path, "-o", executable_path, optimization, "-Wno-override-module" },
+            .argv = plain_argv,
         }) catch |err| {
             std.debug.print("error: cannot run '{s}': {s}\n", .{ clang_path, @errorName(err) });
             std.process.exit(1);
